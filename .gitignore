@@ -1,0 +1,15 @@
+# Sortie de compilation Rust / Tauri
+/src-tauri/target/
+
+# Clés de signature de l'updater — NE JAMAIS committer
+*.key
+*.key.pub
+
+# Node
+node_modules/
+
+# Éditeurs / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

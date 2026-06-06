@@ -1,0 +1,24 @@
+# Dépendances de référence pour le M0.
+# Si tu génères le projet avec `cargo create-tauri-app`, fusionne ces dépendances
+# dans le Cargo.toml généré (garde le [package] et le [lib]/[[bin]] générés).
+
+[package]
+name = "ghost-link"
+version = "0.11.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+# iroh évolue vite — 0.98 est la dernière stable au moment d'écrire ce squelette
+# (l'API suit l'exemple officiel echo.rs). Au besoin : `cargo add iroh`.
+iroh = "0.98"
+dirs = "6"
+sha2 = "0.10"
+tauri-plugin-updater = "2"

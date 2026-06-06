@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ghost-link",
+  "version": "0.11.0",
+  "identifier": "computer.ghostlink.app",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "ghost link",
+        "width": 820,
+        "height": 760,
+        "minWidth": 420,
+        "minHeight": 520,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDExQ0M1M0U0RUVGQkVFQUYKUldTdjd2dnU1RlBNRWNiaDJ0Sjc4R0UraC9GUk5KRnFWaXZKckNkVDB3SUdKanh0TTBjZzhNYm4K",
+      "endpoints": [
+        "https://github.com/julo0211/ghost-link/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

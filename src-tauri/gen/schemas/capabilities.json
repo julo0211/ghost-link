@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Capacité par défaut de ghost link (fenêtre principale).","local":true,"windows":["main"],"permissions":["core:default","updater:default"]}}

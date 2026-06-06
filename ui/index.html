@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#070710">
+<title>ghost link — noyau natif</title>
+<style>
+*{box-sizing:border-box} html,body{margin:0;padding:0}
+:root{
+  --text:#1c1c28; --muted:#5c5c72; --accent:#7a5cff; --accent2:#3aa0e8; --good:#119d6e; --warn:#c47d09; --bad:#d83a40;
+  --glass:rgba(255,255,255,.5); --glass2:rgba(255,255,255,.62); --gborder:rgba(255,255,255,.7); --hair:rgba(20,20,45,.1);
+  --blur:18px; --shadow:0 10px 34px rgba(40,40,80,.14); --hi:inset 0 1px 0 rgba(255,255,255,.9); --radius:22px;
+  --field:rgba(255,255,255,.55);
+  --bg:radial-gradient(600px 380px at 12% 0%,rgba(255,150,210,.28),transparent 60%),radial-gradient(620px 420px at 96% 8%,rgba(120,170,255,.3),transparent 60%),radial-gradient(680px 520px at 60% 110%,rgba(80,225,200,.24),transparent 60%),linear-gradient(160deg,#eef1f8,#e9ebf5);
+}
+[data-theme="dark"]{
+  --text:#eef0f8; --muted:#a4a4be; --good:#46d99a;
+  --glass:rgba(255,255,255,.07); --glass2:rgba(255,255,255,.11); --gborder:rgba(255,255,255,.16); --hair:rgba(255,255,255,.1);
+  --shadow:0 10px 34px rgba(0,0,0,.5); --hi:inset 0 1px 0 rgba(255,255,255,.2); --field:rgba(255,255,255,.06);
+  --bg:radial-gradient(600px 380px at 12% 0%,rgba(139,92,255,.36),transparent 60%),radial-gradient(620px 420px at 96% 8%,rgba(40,120,255,.3),transparent 60%),radial-gradient(680px 520px at 60% 110%,rgba(30,200,170,.22),transparent 60%),linear-gradient(160deg,#0a0a13,#0c0c16);
+}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);background-attachment:fixed;color:var(--text);min-height:100vh;line-height:1.5}
+.wrap{max-width:760px;margin:0 auto;padding:28px 20px 70px}
+header{display:flex;align-items:center;gap:15px;margin-bottom:10px}
+.ghost{width:50px;height:50px;flex:0 0 auto;animation:float 4s ease-in-out infinite;filter:drop-shadow(0 8px 18px rgba(122,92,255,.45))}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
+h1{font-size:29px;margin:0;letter-spacing:-.5px;font-weight:800;background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.tagline{color:var(--muted);font-size:13.5px;margin-top:2px}
+.theme-toggle{margin-left:auto;width:40px;height:40px;border-radius:50%;border:1px solid var(--gborder);background:var(--glass);backdrop-filter:blur(var(--blur));-webkit-backdrop-filter:blur(var(--blur));box-shadow:var(--shadow),var(--hi);font-size:18px;cursor:pointer;line-height:1;transition:.18s}
+.theme-toggle:hover{transform:translateY(-1px)}
+.card{background:var(--glass);backdrop-filter:blur(var(--blur)) saturate(180%);-webkit-backdrop-filter:blur(var(--blur)) saturate(180%);border:1px solid var(--gborder);border-radius:var(--radius);padding:20px;margin-bottom:16px;box-shadow:var(--shadow),var(--hi)}
+.card h2{font-size:16px;margin:0 0 4px;display:flex;align-items:center;gap:9px;font-weight:700}
+.card .step{font-size:12px;font-weight:700;color:var(--accent);background:var(--field);border:1px solid var(--gborder);width:22px;height:22px;border-radius:50%;display:inline-grid;place-items:center}
+.card p.hint{color:var(--muted);font-size:13px;margin:2px 0 14px}
+.conn{display:flex;align-items:center;gap:10px;font-size:14px;font-weight:700;padding:11px 15px;border-radius:16px;margin:14px 0 18px;border:1px solid var(--gborder);background:var(--glass);backdrop-filter:blur(var(--blur));-webkit-backdrop-filter:blur(var(--blur));box-shadow:var(--hi)}
+.conn .dot{width:9px;height:9px;border-radius:50%;background:var(--muted)}
+.s-idle .dot{background:var(--muted)} .s-ok .dot{background:var(--good);box-shadow:0 0 10px var(--good)} .s-ok{border-color:rgba(70,217,154,.4)}
+textarea,input[type=text]{width:100%;background:var(--field);color:var(--text);border:1px solid var(--gborder);border-radius:13px;padding:11px 13px;font-size:13px;font-family:ui-monospace,'Cascadia Code',monospace;resize:vertical;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+input[type=text]{font-family:inherit;font-size:14px} textarea{min-height:58px}
+textarea::placeholder,input::placeholder{color:var(--muted)}
+textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(122,92,255,.25)}
+.btn{background:linear-gradient(135deg,var(--accent),#6f5fe6);color:#fff;border:none;padding:11px 18px;border-radius:14px;font-size:14px;font-weight:700;cursor:pointer;transition:.18s;box-shadow:0 8px 22px rgba(122,92,255,.4),inset 0 1px 0 rgba(255,255,255,.35)}
+.btn:hover{transform:translateY(-1px);box-shadow:0 11px 26px rgba(122,92,255,.5),inset 0 1px 0 rgba(255,255,255,.35)} .btn:active{transform:none} .btn:disabled{opacity:.55;cursor:default}
+.btn.ghost-btn{background:var(--glass2);color:var(--text);border:1px solid var(--gborder);box-shadow:var(--hi);backdrop-filter:blur(var(--blur));-webkit-backdrop-filter:blur(var(--blur))}
+.btn.ghost-btn:hover{background:var(--field)}
+.btn.sm{padding:7px 13px;font-size:13px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap} .hidden{display:none!important}
+.peerline{font-weight:700;font-size:14px;padding:10px 14px;border-radius:14px;background:var(--glass2);border:1px solid rgba(70,217,154,.4);color:var(--good);margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.drop{border:2px dashed var(--gborder);border-radius:16px;padding:26px 18px;text-align:center;background:var(--field);color:var(--muted);font-size:13.5px;transition:.18s}
+.drop.over{border-color:var(--accent);background:var(--glass2);color:var(--text)}
+.drop .big{font-size:30px;display:block;margin-bottom:6px;opacity:.9}
+.xfer{display:flex;align-items:center;gap:12px;padding:11px 13px;border:1px solid var(--gborder);border-radius:13px;margin-top:10px;background:var(--glass);font-size:13px}
+.xfer .meta{flex:1;min-width:0} .xfer .nm{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .xfer .pth{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bar{height:7px;background:var(--hair);border-radius:5px;overflow:hidden;margin-top:7px} .bar>i{display:block;height:100%;width:0;border-radius:5px;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .12s}
+.pct{font-size:12px;color:var(--muted);min-width:96px;text-align:right;font-weight:700;font-family:ui-monospace,monospace}
+.chat{display:flex;flex-direction:column;gap:7px;max-height:240px;overflow:auto;padding:6px 2px;margin-bottom:12px}
+.msg{max-width:78%;padding:8px 12px;border-radius:15px;font-size:13.5px;line-height:1.35;word-break:break-word}
+.msg.me{align-self:flex-end;background:linear-gradient(135deg,var(--accent),#6f5fe6);color:#fff;border-bottom-right-radius:5px;box-shadow:0 4px 14px rgba(122,92,255,.35)}
+.msg.them{align-self:flex-start;background:var(--glass2);border:1px solid var(--gborder);color:var(--text);border-bottom-left-radius:5px}
+.msg .t{display:block;font-size:10px;opacity:.65;margin-top:3px;text-align:right}
+.tabs{display:flex;gap:6px;padding:5px;border-radius:16px;background:var(--glass);border:1px solid var(--gborder);box-shadow:var(--hi);margin-bottom:16px;backdrop-filter:blur(var(--blur));-webkit-backdrop-filter:blur(var(--blur))}
+.tab{flex:1;border:none;background:transparent;color:var(--muted);font-size:13.5px;font-weight:700;padding:9px 8px;border-radius:12px;cursor:pointer;transition:.18s}
+.tab:hover{color:var(--text)}
+.tab.active{background:var(--field);color:var(--text);box-shadow:var(--hi)}
+.pane-hidden{display:none!important}
+.banner{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:11px 15px;border-radius:16px;margin:0 0 14px;border:1px solid rgba(122,92,255,.45);background:var(--glass2);box-shadow:var(--shadow),var(--hi);font-size:13.5px;font-weight:600}
+.banner .sp{flex:1}
+.badge{font-size:10px;font-weight:700;color:var(--good);border:1px solid rgba(70,217,154,.5);border-radius:999px;padding:1px 7px;margin-left:6px;vertical-align:middle}
+.fp{font-family:ui-monospace,monospace;font-size:15px;font-weight:700;letter-spacing:1px;color:var(--accent)}
+.pdot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:var(--muted)}
+.pdot.online{background:var(--good);box-shadow:0 0 8px var(--good)}
+.pdot.offline{background:var(--muted);opacity:.45}
+.pdot.checking{background:var(--warn);animation:ppulse 1s ease-in-out infinite}
+@keyframes ppulse{0%,100%{opacity:.35}50%{opacity:1}}
+.log{font-family:ui-monospace,'Cascadia Code',monospace;font-size:12.5px;max-height:160px;overflow:auto}
+.log div{padding:4px 0;border-bottom:1px solid var(--hair);color:var(--muted)}
+.foot{text-align:center;color:var(--muted);font-size:12px;margin-top:30px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <svg class="ghost" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a99bff"/><stop offset="1" stop-color="#4be1e1"/></linearGradient></defs><path d="M32 6C20 6 12 15 12 27v25c0 2.6 3 4 4.8 2.1L21 50l4.4 4.4a3 3 0 0 0 4.3 0L34 50l4.4 4.4a3 3 0 0 0 4.3 0L47 50l4.2 4.1c1.8 1.9 4.8.5 4.8-2.1V27C56 15 44 6 32 6Z" fill="url(#g)"/><circle cx="25" cy="28" r="3.4" fill="#0a0a14"/><circle cx="39" cy="28" r="3.4" fill="#0a0a14"/></svg>
+    <div><h1>ghost link</h1><div class="tagline">noyau natif — session de transfert</div></div>
+    <button class="theme-toggle" id="themeToggle" type="button" aria-label="Jour / Nuit" title="Bascule jour / nuit">🌙</button>
+  </header>
+
+  <div id="connStatus" class="conn s-idle"><span class="dot"></span><span class="conn-text">Déconnecté</span></div>
+
+  <div id="freqBanner" class="banner hidden"><span id="freqText">Un pair veut t'ajouter en ami.</span><span class="sp"></span><button class="btn sm" id="btnFreqAccept">Accepter</button><button class="btn sm ghost-btn" id="btnFreqRefuse">Refuser</button></div>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="transfert" type="button">📤 Transfert</button>
+    <button class="tab" data-tab="amis" type="button">👥 Amis</button>
+    <button class="tab" data-tab="identite" type="button">🪪 Identité</button>
+  </div>
+
+  <div class="card" data-pane="identite">
+    <h2>🪪 Mon identité</h2>
+    <p class="hint">Ton code ghost — court et stable. Partage-le à tes amis : ils te retrouveront sans coller d'adresse.</p>
+    <div class="row"><button class="btn" id="btnId">✨ Afficher mon code</button><button class="btn sm ghost-btn" id="btnCopyId">📋 Copier</button></div>
+    <input type="text" id="myId" readonly placeholder="(clique sur « Afficher mon code »)" style="margin-top:10px;font-family:ui-monospace,monospace;font-size:13px">
+    <div id="fpBox" class="hidden" style="margin-top:12px"><span class="hint">Empreinte d'identité (compare-la de vive voix avec ton ami) :</span><div class="fp" id="myFp" style="margin-top:5px"></div></div>
+    <div class="row" style="margin-top:12px"><button class="btn sm ghost-btn" id="btnAddrToggle">⚙︎ Adresse complète</button></div>
+    <div id="addrAdvanced" class="hidden">
+      <p class="hint" style="margin:12px 0 8px">Si la découverte ne passe pas (réseau très restreint), partage plutôt l'adresse complète pour une connexion directe immédiate.</p>
+      <div class="row"><button class="btn sm ghost-btn" id="btnAddr">Obtenir l'adresse</button><button class="btn sm ghost-btn" id="btnCopy">📋 Copier</button></div>
+      <textarea id="myAddr" readonly placeholder="(adresse complète)" style="margin-top:8px;min-height:64px"></textarea>
+    </div>
+    <div style="margin-top:16px;border-top:1px solid var(--hair);padding-top:14px">
+      <div class="row" style="justify-content:space-between;flex-wrap:nowrap"><h2 style="margin:0;font-size:14px">⬆️ Mises à jour</h2><button class="btn sm ghost-btn" id="btnCheckUpdate">Vérifier</button></div>
+      <p class="hint" id="updateStatus" style="margin:8px 0 0">Version actuelle : <span id="appVer">…</span></p>
+      <div id="updateBox" class="hidden" style="margin-top:10px">
+        <button class="btn" id="btnInstallUpdate">⬇️ Installer la mise à jour</button>
+        <div class="bar" style="margin-top:8px"><i id="updateBar"></i></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" data-pane="transfert">
+    <h2>🔌 Connexion</h2>
+    <div id="connectForm">
+      <p class="hint">Entre le <b>code</b> (ou l'adresse) d'un pair pour ouvrir une session. Ensuite, envoyez-vous autant de fichiers que vous voulez.</p>
+      <textarea id="peerAddr" placeholder="Code ami ou adresse ghost du pair…"></textarea>
+      <div class="row" style="margin-top:10px"><button class="btn" id="btnConnect">🔌 Se connecter</button></div>
+    </div>
+    <div id="sessionBox" class="hidden">
+      <div class="peerline"><span class="dot" style="width:9px;height:9px;border-radius:50%;background:var(--good);box-shadow:0 0 10px var(--good)"></span><span id="peerLabel">Connecté</span></div>
+      <div class="row hidden" style="margin-bottom:12px" id="savePeerRow">
+        <input type="text" id="savePeerName" placeholder="Nom de cet ami" style="flex:1 1 150px;width:auto;min-width:120px">
+        <button class="btn sm ghost-btn" id="btnSavePeer">💾 Garder cet ami</button>
+      </div>
+      <div class="drop" id="drop"><span class="big">📄</span> Glisse un fichier ici pour l'envoyer</div>
+      <input type="text" id="filePath" placeholder="…ou colle le chemin du fichier" style="margin-top:8px">
+      <div class="row" style="margin-top:10px"><button class="btn" id="btnSend">📤 Envoyer le fichier</button><button class="btn sm ghost-btn" id="btnFreq">➕ Demander en ami</button><button class="btn sm ghost-btn" id="btnDisconnect">⏏ Déconnecter</button></div>
+      <div id="sendBox" class="xfer hidden"><div class="meta"><div class="nm" id="sendName"></div><div class="bar"><i id="sendBar"></i></div></div><div class="pct" id="sendPct"></div><button class="btn sm ghost-btn hidden" id="btnCancelSend">Annuler</button></div>
+    </div>
+  </div>
+
+  <div class="card" data-pane="amis">
+    <div class="row" style="justify-content:space-between;flex-wrap:nowrap"><h2 style="margin:0">👥 Mes amis</h2><button class="btn sm ghost-btn" id="btnRefreshPresence" title="Vérifier qui est en ligne">⟳ Statut</button></div>
+    <p class="hint" style="margin:6px 0 12px">Point vert = ami en ligne · ✓ = ami mutuel. Connecte-toi en un clic.</p>
+    <div id="friendsList"></div>
+    <div class="row" style="margin-top:12px">
+      <input type="text" id="friendName" placeholder="Nom" style="flex:1 1 110px;width:auto;min-width:90px">
+      <input type="text" id="friendCode" placeholder="Code ami" style="flex:2 1 180px;width:auto;min-width:140px">
+      <button class="btn sm" id="btnAddFriend">+ Ajouter</button>
+    </div>
+  </div>
+
+  <div class="card" data-pane="transfert">
+    <h2>📥 Fichiers reçus</h2>
+    <div id="recvBox" class="xfer hidden"><div class="meta"><div class="nm" id="recvName"></div><div class="bar"><i id="recvBar"></i></div></div><div class="pct" id="recvPct"></div><button class="btn sm ghost-btn" id="btnCancelRecv">Annuler</button></div>
+    <div id="recvList"><div class="hint" style="margin:0">Les fichiers reçus s'enregistrent dans ton dossier <b>Téléchargements</b>.</div></div>
+  </div>
+
+  <div class="card hidden" id="chatCard" data-pane="transfert">
+    <h2>💬 Discussion</h2>
+    <div class="chat" id="chatLog"></div>
+    <div class="row"><input type="text" id="chatInput" placeholder="Écris un message…" style="flex:1;width:auto;min-width:0"><button class="btn" id="btnChat">Envoyer</button></div>
+  </div>
+
+  <div class="card"><h2>📜 Journal</h2><div id="log" class="log"></div></div>
+
+  <div class="foot">ghost link · noyau natif v0.11.0 · 👻</div>
+</div>
+
+<script>
+  const { invoke } = window.__TAURI__.core;
+  const { listen } = window.__TAURI__.event;
+  const $ = s => document.querySelector(s);
+  function log(m){ const d=document.createElement('div'); d.textContent='• '+m; $('#log').prepend(d); }
+  function fmt(b){ b=Number(b)||0; if(b<1024) return b.toFixed(0)+' o'; const u=['Ko','Mo','Go','To']; let i=-1; do{ b/=1024; i++; }while(b>=1024&&i<u.length-1); return b.toFixed(1)+' '+u[i]; }
+  function baseName(p){ return String(p).split(/[\\/]/).pop(); }
+  function shortId(id){ id=String(id); return id.length>14 ? id.slice(0,14)+'…' : id; }
+
+  // Mon code / adresse complète
+  $('#btnId').onclick = async () => {
+    try { const code = await invoke('my_id'); $('#myId').value = code; showFp(code); log('Code ghost affiché.'); }
+    catch (e) { log('Erreur code : ' + e); }
+  };
+  $('#btnCopyId').onclick = () => { if ($('#myId').value) { navigator.clipboard.writeText($('#myId').value); log('Code copié.'); } };
+  $('#btnAddrToggle').onclick = () => $('#addrAdvanced').classList.toggle('hidden');
+  $('#btnAddr').onclick = async () => {
+    try { $('#myAddr').value = await invoke('my_addr'); log('Adresse complète obtenue.'); }
+    catch (e) { log('Erreur adresse : ' + e); }
+  };
+  $('#btnCopy').onclick = () => { if ($('#myAddr').value) { navigator.clipboard.writeText($('#myAddr').value); log('Adresse copiée.'); } };
+
+  // Connexion (code ami ou adresse)
+  async function connectTo(addr){
+    addr = (addr || '').trim();
+    if (!addr) { log('Entre un code ami ou une adresse.'); return; }
+    $('#btnConnect').disabled = true; log('Connexion en cours…');
+    try { await invoke('connect', { addr }); }
+    catch (e) { log('Erreur connexion : ' + e); $('#btnConnect').disabled = false; }
+  }
+  $('#btnConnect').onclick = () => connectTo($('#peerAddr').value);
+  $('#btnDisconnect').onclick = () => invoke('disconnect');
+
+  // Carnet d'amis (stocké localement)
+  const FKEY = 'ghostlink_friends';
+  let currentPeer = null;
+  let presence = {};
+  let fpCache = {};
+  function loadFriends(){ try { return JSON.parse(localStorage.getItem(FKEY)) || []; } catch { return []; } }
+  function saveFriends(a){ localStorage.setItem(FKEY, JSON.stringify(a)); }
+  function addFriend(name, code){
+    name = (name || '').trim(); code = (code || '').trim();
+    if (!name || !code) { log('Donne un nom et un code.'); return false; }
+    const a = loadFriends();
+    if (a.some(f => f.code === code)) { log('Cet ami est déjà enregistré.'); return false; }
+    a.push({ name, code }); saveFriends(a); renderFriends(); return true;
+  }
+  function removeFriend(i){ const a = loadFriends(); a.splice(i, 1); saveFriends(a); renderFriends(); refreshSaveRow(); }
+  function renderFriends(){
+    const a = loadFriends(); const box = $('#friendsList'); box.innerHTML = '';
+    if (!a.length) { box.innerHTML = '<div class="hint" style="margin:6px 0">Aucun ami enregistré pour l’instant.</div>'; return; }
+    a.forEach((f, i) => {
+      const d = document.createElement('div'); d.className = 'xfer';
+      const st = presence[f.code];
+      const pcls = st ? ('pdot ' + st) : 'pdot';
+      const ptitle = st === 'online' ? 'en ligne' : (st === 'checking' ? 'vérification…' : 'hors ligne');
+      d.innerHTML = '<span class="' + pcls + '" title="' + ptitle + '"></span><div class="meta"><div class="nm"></div><div class="pth"></div></div><button class="btn sm" data-c>🔌 Connecter</button><button class="btn sm ghost-btn" data-x title="Retirer">✕</button>';
+      const nm = d.querySelector('.nm'); nm.textContent = f.name;
+      if (f.mutual) { const bg = document.createElement('span'); bg.className = 'badge'; bg.textContent = '✓ mutuel'; nm.appendChild(bg); }
+      d.querySelector('.pth').textContent = fpCache[f.code] || shortId(f.code);
+      d.querySelector('[data-c]').onclick = () => connectTo(f.code);
+      d.querySelector('[data-x]').onclick = () => removeFriend(i);
+      box.appendChild(d);
+    });
+  }
+  function refreshSaveRow(){
+    const row = $('#savePeerRow'); if (!row) return;
+    const known = currentPeer && loadFriends().some(f => f.code === currentPeer);
+    row.classList.toggle('hidden', !currentPeer || known);
+  }
+  $('#btnAddFriend').onclick = () => { if (addFriend($('#friendName').value, $('#friendCode').value)) { $('#friendName').value = ''; $('#friendCode').value = ''; log('Ami ajouté.'); } };
+  $('#btnSavePeer').onclick = () => {
+    const name = $('#savePeerName').value.trim() || ('Ami ' + shortId(currentPeer || ''));
+    if (currentPeer && addFriend(name, currentPeer)) { $('#savePeerName').value = ''; refreshSaveRow(); log('Ami enregistré.'); }
+  };
+
+  // Présence : sonder les amis pour savoir qui est en ligne (P2P, sans serveur).
+  async function probeFriend(code){
+    presence[code] = 'checking'; renderFriends();
+    let online = false;
+    try { online = await invoke('probe', { id: code }); } catch (e) { online = false; }
+    presence[code] = online ? 'online' : 'offline'; renderFriends();
+  }
+  async function refreshPresence(){
+    const a = loadFriends();
+    if (!a.length) return;
+    await Promise.all(a.map(f => probeFriend(f.code)));
+  }
+  $('#btnRefreshPresence').onclick = refreshPresence;
+
+  // Empreintes d'identité
+  async function loadFingerprints(){
+    const a = loadFriends(); let changed = false;
+    for (const f of a){ if (!fpCache[f.code]){ try { fpCache[f.code] = await invoke('fingerprint', { code: f.code }); changed = true; } catch (e) {} } }
+    if (changed) renderFriends();
+  }
+  async function showFp(code){
+    try { $('#myFp').textContent = await invoke('fingerprint', { code }); $('#fpBox').classList.remove('hidden'); } catch (e) {}
+  }
+
+  // Onglets
+  function showTab(name){
+    document.querySelectorAll('[data-pane]').forEach(el => el.classList.toggle('pane-hidden', el.getAttribute('data-pane') !== name));
+    document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.getAttribute('data-tab') === name));
+  }
+  document.querySelectorAll('.tab').forEach(b => b.onclick = () => showTab(b.getAttribute('data-tab')));
+
+  // Demandes d'ami (mutuelles)
+  function saveMutual(code){
+    if (!code) return;
+    const a = loadFriends(); let f = a.find(x => x.code === code);
+    if (!f) { f = { name: 'Ami ' + String(code).slice(0, 8), code, mutual: true }; a.push(f); }
+    else f.mutual = true;
+    saveFriends(a); renderFriends(); loadFingerprints();
+  }
+  $('#btnFreq').onclick = async () => {
+    try { await invoke('send_freq'); log('Demande d’ami envoyée.'); }
+    catch (e) { log('Demande : ' + e); }
+  };
+  listen('ghost-freq', async () => {
+    if (!currentPeer) return;
+    let fp = fpCache[currentPeer];
+    if (!fp) { try { fp = await invoke('fingerprint', { code: currentPeer }); fpCache[currentPeer] = fp; } catch (e) { fp = shortId(currentPeer); } }
+    $('#freqText').textContent = 'Un pair (' + fp + ') veut t’ajouter en ami.';
+    $('#freqBanner').classList.remove('hidden');
+  });
+  $('#btnFreqAccept').onclick = async () => {
+    $('#freqBanner').classList.add('hidden');
+    if (!currentPeer) return;
+    saveMutual(currentPeer);
+    try { await invoke('send_faccept'); } catch (e) {}
+    log('Demande d’ami acceptée.');
+  };
+  $('#btnFreqRefuse').onclick = () => { $('#freqBanner').classList.add('hidden'); log('Demande d’ami refusée.'); };
+  listen('ghost-faccept', () => {
+    if (!currentPeer) return;
+    saveMutual(currentPeer);
+    log('Ami ajouté (mutuel) ✓');
+  });
+
+  // Mises à jour automatiques
+  let dlBytes = 0;
+  async function checkUpdate(silent){
+    if (!silent) $('#updateStatus').textContent = 'Recherche…';
+    try {
+      const v = await invoke('check_update');
+      if (v) { $('#updateStatus').textContent = '🎉 Nouvelle version disponible : ' + v; $('#updateBox').classList.remove('hidden'); log('Mise à jour disponible : ' + v); }
+      else if (!silent) { $('#updateStatus').textContent = 'Tu es à jour ✅'; }
+    } catch (e) { if (!silent) $('#updateStatus').textContent = 'Vérification impossible : ' + e; }
+  }
+  $('#btnCheckUpdate').onclick = () => checkUpdate(false);
+  $('#btnInstallUpdate').onclick = async () => {
+    $('#btnInstallUpdate').disabled = true; dlBytes = 0; $('#updateStatus').textContent = 'Téléchargement…';
+    try { await invoke('install_update'); }
+    catch (e) { $('#updateStatus').textContent = 'Échec : ' + e; $('#btnInstallUpdate').disabled = false; }
+  };
+  listen('update-progress', e => {
+    const { chunk, total } = e.payload || {};
+    dlBytes += (chunk || 0);
+    if (total) { $('#updateBar').style.width = Math.round(dlBytes / total * 100) + '%'; }
+  });
+
+  function setFile(path){ $('#filePath').value = path; $('#drop').innerHTML = '<span class="big">📄</span> ' + baseName(path); }
+
+  // Envoi (avec débit + annulation)
+  let sT = 0, sB = 0;
+  $('#btnSend').onclick = async () => {
+    const path = $('#filePath').value.trim();
+    if (!path) { log('Glisse un fichier (ou colle son chemin).'); return; }
+    sT = 0; sB = 0;
+    $('#sendBox').classList.remove('hidden'); $('#btnCancelSend').classList.remove('hidden');
+    $('#sendName').textContent = baseName(path); $('#sendBar').style.width = '0%'; $('#sendPct').textContent = '0%';
+    $('#btnSend').disabled = true;
+    try { const name = await invoke('send_file', { path }); $('#sendBar').style.width='100%'; $('#sendPct').textContent='✅ envoyé'; log('Fichier envoyé : ' + name + ' ✅'); }
+    catch (e) { $('#sendPct').textContent = '✗ ' + (String(e)==='annulé'?'annulé':'erreur'); log('Envoi : ' + e); }
+    finally { $('#btnSend').disabled = false; $('#btnCancelSend').classList.add('hidden'); }
+  };
+  $('#btnCancelSend').onclick = () => { invoke('cancel_send'); log('Annulation de l’envoi…'); };
+  listen('ghost-send-progress', e => {
+    const {sent,size}=e.payload; const now=performance.now(); if(sT===0){sT=now;sB=0;}
+    const dt=(now-sT)/1000; const spd=dt>0?(sent-sB)/dt:0; const p=size?Math.round(sent/size*100):0;
+    $('#sendBar').style.width=p+'%'; $('#sendPct').textContent=p+'% · '+fmt(spd)+'/s'; sT=now; sB=sent;
+  });
+
+  // Réception (avec débit + annulation)
+  let rT = 0, rB = 0;
+  $('#btnCancelRecv').onclick = () => { invoke('cancel_recv'); log('Annulation de la réception…'); };
+  listen('ghost-recv-start', e => {
+    $('#recvBox').classList.remove('hidden'); $('#btnCancelRecv').classList.remove('hidden');
+    $('#recvName').textContent = e.payload.name; $('#recvBar').style.width='0%'; $('#recvPct').textContent='0%'; rT=0; rB=0;
+    log('⬇️ Réception de « ' + e.payload.name + ' » (' + fmt(e.payload.size) + ')…');
+  });
+  listen('ghost-recv-progress', e => {
+    const {received,size}=e.payload; const now=performance.now(); if(rT===0){rT=now;rB=0;}
+    const dt=(now-rT)/1000; const spd=dt>0?(received-rB)/dt:0; const p=size?Math.round(received/size*100):0;
+    $('#recvBar').style.width=p+'%'; $('#recvPct').textContent=p+'% · '+fmt(spd)+'/s'; rT=now; rB=received;
+  });
+  listen('ghost-recv-done', e => {
+    $('#recvBox').classList.add('hidden');
+    const { name, path } = e.payload;
+    const empty = $('#recvList').querySelector('.hint'); if (empty) empty.remove();
+    const d = document.createElement('div'); d.className = 'xfer';
+    d.innerHTML = '<span style="font-size:18px">✅</span><div class="meta"><div class="nm"></div><div class="pth"></div></div>';
+    d.querySelector('.nm').textContent = name; d.querySelector('.pth').textContent = path;
+    $('#recvList').prepend(d); log('Fichier reçu : ' + name);
+  });
+  listen('ghost-recv-cancel', e => { $('#recvBox').classList.add('hidden'); log('Réception annulée : ' + (e.payload && e.payload.name || '')); });
+
+  // Chat (texte chiffré par le canal iroh)
+  function addMsg(text, who){
+    const c = $('#chatLog');
+    const m = document.createElement('div'); m.className = 'msg ' + (who === 'me' ? 'me' : 'them');
+    const b = document.createElement('div'); b.textContent = text;
+    const t = document.createElement('span'); t.className = 't';
+    t.textContent = new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+    m.appendChild(b); m.appendChild(t);
+    c.appendChild(m); c.scrollTop = c.scrollHeight;
+  }
+  async function sendChat(){
+    const text = $('#chatInput').value.trim();
+    if (!text) return;
+    try { await invoke('send_chat', { text }); addMsg(text, 'me'); $('#chatInput').value = ''; }
+    catch (e) { log('Chat : ' + e); }
+  }
+  $('#btnChat').onclick = sendChat;
+  $('#chatInput').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); sendChat(); } };
+  listen('ghost-chat', e => { addMsg(e.payload.text, 'them'); });
+
+  // Session
+  function setConnected(peer){
+    currentPeer = peer;
+    $('#connStatus').className = 'conn s-ok'; $('#connStatus').querySelector('.conn-text').textContent = 'Connecté à ' + shortId(peer);
+    $('#peerLabel').textContent = 'Connecté à ' + shortId(peer);
+    $('#connectForm').classList.add('hidden'); $('#sessionBox').classList.remove('hidden'); $('#btnConnect').disabled = false;
+    $('#chatCard').classList.remove('hidden');
+    showTab('transfert');
+    refreshSaveRow();
+  }
+  function setDisconnected(){
+    currentPeer = null;
+    $('#connStatus').className = 'conn s-idle'; $('#connStatus').querySelector('.conn-text').textContent = 'Déconnecté';
+    $('#sessionBox').classList.add('hidden'); $('#connectForm').classList.remove('hidden'); $('#btnConnect').disabled = false;
+    $('#sendBox').classList.add('hidden'); $('#recvBox').classList.add('hidden');
+    $('#savePeerRow').classList.add('hidden'); $('#savePeerName').value = '';
+    $('#freqBanner').classList.add('hidden');
+    $('#chatCard').classList.add('hidden'); $('#chatLog').innerHTML = ''; $('#chatInput').value = '';
+    $('#filePath').value = ''; $('#drop').innerHTML = '<span class="big">📄</span> Glisse un fichier ici pour l\'envoyer';
+  }
+  listen('ghost-connected', e => { log('🔗 Connecté à : ' + e.payload); setConnected(e.payload); });
+  listen('ghost-disconnected', e => { log('Déconnecté.'); setDisconnected(); });
+  listen('ghost-error', e => log('⚠️ ' + e.payload));
+
+  // Glisser-déposer natif
+  listen('tauri://drag-enter', () => $('#drop').classList.add('over'));
+  listen('tauri://drag-over',  () => $('#drop').classList.add('over'));
+  listen('tauri://drag-leave', () => $('#drop').classList.remove('over'));
+  listen('tauri://drag-drop', e => { $('#drop').classList.remove('over'); const paths = e.payload && e.payload.paths; if (paths && paths.length) setFile(paths[0]); });
+
+  showTab('transfert');
+  renderFriends();
+  loadFingerprints();
+  invoke('my_id').then(code => { $('#myId').value = code; showFp(code); }).catch(() => {});
+  invoke('app_version').then(v => { $('#appVer').textContent = v; }).catch(() => {});
+  setTimeout(() => checkUpdate(true), 5000);
+  setTimeout(refreshPresence, 3000);
+  setInterval(refreshPresence, 30000);
+  log('Prêt. Affiche ton code, ajoute des amis, et ouvre une session.');
+
+  (function(){var KEY='ghostlink_theme';var mq=window.matchMedia?window.matchMedia('(prefers-color-scheme: dark)'):null;
+   function stored(){return localStorage.getItem(KEY);}
+   function eff(){var s=stored();return s?s:((mq&&mq.matches)?'dark':'light');}
+   function apply(){var e=eff();document.documentElement.setAttribute('data-theme',e);var b=document.getElementById('themeToggle');if(b)b.textContent=(e==='dark'?'🌙':'☀️');}
+   var tb=document.getElementById('themeToggle');if(tb)tb.onclick=function(){localStorage.setItem(KEY,eff()==='dark'?'light':'dark');apply();};
+   if(mq&&mq.addEventListener)mq.addEventListener('change',function(){if(!stored())apply();});
+   apply();})();
+</script>
+</body>
+</html>
