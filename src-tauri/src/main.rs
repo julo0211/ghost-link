@@ -36,7 +36,8 @@ async fn connect(app: tauri::AppHandle, state: State<'_, Net>, addr: String) -> 
     let ep = state.endpoint.clone();
     let slot = state.slot.clone();
     let rc = state.recv_cancel.clone();
-    net::connect(&ep, &app, &slot, &rc, &addr).await.map_err(|e| e.to_string())
+    let settings = state.settings.clone();
+    net::connect(&ep, &app, &slot, &rc, &settings, &addr).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -47,21 +48,41 @@ async fn send_file(app: tauri::AppHandle, state: State<'_, Net>, path: String) -
 }
 
 #[tauri::command]
-async fn send_chat(state: State<'_, Net>, text: String) -> Result<(), String> {
+async fn send_chat(state: State<'_, Net>, text: String, name: String) -> Result<(), String> {
     let slot = state.slot.clone();
-    net::send_chat(&slot, &text).await.map_err(|e| e.to_string())
+    net::send_chat(&slot, &name, &text).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn send_freq(state: State<'_, Net>) -> Result<(), String> {
+async fn send_freq(state: State<'_, Net>, name: String) -> Result<(), String> {
     let slot = state.slot.clone();
-    net::send_freq(&slot).await.map_err(|e| e.to_string())
+    net::send_freq(&slot, &name).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn send_faccept(state: State<'_, Net>) -> Result<(), String> {
+async fn send_faccept(state: State<'_, Net>, name: String) -> Result<(), String> {
     let slot = state.slot.clone();
-    net::send_faccept(&slot).await.map_err(|e| e.to_string())
+    net::send_faccept(&slot, &name).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_download_dir(state: State<'_, Net>, path: String) {
+    net::set_download_dir(&state.settings, &path);
+}
+
+#[tauri::command]
+fn get_download_dir(state: State<'_, Net>) -> String {
+    net::get_download_dir(&state.settings)
+}
+
+#[tauri::command]
+fn set_only_friends(state: State<'_, Net>, on: bool) {
+    net::set_only_friends(&state.settings, on);
+}
+
+#[tauri::command]
+fn set_friends(state: State<'_, Net>, codes: Vec<String>) {
+    net::set_friends(&state.settings, codes);
 }
 
 #[tauri::command]
@@ -147,7 +168,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             my_addr, my_id, probe, connect, send_file, send_chat, send_freq, send_faccept,
-            fingerprint, app_version, check_update, install_update, disconnect, cancel_send,
+            fingerprint, app_version, check_update, install_update, set_download_dir,
+            get_download_dir, set_only_friends, set_friends, disconnect, cancel_send,
             cancel_recv
         ])
         .run(tauri::generate_context!())

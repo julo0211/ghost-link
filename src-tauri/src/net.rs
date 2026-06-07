@@ -2,9 +2,10 @@
 // Modèle « session » : on se connecte une fois, puis on s'envoie autant de fichiers
 // qu'on veut (dans les deux sens). Avec débit, annulation et déconnexion propagée.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use iroh::{
     endpoint::{presets, Connection},
@@ -36,11 +37,38 @@ async fn current(slot: &Slot) -> Option<Connection> {
     slot.lock().await.conn.clone()
 }
 
+/// Réglages partagés, modifiables à chaud depuis l'UI.
+#[derive(Clone, Default)]
+pub struct Settings {
+    pub download_dir: Arc<StdMutex<Option<PathBuf>>>,
+    pub only_friends: Arc<AtomicBool>,
+    pub friends: Arc<StdMutex<HashSet<String>>>,
+}
+
+impl Settings {
+    /// Dossier de réception courant (configuré, sinon Téléchargements, sinon temp).
+    fn recv_dir(&self) -> PathBuf {
+        self.download_dir
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| dirs::download_dir().unwrap_or_else(std::env::temp_dir))
+    }
+    /// Un pair entrant est-il autorisé ? (toujours oui si le filtre amis est désactivé)
+    fn allows(&self, peer_id: &str) -> bool {
+        if !self.only_friends.load(Ordering::SeqCst) {
+            return true;
+        }
+        self.friends.lock().unwrap().contains(peer_id)
+    }
+}
+
 #[derive(Clone)]
 pub struct Ghost {
     pub app: AppHandle,
     pub slot: Slot,
     pub recv_cancel: Arc<AtomicBool>,
+    pub settings: Settings,
 }
 
 impl std::fmt::Debug for Ghost {
@@ -51,7 +79,21 @@ impl std::fmt::Debug for Ghost {
 
 impl ProtocolHandler for Ghost {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        run_conn(self.app.clone(), self.slot.clone(), self.recv_cancel.clone(), connection).await;
+        // Filtre « amis uniquement » : on refuse les pairs inconnus avant tout.
+        let peer = connection.remote_id().to_string();
+        if !self.settings.allows(&peer) {
+            connection.close(0u32.into(), b"not-a-friend");
+            let _ = self.app.emit("ghost-refused", &peer);
+            return Ok(());
+        }
+        run_conn(
+            self.app.clone(),
+            self.slot.clone(),
+            self.recv_cancel.clone(),
+            self.settings.clone(),
+            connection,
+        )
+        .await;
         Ok(())
     }
 }
@@ -71,6 +113,7 @@ pub struct Net {
     pub slot: Slot,
     pub send_cancel: Arc<AtomicBool>,
     pub recv_cancel: Arc<AtomicBool>,
+    pub settings: Settings,
     _router: Router,
 }
 
@@ -105,6 +148,51 @@ fn load_or_create_secret() -> SecretKey {
     sk
 }
 
+/// Fichier mémorisant le dossier de réception choisi.
+fn download_dir_path() -> PathBuf {
+    let base = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
+    base.join("ghost-link").join("download_dir.txt")
+}
+fn load_download_dir() -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(download_dir_path()).ok()?;
+    let t = raw.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(t))
+    }
+}
+fn save_download_dir(dir: &str) {
+    let path = download_dir_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, dir.trim());
+}
+
+/// Définit (et mémorise) le dossier de réception. Chaîne vide = défaut (Téléchargements).
+pub fn set_download_dir(settings: &Settings, path: &str) {
+    let p = path.trim();
+    *settings.download_dir.lock().unwrap() = if p.is_empty() { None } else { Some(PathBuf::from(p)) };
+    save_download_dir(p);
+}
+pub fn get_download_dir(settings: &Settings) -> String {
+    settings.recv_dir().to_string_lossy().to_string()
+}
+pub fn set_only_friends(settings: &Settings, on: bool) {
+    settings.only_friends.store(on, Ordering::SeqCst);
+}
+pub fn set_friends(settings: &Settings, codes: Vec<String>) {
+    let mut s = settings.friends.lock().unwrap();
+    s.clear();
+    for c in codes {
+        let c = c.trim();
+        if !c.is_empty() {
+            s.insert(c.to_string());
+        }
+    }
+}
+
 pub async fn start(app: AppHandle) -> anyhow::Result<Net> {
     // Identité persistante : même clé (donc même code ami) à chaque lancement.
     let secret = load_or_create_secret();
@@ -116,11 +204,30 @@ pub async fn start(app: AppHandle) -> anyhow::Result<Net> {
     let slot: Slot = Arc::new(Mutex::new(ConnState::default()));
     let send_cancel = Arc::new(AtomicBool::new(false));
     let recv_cancel = Arc::new(AtomicBool::new(false));
+    let settings = Settings::default();
+    if let Some(dir) = load_download_dir() {
+        *settings.download_dir.lock().unwrap() = Some(dir);
+    }
     let router = Router::builder(endpoint.clone())
-        .accept(ALPN, Ghost { app, slot: slot.clone(), recv_cancel: recv_cancel.clone() })
+        .accept(
+            ALPN,
+            Ghost {
+                app,
+                slot: slot.clone(),
+                recv_cancel: recv_cancel.clone(),
+                settings: settings.clone(),
+            },
+        )
         .accept(PRESENCE_ALPN, Presence)
         .spawn();
-    Ok(Net { endpoint, slot, send_cancel, recv_cancel, _router: router })
+    Ok(Net {
+        endpoint,
+        slot,
+        send_cancel,
+        recv_cancel,
+        settings,
+        _router: router,
+    })
 }
 
 pub async fn my_addr(ep: &Endpoint) -> anyhow::Result<String> {
@@ -161,6 +268,7 @@ pub async fn connect(
     app: &AppHandle,
     slot: &Slot,
     recv_cancel: &Arc<AtomicBool>,
+    settings: &Settings,
     input: &str,
 ) -> anyhow::Result<String> {
     let input = input.trim();
@@ -183,7 +291,8 @@ pub async fn connect(
     let app2 = app.clone();
     let slot2 = slot.clone();
     let rc = recv_cancel.clone();
-    tokio::spawn(async move { run_conn(app2, slot2, rc, conn).await });
+    let st = settings.clone();
+    tokio::spawn(async move { run_conn(app2, slot2, rc, st, conn).await });
     Ok(peer)
 }
 
@@ -206,7 +315,7 @@ pub async fn disconnect(app: &AppHandle, slot: &Slot) {
     }
 }
 
-async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, connection: Connection) {
+async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, settings: Settings, connection: Connection) {
     let peer = connection.remote_id().to_string();
     let mygen = {
         let mut g = slot.lock().await;
@@ -224,6 +333,7 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, conn
             Ok((mut send, mut recv)) => {
                 let a = app.clone();
                 let cancel = recv_cancel.clone();
+                let settings = settings.clone();
                 tokio::spawn(async move {
                     // Premier octet : type de flux (1 = fichier, 2 = chat).
                     let mut kind = [0u8; 1];
@@ -231,29 +341,46 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, conn
                         return;
                     }
                     if kind[0] == KIND_CHAT {
-                        let text: anyhow::Result<String> = async {
+                        // [u16 nom_len][nom][u32 texte_len][texte]
+                        let parsed: anyhow::Result<(String, String)> = async {
+                            let mut l2 = [0u8; 2];
+                            AsyncReadExt::read_exact(&mut recv, &mut l2).await?;
+                            let nlen = u16::from_be_bytes(l2) as usize;
+                            let mut nbuf = vec![0u8; nlen];
+                            AsyncReadExt::read_exact(&mut recv, &mut nbuf).await?;
                             let mut l4 = [0u8; 4];
                             AsyncReadExt::read_exact(&mut recv, &mut l4).await?;
                             let len = u32::from_be_bytes(l4) as usize;
                             if len > 256 * 1024 {
                                 anyhow::bail!("message trop long");
                             }
-                            let mut buf = vec![0u8; len];
-                            AsyncReadExt::read_exact(&mut recv, &mut buf).await?;
-                            Ok(String::from_utf8_lossy(&buf).to_string())
+                            let mut tbuf = vec![0u8; len];
+                            AsyncReadExt::read_exact(&mut recv, &mut tbuf).await?;
+                            Ok((
+                                String::from_utf8_lossy(&nbuf).to_string(),
+                                String::from_utf8_lossy(&tbuf).to_string(),
+                            ))
                         }
                         .await;
-                        if let Ok(t) = text {
-                            let _ = a.emit("ghost-chat", serde_json::json!({ "text": t }));
+                        if let Ok((name, text)) = parsed {
+                            let _ = a.emit("ghost-chat", serde_json::json!({ "name": name, "text": text }));
                         }
                         return;
                     }
-                    if kind[0] == KIND_FREQ {
-                        let _ = a.emit("ghost-freq", serde_json::json!({}));
-                        return;
-                    }
-                    if kind[0] == KIND_FACCEPT {
-                        let _ = a.emit("ghost-faccept", serde_json::json!({}));
+                    if kind[0] == KIND_FREQ || kind[0] == KIND_FACCEPT {
+                        // [u16 nom_len][nom]
+                        let name = async {
+                            let mut l2 = [0u8; 2];
+                            AsyncReadExt::read_exact(&mut recv, &mut l2).await?;
+                            let nlen = u16::from_be_bytes(l2) as usize;
+                            let mut nbuf = vec![0u8; nlen];
+                            AsyncReadExt::read_exact(&mut recv, &mut nbuf).await?;
+                            anyhow::Ok(String::from_utf8_lossy(&nbuf).to_string())
+                        }
+                        .await
+                        .unwrap_or_default();
+                        let ev = if kind[0] == KIND_FREQ { "ghost-freq" } else { "ghost-faccept" };
+                        let _ = a.emit(ev, serde_json::json!({ "name": name }));
                         return;
                     }
 
@@ -277,7 +404,7 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, conn
                         Err(_) => return,
                     };
 
-                    let dir = dirs::download_dir().unwrap_or_else(std::env::temp_dir);
+                    let dir = settings.recv_dir();
                     let dest = unique_path(&dir, &name);
                     let _ = a.emit("ghost-recv-start", serde_json::json!({ "name": name, "size": size }));
 
@@ -395,8 +522,8 @@ pub async fn send_file(
     Ok(name)
 }
 
-/// Envoie un message de chat sur la connexion ouverte (chiffré par le canal iroh).
-pub async fn send_chat(slot: &Slot, text: &str) -> anyhow::Result<()> {
+/// Envoie un message de chat (avec le nom d'affichage) sur la connexion ouverte.
+pub async fn send_chat(slot: &Slot, name: &str, text: &str) -> anyhow::Result<()> {
     let conn = current(slot)
         .await
         .ok_or_else(|| anyhow::anyhow!("pas connecté à un pair"))?;
@@ -404,22 +531,29 @@ pub async fn send_chat(slot: &Slot, text: &str) -> anyhow::Result<()> {
         .open_bi()
         .await
         .map_err(|e| anyhow::anyhow!("ouverture du flux: {e}"))?;
-    let bytes = text.as_bytes();
     AsyncWriteExt::write_all(&mut send, &[KIND_CHAT])
         .await
         .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
-    AsyncWriteExt::write_all(&mut send, &(bytes.len() as u32).to_be_bytes())
+    let nb = name.as_bytes();
+    AsyncWriteExt::write_all(&mut send, &(nb.len() as u16).to_be_bytes())
         .await
         .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
-    AsyncWriteExt::write_all(&mut send, bytes)
+    AsyncWriteExt::write_all(&mut send, nb)
+        .await
+        .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
+    let tb = text.as_bytes();
+    AsyncWriteExt::write_all(&mut send, &(tb.len() as u32).to_be_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
+    AsyncWriteExt::write_all(&mut send, tb)
         .await
         .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
     Ok(())
 }
 
-/// Envoie un petit message « sans corps » (juste un type) sur la connexion ouverte.
-async fn send_kind(slot: &Slot, kind: u8) -> anyhow::Result<()> {
+/// Envoie un message « type + nom d'affichage » (demandes d'ami) sur la connexion ouverte.
+async fn send_named(slot: &Slot, kind: u8, name: &str) -> anyhow::Result<()> {
     let conn = current(slot)
         .await
         .ok_or_else(|| anyhow::anyhow!("pas connecté à un pair"))?;
@@ -430,18 +564,25 @@ async fn send_kind(slot: &Slot, kind: u8) -> anyhow::Result<()> {
     AsyncWriteExt::write_all(&mut send, &[kind])
         .await
         .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
+    let nb = name.as_bytes();
+    AsyncWriteExt::write_all(&mut send, &(nb.len() as u16).to_be_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
+    AsyncWriteExt::write_all(&mut send, nb)
+        .await
+        .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
     Ok(())
 }
 
-/// Demande d'ami (au pair connecté).
-pub async fn send_freq(slot: &Slot) -> anyhow::Result<()> {
-    send_kind(slot, KIND_FREQ).await
+/// Demande d'ami (au pair connecté), avec le nom d'affichage.
+pub async fn send_freq(slot: &Slot, name: &str) -> anyhow::Result<()> {
+    send_named(slot, KIND_FREQ, name).await
 }
 
-/// Acceptation d'une demande d'ami.
-pub async fn send_faccept(slot: &Slot) -> anyhow::Result<()> {
-    send_kind(slot, KIND_FACCEPT).await
+/// Acceptation d'une demande d'ami, avec le nom d'affichage.
+pub async fn send_faccept(slot: &Slot, name: &str) -> anyhow::Result<()> {
+    send_named(slot, KIND_FACCEPT, name).await
 }
 
 /// Empreinte lisible d'un code (8 premiers octets de SHA-256, en 4 groupes hex).

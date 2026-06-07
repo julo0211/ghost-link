@@ -83,7 +83,10 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   <header>
     <svg class="ghost" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a99bff"/><stop offset="1" stop-color="#4be1e1"/></linearGradient></defs><path d="M32 6C20 6 12 15 12 27v25c0 2.6 3 4 4.8 2.1L21 50l4.4 4.4a3 3 0 0 0 4.3 0L34 50l4.4 4.4a3 3 0 0 0 4.3 0L47 50l4.2 4.1c1.8 1.9 4.8.5 4.8-2.1V27C56 15 44 6 32 6Z" fill="url(#g)"/><circle cx="25" cy="28" r="3.4" fill="#0a0a14"/><circle cx="39" cy="28" r="3.4" fill="#0a0a14"/></svg>
     <div><h1>ghost link</h1><div class="tagline">noyau natif — session de transfert</div></div>
-    <button class="theme-toggle" id="themeToggle" type="button" aria-label="Jour / Nuit" title="Bascule jour / nuit">🌙</button>
+    <div style="margin-left:auto;display:flex;gap:8px">
+      <button class="theme-toggle" id="btnSettings" type="button" title="Réglages" style="margin:0">⚙️</button>
+      <button class="theme-toggle" id="themeToggle" type="button" aria-label="Jour / Nuit" title="Bascule jour / nuit" style="margin:0">🌙</button>
+    </div>
   </header>
 
   <div id="connStatus" class="conn s-idle"><span class="dot"></span><span class="conn-text">Déconnecté</span></div>
@@ -94,6 +97,16 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     <button class="tab active" data-tab="transfert" type="button">📤 Transfert</button>
     <button class="tab" data-tab="amis" type="button">👥 Amis</button>
     <button class="tab" data-tab="identite" type="button">🪪 Identité</button>
+  </div>
+
+  <div class="card hidden" id="settingsCard">
+    <div class="row" style="justify-content:space-between;flex-wrap:nowrap"><h2 style="margin:0">⚙️ Réglages</h2><button class="btn sm ghost-btn" id="btnCloseSettings">Fermer</button></div>
+    <p class="hint" style="margin:14px 0 4px">Nom d'affichage (vu par tes pairs dans le chat et les demandes d'ami)</p>
+    <div class="row"><input type="text" id="setName" placeholder="ex. ton pseudo" style="flex:1;width:auto;min-width:0"><button class="btn sm" id="btnSaveName">Enregistrer</button></div>
+    <p class="hint" style="margin:16px 0 4px">Dossier de réception des fichiers</p>
+    <div class="row"><input type="text" id="setDir" placeholder="(par défaut : Téléchargements)" style="flex:1;width:auto;min-width:0;font-family:ui-monospace,monospace;font-size:12px"><button class="btn sm" id="btnSaveDir">Définir</button></div>
+    <p class="hint" style="margin:6px 0 0">Colle le chemin d'un dossier (vide = Téléchargements).</p>
+    <label class="row" style="margin-top:16px;cursor:pointer;gap:8px"><input type="checkbox" id="setOnlyFriends" style="width:auto;flex:0 0 auto"> <span style="font-size:13.5px">N'accepter que les connexions de mes amis</span></label>
   </div>
 
   <div class="card" data-pane="identite">
@@ -163,7 +176,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
 
   <div class="card"><h2>📜 Journal</h2><div id="log" class="log"></div></div>
 
-  <div class="foot">ghost link · noyau natif v0.11.0 · 👻</div>
+  <div class="foot">ghost link · noyau natif v0.12.0 · 👻</div>
 </div>
 
 <script>
@@ -211,9 +224,9 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     if (!name || !code) { log('Donne un nom et un code.'); return false; }
     const a = loadFriends();
     if (a.some(f => f.code === code)) { log('Cet ami est déjà enregistré.'); return false; }
-    a.push({ name, code }); saveFriends(a); renderFriends(); return true;
+    a.push({ name, code }); saveFriends(a); renderFriends(); pushFriendsToBackend(); return true;
   }
-  function removeFriend(i){ const a = loadFriends(); a.splice(i, 1); saveFriends(a); renderFriends(); refreshSaveRow(); }
+  function removeFriend(i){ const a = loadFriends(); a.splice(i, 1); saveFriends(a); renderFriends(); refreshSaveRow(); pushFriendsToBackend(); }
   function renderFriends(){
     const a = loadFriends(); const box = $('#friendsList'); box.innerHTML = '';
     if (!a.length) { box.innerHTML = '<div class="hint" style="margin:6px 0">Aucun ami enregistré pour l’instant.</div>'; return; }
@@ -274,36 +287,43 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   document.querySelectorAll('.tab').forEach(b => b.onclick = () => showTab(b.getAttribute('data-tab')));
 
   // Demandes d'ami (mutuelles)
-  function saveMutual(code){
+  function saveMutual(code, name){
     if (!code) return;
+    const label = (name && name.trim()) ? name.trim() : ('Ami ' + String(code).slice(0, 8));
     const a = loadFriends(); let f = a.find(x => x.code === code);
-    if (!f) { f = { name: 'Ami ' + String(code).slice(0, 8), code, mutual: true }; a.push(f); }
+    if (!f) { f = { name: label, code, mutual: true }; a.push(f); }
     else f.mutual = true;
-    saveFriends(a); renderFriends(); loadFingerprints();
+    saveFriends(a); renderFriends(); loadFingerprints(); pushFriendsToBackend();
   }
   $('#btnFreq').onclick = async () => {
-    try { await invoke('send_freq'); log('Demande d’ami envoyée.'); }
+    try { await invoke('send_freq', { name: myName() }); log('Demande d’ami envoyée.'); }
     catch (e) { log('Demande : ' + e); }
   };
-  listen('ghost-freq', async () => {
+  let pendingFreqName = '';
+  listen('ghost-freq', async e => {
     if (!currentPeer) return;
-    let fp = fpCache[currentPeer];
-    if (!fp) { try { fp = await invoke('fingerprint', { code: currentPeer }); fpCache[currentPeer] = fp; } catch (e) { fp = shortId(currentPeer); } }
-    $('#freqText').textContent = 'Un pair (' + fp + ') veut t’ajouter en ami.';
+    pendingFreqName = (e.payload && e.payload.name) ? e.payload.name : '';
+    let label = pendingFreqName.trim();
+    if (!label) {
+      label = fpCache[currentPeer];
+      if (!label) { try { label = await invoke('fingerprint', { code: currentPeer }); fpCache[currentPeer] = label; } catch (e2) { label = shortId(currentPeer); } }
+    }
+    $('#freqText').textContent = label + ' veut t’ajouter en ami.';
     $('#freqBanner').classList.remove('hidden');
   });
   $('#btnFreqAccept').onclick = async () => {
     $('#freqBanner').classList.add('hidden');
     if (!currentPeer) return;
-    saveMutual(currentPeer);
-    try { await invoke('send_faccept'); } catch (e) {}
+    saveMutual(currentPeer, pendingFreqName);
+    try { await invoke('send_faccept', { name: myName() }); } catch (e) {}
     log('Demande d’ami acceptée.');
   };
   $('#btnFreqRefuse').onclick = () => { $('#freqBanner').classList.add('hidden'); log('Demande d’ami refusée.'); };
-  listen('ghost-faccept', () => {
+  listen('ghost-faccept', e => {
     if (!currentPeer) return;
-    saveMutual(currentPeer);
-    log('Ami ajouté (mutuel) ✓');
+    const nm = (e.payload && e.payload.name) ? e.payload.name : '';
+    saveMutual(currentPeer, nm);
+    log('Ami ajouté (mutuel) ✓' + (nm ? ' — ' + nm : ''));
   });
 
   // Mises à jour automatiques
@@ -375,9 +395,15 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   listen('ghost-recv-cancel', e => { $('#recvBox').classList.add('hidden'); log('Réception annulée : ' + (e.payload && e.payload.name || '')); });
 
   // Chat (texte chiffré par le canal iroh)
-  function addMsg(text, who){
+  function addMsg(text, who, author){
     const c = $('#chatLog');
     const m = document.createElement('div'); m.className = 'msg ' + (who === 'me' ? 'me' : 'them');
+    if (who !== 'me' && author && author.trim()) {
+      const au = document.createElement('div');
+      au.style.cssText = 'font-size:11px;font-weight:700;opacity:.8;margin-bottom:2px';
+      au.textContent = author.trim();
+      m.appendChild(au);
+    }
     const b = document.createElement('div'); b.textContent = text;
     const t = document.createElement('span'); t.className = 't';
     t.textContent = new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
@@ -387,12 +413,35 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   async function sendChat(){
     const text = $('#chatInput').value.trim();
     if (!text) return;
-    try { await invoke('send_chat', { text }); addMsg(text, 'me'); $('#chatInput').value = ''; }
+    try { await invoke('send_chat', { text, name: myName() }); addMsg(text, 'me'); $('#chatInput').value = ''; }
     catch (e) { log('Chat : ' + e); }
   }
   $('#btnChat').onclick = sendChat;
   $('#chatInput').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); sendChat(); } };
-  listen('ghost-chat', e => { addMsg(e.payload.text, 'them'); });
+  listen('ghost-chat', e => { addMsg(e.payload.text, 'them', e.payload.name); });
+
+  // Réglages (engrenage ⚙️)
+  function myName(){ return (localStorage.getItem('ghostlink_name') || '').trim(); }
+  function pushFriendsToBackend(){
+    const codes = loadFriends().map(f => f.code);
+    invoke('set_friends', { codes }).catch(() => {});
+  }
+  $('#btnSettings').onclick = () => $('#settingsCard').classList.toggle('hidden');
+  $('#btnCloseSettings').onclick = () => $('#settingsCard').classList.add('hidden');
+  $('#setName').value = myName();
+  $('#btnSaveName').onclick = () => { localStorage.setItem('ghostlink_name', $('#setName').value.trim()); log('Nom d’affichage enregistré.'); };
+  $('#btnSaveDir').onclick = async () => {
+    try { await invoke('set_download_dir', { path: $('#setDir').value.trim() }); const d = await invoke('get_download_dir'); $('#setDir').value = d; log('Dossier de réception : ' + d); }
+    catch (e) { log('Dossier : ' + e); }
+  };
+  $('#setOnlyFriends').onchange = () => {
+    const on = $('#setOnlyFriends').checked;
+    localStorage.setItem('ghostlink_onlyfriends', on ? '1' : '0');
+    pushFriendsToBackend();
+    invoke('set_only_friends', { on }).catch(() => {});
+    log(on ? 'Mode « amis uniquement » activé.' : 'Mode « amis uniquement » désactivé.');
+  };
+  listen('ghost-refused', e => log('⛔ Connexion refusée (pair pas dans tes amis) : ' + shortId(e.payload)));
 
   // Session
   function setConnected(peer){
@@ -429,6 +478,8 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   loadFingerprints();
   invoke('my_id').then(code => { $('#myId').value = code; showFp(code); }).catch(() => {});
   invoke('app_version').then(v => { $('#appVer').textContent = v; }).catch(() => {});
+  invoke('get_download_dir').then(d => { $('#setDir').value = d; }).catch(() => {});
+  (function(){ const on = localStorage.getItem('ghostlink_onlyfriends') === '1'; $('#setOnlyFriends').checked = on; pushFriendsToBackend(); invoke('set_only_friends', { on }).catch(() => {}); })();
   setTimeout(() => checkUpdate(true), 5000);
   setTimeout(refreshPresence, 3000);
   setInterval(refreshPresence, 30000);
