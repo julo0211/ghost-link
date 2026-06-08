@@ -26,7 +26,7 @@ if (-not (Test-Path ".git")) { git init | Out-Null }
 git config user.name  $Name
 git config user.email $Email
 git add -A
-git commit -m "ghost link v0.11.0 — app native Tauri + iroh (P2P E2EE, chat, amis, presence, MAJ auto signees)" | Out-Null
+git commit -m "Mise a jour ghost link" | Out-Null
 git branch -M main
 git remote remove origin 2>$null | Out-Null
 git remote add origin "git@github.com:$Repo.git"

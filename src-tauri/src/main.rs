@@ -3,6 +3,7 @@
 // avec débit, annulation et déconnexion propagée.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio;
 mod net;
 
 use net::Net;
@@ -14,30 +15,28 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 struct PendingUpdate(std::sync::Mutex<Option<Update>>);
 
 #[tauri::command]
-async fn my_addr(state: State<'_, Net>) -> Result<String, String> {
-    let ep = state.endpoint.clone();
-    net::my_addr(&ep).await.map_err(|e| e.to_string())
+fn perm_code(state: State<'_, Net>) -> String {
+    net::perm_code(state.inner())
 }
 
 #[tauri::command]
-async fn my_id(state: State<'_, Net>) -> Result<String, String> {
-    let ep = state.endpoint.clone();
-    net::my_id(&ep).await.map_err(|e| e.to_string())
+async fn eph_code(state: State<'_, Net>) -> Result<String, String> {
+    Ok(net::eph_code(state.inner()).await)
+}
+
+#[tauri::command]
+async fn rotate_eph_code(state: State<'_, Net>) -> Result<String, String> {
+    net::rotate_eph(state.inner()).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn probe(state: State<'_, Net>, id: String) -> Result<bool, String> {
-    let ep = state.endpoint.clone();
-    Ok(net::probe(&ep, &id).await)
+    Ok(net::probe(state.inner(), &id).await)
 }
 
 #[tauri::command]
-async fn connect(app: tauri::AppHandle, state: State<'_, Net>, addr: String) -> Result<String, String> {
-    let ep = state.endpoint.clone();
-    let slot = state.slot.clone();
-    let rc = state.recv_cancel.clone();
-    let settings = state.settings.clone();
-    net::connect(&ep, &app, &slot, &rc, &settings, &addr).await.map_err(|e| e.to_string())
+async fn connect(state: State<'_, Net>, addr: String) -> Result<String, String> {
+    net::connect(state.inner(), &addr).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -56,13 +55,15 @@ async fn send_chat(state: State<'_, Net>, text: String, name: String) -> Result<
 #[tauri::command]
 async fn send_freq(state: State<'_, Net>, name: String) -> Result<(), String> {
     let slot = state.slot.clone();
-    net::send_freq(&slot, &name).await.map_err(|e| e.to_string())
+    let code = net::perm_code(state.inner());
+    net::send_freq(&slot, &name, &code).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn send_faccept(state: State<'_, Net>, name: String) -> Result<(), String> {
     let slot = state.slot.clone();
-    net::send_faccept(&slot, &name).await.map_err(|e| e.to_string())
+    let code = net::perm_code(state.inner());
+    net::send_faccept(&slot, &name, &code).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -83,6 +84,92 @@ fn set_only_friends(state: State<'_, Net>, on: bool) {
 #[tauri::command]
 fn set_friends(state: State<'_, Net>, codes: Vec<String>) {
     net::set_friends(&state.settings, codes);
+}
+
+#[tauri::command]
+async fn voice_test_start(
+    voice: State<'_, audio::Voice>,
+    cfg: State<'_, audio::AudioCfg>,
+) -> Result<(), String> {
+    let v = voice.inner().clone();
+    let c = cfg.inner().clone();
+    tokio::task::spawn_blocking(move || v.start(c))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn voice_test_stop(voice: State<'_, audio::Voice>) {
+    voice.stop();
+}
+
+#[tauri::command]
+async fn call_start(
+    net: State<'_, Net>,
+    call: State<'_, audio::Call>,
+    cfg: State<'_, audio::AudioCfg>,
+    signal: bool,
+) -> Result<(), String> {
+    let conn = net::current(&net.slot)
+        .await
+        .ok_or_else(|| "pas connecté à un pair".to_string())?;
+    let c = call.inner().clone();
+    let acfg = cfg.inner().clone();
+    let rt = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || c.start(conn, rt, acfg))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    if signal {
+        let slot = net.slot.clone();
+        net::send_call_start(&slot).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn call_stop(
+    net: State<'_, Net>,
+    call: State<'_, audio::Call>,
+    signal: bool,
+) -> Result<(), String> {
+    call.stop();
+    if signal {
+        let slot = net.slot.clone();
+        let _ = net::send_call_stop(&slot).await;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn call_set_mute(call: State<'_, audio::Call>, on: bool) {
+    call.set_mute(on);
+}
+
+#[tauri::command]
+fn list_audio_devices() -> (Vec<String>, Vec<String>) {
+    audio::list_devices()
+}
+
+#[tauri::command]
+fn set_audio_input(cfg: State<'_, audio::AudioCfg>, name: Option<String>) {
+    cfg.set_input(name);
+}
+
+#[tauri::command]
+fn set_audio_output(cfg: State<'_, audio::AudioCfg>, name: Option<String>) {
+    cfg.set_output(name);
+}
+
+#[tauri::command]
+fn respond_incoming(net: State<'_, Net>, id: u64, accept: bool) {
+    net::respond_incoming(&net.incoming, id, accept);
+}
+
+#[tauri::command]
+fn respond_file(net: State<'_, Net>, id: u64, accept: bool) {
+    net::respond_file(&net.settings, id, accept);
 }
 
 #[tauri::command]
@@ -164,14 +251,34 @@ fn main() {
                 .expect("démarrage du réseau iroh impossible");
             app.manage(net);
             app.manage(PendingUpdate(std::sync::Mutex::new(None)));
+            app.manage(audio::Voice::default());
+            app.manage(audio::Call::default());
+            app.manage(audio::AudioCfg::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            my_addr, my_id, probe, connect, send_file, send_chat, send_freq, send_faccept,
+            perm_code, eph_code, rotate_eph_code, probe, connect, send_file, send_chat, send_freq, send_faccept,
             fingerprint, app_version, check_update, install_update, set_download_dir,
-            get_download_dir, set_only_friends, set_friends, disconnect, cancel_send,
-            cancel_recv
+            get_download_dir, set_only_friends, set_friends, voice_test_start, voice_test_stop,
+            call_start, call_stop, call_set_mute, list_audio_devices, set_audio_input,
+            set_audio_output, respond_incoming, respond_file, disconnect, cancel_send, cancel_recv
         ])
-        .run(tauri::generate_context!())
-        .expect("erreur au lancement de ghost link");
+        .build(tauri::generate_context!())
+        .expect("erreur au lancement de ghost link")
+        .run(|app_handle, event| {
+            // À la fermeture de l'app, prévenir le pair : fermeture propre de la connexion
+            // pour qu'il passe en « déconnecté » immédiatement (au lieu d'attendre un timeout).
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                if let Some(net) = app_handle.try_state::<Net>() {
+                    let slot = net.slot.clone();
+                    tauri::async_runtime::block_on(async move {
+                        if let Some(c) = net::current(&slot).await {
+                            c.close(0u32.into(), b"bye");
+                        }
+                        // laisser le temps à la trame de fermeture de partir avant l'arrêt
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    });
+                }
+            }
+        });
 }

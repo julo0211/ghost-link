@@ -1,11 +1,11 @@
 {
-  "version": "0.11.0",
-  "notes": "Premiere version publique",
-  "pub_date": "2026-06-06T17:01:59.190Z",
+  "version": "0.12.0",
+  "notes": "Reglages (nom, dossier, amis-only) + preparation du chat vocal",
+  "pub_date": "2026-06-07T15:30:33.540Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVh6Nkh3Q1c1eHlXRXF6WmpuT1p5NFY5TlgrQUZFdzlPZEdrODB6Q2YyWDJTTkJZODEvUDVGUTlqdGxBa3VmNm10bzhkVmFIV2lJSVllZEpxWmk3SlFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgwNzY1MjU3CWZpbGU6Z2hvc3QtbGlua18wLjExLjBfeDY0LXNldHVwLmV4ZQpZNnlnOEJlTWVWaXJsckU4VVhHazJMamVOYnl6L1ZVN3FzTkxPdEJJM2krejdudmNDY2dhZlFWQ1QwWmtQSTdVTGV6enEyNmNYMWJPYVltUngxVjdDUT09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.11.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVJtVTF3UytKeTU4RDVYMEVVN3BSN1BSem9LOXlIcjBhZE5tN1U0RTJRcnYwdDBsektYNFZsaGNGQjUzRTdOVU5Tcmcxdm5mVG9ZYXdGeFlOTzk0dWdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgwODQ2MjMxCWZpbGU6Z2hvc3QtbGlua18wLjEyLjBfeDY0LXNldHVwLmV4ZQovV3loVjVzaytHQ0VrcWZqbzZZMzY1bmowZlZ5dGxZQkNqODlPRURtMXZZUVdFQnFYWERrSEY1eHo1VjlBWThFaDRFZXNkT1BlMlp2NnhNYnMrYWpDZz09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.12.0_x64-setup.exe"
     }
   }
 }

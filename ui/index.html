@@ -93,6 +93,12 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
 
   <div id="freqBanner" class="banner hidden"><span id="freqText">Un pair veut t'ajouter en ami.</span><span class="sp"></span><button class="btn sm" id="btnFreqAccept">Accepter</button><button class="btn sm ghost-btn" id="btnFreqRefuse">Refuser</button></div>
 
+  <div id="incomingBanner" class="banner hidden"><span id="incomingText">Un pair veut se connecter.</span><span class="sp"></span><button class="btn sm" id="btnAccept">Accepter</button><button class="btn sm ghost-btn" id="btnRefuse">Refuser</button></div>
+
+  <div id="fileOfferBanner" class="banner hidden"><span id="fileOfferText">Réception d'un fichier.</span><span class="sp"></span><button class="btn sm" id="btnFileAccept">Accepter</button><button class="btn sm ghost-btn" id="btnFileReject">Refuser</button></div>
+
+  <div id="callOfferBanner" class="banner hidden"><span id="callOfferText">📞 Appel entrant…</span><span class="sp"></span><button class="btn sm" id="btnCallAccept">Accepter</button><button class="btn sm ghost-btn" id="btnCallRefuse">Refuser</button></div>
+
   <div class="tabs">
     <button class="tab active" data-tab="transfert" type="button">📤 Transfert</button>
     <button class="tab" data-tab="amis" type="button">👥 Amis</button>
@@ -107,20 +113,30 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     <div class="row"><input type="text" id="setDir" placeholder="(par défaut : Téléchargements)" style="flex:1;width:auto;min-width:0;font-family:ui-monospace,monospace;font-size:12px"><button class="btn sm" id="btnSaveDir">Définir</button></div>
     <p class="hint" style="margin:6px 0 0">Colle le chemin d'un dossier (vide = Téléchargements).</p>
     <label class="row" style="margin-top:16px;cursor:pointer;gap:8px"><input type="checkbox" id="setOnlyFriends" style="width:auto;flex:0 0 auto"> <span style="font-size:13.5px">N'accepter que les connexions de mes amis</span></label>
+    <p class="hint" style="margin:18px 0 4px">Vocal (en préparation) — test local du micro</p>
+    <div class="row"><button class="btn sm" id="btnVoiceTest">🎙️ Tester le micro</button><span class="hint" id="voiceStatus" style="margin:0"></span></div>
+    <p class="hint" style="margin:16px 0 4px">Micro</p>
+    <select id="selMic" style="width:100%;background:var(--field);color:var(--text);border:1px solid var(--gborder);border-radius:13px;padding:10px 12px;font-size:13px"></select>
+    <p class="hint" style="margin:12px 0 4px">Haut-parleur</p>
+    <select id="selSpk" style="width:100%;background:var(--field);color:var(--text);border:1px solid var(--gborder);border-radius:13px;padding:10px 12px;font-size:13px"></select>
+    <p class="hint" style="margin:6px 0 0">Appliqué au prochain test micro / appel.</p>
   </div>
 
   <div class="card" data-pane="identite">
     <h2>🪪 Mon identité</h2>
-    <p class="hint">Ton code ghost — court et stable. Partage-le à tes amis : ils te retrouveront sans coller d'adresse.</p>
-    <div class="row"><button class="btn" id="btnId">✨ Afficher mon code</button><button class="btn sm ghost-btn" id="btnCopyId">📋 Copier</button></div>
-    <input type="text" id="myId" readonly placeholder="(clique sur « Afficher mon code »)" style="margin-top:10px;font-family:ui-monospace,monospace;font-size:13px">
-    <div id="fpBox" class="hidden" style="margin-top:12px"><span class="hint">Empreinte d'identité (compare-la de vive voix avec ton ami) :</span><div class="fp" id="myFp" style="margin-top:5px"></div></div>
-    <div class="row" style="margin-top:12px"><button class="btn sm ghost-btn" id="btnAddrToggle">⚙︎ Adresse complète</button></div>
-    <div id="addrAdvanced" class="hidden">
-      <p class="hint" style="margin:12px 0 8px">Si la découverte ne passe pas (réseau très restreint), partage plutôt l'adresse complète pour une connexion directe immédiate.</p>
-      <div class="row"><button class="btn sm ghost-btn" id="btnAddr">Obtenir l'adresse</button><button class="btn sm ghost-btn" id="btnCopy">📋 Copier</button></div>
-      <textarea id="myAddr" readonly placeholder="(adresse complète)" style="margin-top:8px;min-height:64px"></textarea>
+
+    <p class="hint"><b>🎲 Code éphémère</b> — jetable, régénéré à chaque lancement. À donner pour un premier contact ou un partage ponctuel.</p>
+    <div class="row">
+      <input type="text" id="ephId" readonly placeholder="(génération…)" style="flex:1 1 200px;width:auto;min-width:120px;font-family:ui-monospace,monospace;font-size:13px">
+      <button class="btn sm ghost-btn" id="btnCopyEph">📋 Copier</button>
+      <button class="btn sm" id="btnRotateEph">🔄 Changer</button>
     </div>
+
+    <p class="hint" style="margin-top:18px"><b>🔑 Code permanent (ami)</b> — stable. À partager <b>seulement avec tes amis</b> (ou en vous ajoutant pendant une connexion). C'est par lui qu'ils te retrouvent.</p>
+    <div class="row"><button class="btn" id="btnId">✨ Afficher</button><button class="btn sm ghost-btn" id="btnCopyId">📋 Copier</button></div>
+    <input type="text" id="myId" readonly placeholder="(clique sur « Afficher »)" style="margin-top:10px;font-family:ui-monospace,monospace;font-size:13px">
+    <div id="fpBox" class="hidden" style="margin-top:12px"><span class="hint">Empreinte du code permanent (compare-la de vive voix avec ton ami) :</span><div class="fp" id="myFp" style="margin-top:5px"></div></div>
+    <p class="hint" style="margin:12px 0 0">🔒 Aucun des deux codes ne contient ton adresse IP.</p>
     <div style="margin-top:16px;border-top:1px solid var(--hair);padding-top:14px">
       <div class="row" style="justify-content:space-between;flex-wrap:nowrap"><h2 style="margin:0;font-size:14px">⬆️ Mises à jour</h2><button class="btn sm ghost-btn" id="btnCheckUpdate">Vérifier</button></div>
       <p class="hint" id="updateStatus" style="margin:8px 0 0">Version actuelle : <span id="appVer">…</span></p>
@@ -134,19 +150,16 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   <div class="card" data-pane="transfert">
     <h2>🔌 Connexion</h2>
     <div id="connectForm">
-      <p class="hint">Entre le <b>code</b> (ou l'adresse) d'un pair pour ouvrir une session. Ensuite, envoyez-vous autant de fichiers que vous voulez.</p>
-      <textarea id="peerAddr" placeholder="Code ami ou adresse ghost du pair…"></textarea>
+      <p class="hint">Entre le <b>code ami</b> d'un pair pour ouvrir une session. Ensuite, envoyez-vous autant de fichiers que vous voulez.</p>
+      <textarea id="peerAddr" placeholder="Code ami du pair…"></textarea>
       <div class="row" style="margin-top:10px"><button class="btn" id="btnConnect">🔌 Se connecter</button></div>
     </div>
     <div id="sessionBox" class="hidden">
       <div class="peerline"><span class="dot" style="width:9px;height:9px;border-radius:50%;background:var(--good);box-shadow:0 0 10px var(--good)"></span><span id="peerLabel">Connecté</span></div>
-      <div class="row hidden" style="margin-bottom:12px" id="savePeerRow">
-        <input type="text" id="savePeerName" placeholder="Nom de cet ami" style="flex:1 1 150px;width:auto;min-width:120px">
-        <button class="btn sm ghost-btn" id="btnSavePeer">💾 Garder cet ami</button>
-      </div>
       <div class="drop" id="drop"><span class="big">📄</span> Glisse un fichier ici pour l'envoyer</div>
       <input type="text" id="filePath" placeholder="…ou colle le chemin du fichier" style="margin-top:8px">
-      <div class="row" style="margin-top:10px"><button class="btn" id="btnSend">📤 Envoyer le fichier</button><button class="btn sm ghost-btn" id="btnFreq">➕ Demander en ami</button><button class="btn sm ghost-btn" id="btnDisconnect">⏏ Déconnecter</button></div>
+      <div class="row" style="margin-top:10px"><button class="btn" id="btnSend">📤 Envoyer le fichier</button><button class="btn sm ghost-btn" id="btnCall">📞 Appeler</button><button class="btn sm ghost-btn hidden" id="btnMute">🔇 Couper le micro</button><button class="btn sm ghost-btn" id="btnFreq">➕ Demander en ami</button><button class="btn sm ghost-btn" id="btnDisconnect">⏏ Déconnecter</button></div>
+      <div class="hint" id="callStatus" style="margin-top:8px"></div>
       <div id="sendBox" class="xfer hidden"><div class="meta"><div class="nm" id="sendName"></div><div class="bar"><i id="sendBar"></i></div></div><div class="pct" id="sendPct"></div><button class="btn sm ghost-btn hidden" id="btnCancelSend">Annuler</button></div>
     </div>
   </div>
@@ -176,7 +189,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
 
   <div class="card"><h2>📜 Journal</h2><div id="log" class="log"></div></div>
 
-  <div class="foot">ghost link · noyau natif v0.12.0 · 👻</div>
+  <div class="foot">ghost link · noyau natif v0.14.2 · 👻</div>
 </div>
 
 <script>
@@ -185,21 +198,33 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   const $ = s => document.querySelector(s);
   function log(m){ const d=document.createElement('div'); d.textContent='• '+m; $('#log').prepend(d); }
   function fmt(b){ b=Number(b)||0; if(b<1024) return b.toFixed(0)+' o'; const u=['Ko','Mo','Go','To']; let i=-1; do{ b/=1024; i++; }while(b>=1024&&i<u.length-1); return b.toFixed(1)+' '+u[i]; }
+  function etaStr(sec){ if(!isFinite(sec)||sec<=0) return '—'; sec=Math.round(sec); if(sec<60) return sec+' s'; const m=Math.floor(sec/60), s=sec%60; if(m<60) return m+' min '+(s<10?'0':'')+s+' s'; const h=Math.floor(m/60); return h+' h '+((m%60)<10?'0':'')+(m%60)+' min'; }
   function baseName(p){ return String(p).split(/[\\/]/).pop(); }
   function shortId(id){ id=String(id); return id.length>14 ? id.slice(0,14)+'…' : id; }
 
-  // Mon code / adresse complète
+  // Mon code : caché par défaut, révélé/masqué via le bouton (le bouton sert à ça).
+  let myCode = '';
   $('#btnId').onclick = async () => {
-    try { const code = await invoke('my_id'); $('#myId').value = code; showFp(code); log('Code ghost affiché.'); }
-    catch (e) { log('Erreur code : ' + e); }
+    if ($('#myId').value) {                       // déjà affiché → masquer
+      $('#myId').value = ''; $('#fpBox').classList.add('hidden');
+      $('#btnId').textContent = '✨ Afficher mon code';
+      return;
+    }
+    try {
+      if (!myCode) myCode = await invoke('perm_code');
+      $('#myId').value = myCode; showFp(myCode);
+      $('#btnId').textContent = '🙈 Masquer mon code';
+      log('Code ghost affiché.');
+    } catch (e) { log('Erreur code : ' + e); }
   };
-  $('#btnCopyId').onclick = () => { if ($('#myId').value) { navigator.clipboard.writeText($('#myId').value); log('Code copié.'); } };
-  $('#btnAddrToggle').onclick = () => $('#addrAdvanced').classList.toggle('hidden');
-  $('#btnAddr').onclick = async () => {
-    try { $('#myAddr').value = await invoke('my_addr'); log('Adresse complète obtenue.'); }
-    catch (e) { log('Erreur adresse : ' + e); }
+  $('#btnCopyId').onclick = () => { if (myCode) { navigator.clipboard.writeText(myCode); log('Code permanent copié ✅'); } else { log('Code indisponible.'); } };
+  $('#btnCopyEph').onclick = () => { const v = $('#ephId').value; if (v) { navigator.clipboard.writeText(v); log('Code éphémère copié ✅'); } };
+  $('#btnRotateEph').onclick = async () => {
+    $('#btnRotateEph').disabled = true;
+    try { const c = await invoke('rotate_eph_code'); $('#ephId').value = c; log('🔄 Nouveau code éphémère — l\'ancien ne marche plus.'); }
+    catch (e) { log('Rotation : ' + e); }
+    finally { $('#btnRotateEph').disabled = false; }
   };
-  $('#btnCopy').onclick = () => { if ($('#myAddr').value) { navigator.clipboard.writeText($('#myAddr').value); log('Adresse copiée.'); } };
 
   // Connexion (code ami ou adresse)
   async function connectTo(addr){
@@ -244,16 +269,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
       box.appendChild(d);
     });
   }
-  function refreshSaveRow(){
-    const row = $('#savePeerRow'); if (!row) return;
-    const known = currentPeer && loadFriends().some(f => f.code === currentPeer);
-    row.classList.toggle('hidden', !currentPeer || known);
-  }
   $('#btnAddFriend').onclick = () => { if (addFriend($('#friendName').value, $('#friendCode').value)) { $('#friendName').value = ''; $('#friendCode').value = ''; log('Ami ajouté.'); } };
-  $('#btnSavePeer').onclick = () => {
-    const name = $('#savePeerName').value.trim() || ('Ami ' + shortId(currentPeer || ''));
-    if (currentPeer && addFriend(name, currentPeer)) { $('#savePeerName').value = ''; refreshSaveRow(); log('Ami enregistré.'); }
-  };
 
   // Présence : sonder les amis pour savoir qui est en ligne (P2P, sans serveur).
   async function probeFriend(code){
@@ -292,7 +308,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     const label = (name && name.trim()) ? name.trim() : ('Ami ' + String(code).slice(0, 8));
     const a = loadFriends(); let f = a.find(x => x.code === code);
     if (!f) { f = { name: label, code, mutual: true }; a.push(f); }
-    else f.mutual = true;
+    else { f.mutual = true; if (name && name.trim()) f.name = name.trim(); }
     saveFriends(a); renderFriends(); loadFingerprints(); pushFriendsToBackend();
   }
   $('#btnFreq').onclick = async () => {
@@ -300,13 +316,16 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     catch (e) { log('Demande : ' + e); }
   };
   let pendingFreqName = '';
+  let pendingFreqCode = '';
   listen('ghost-freq', async e => {
     if (!currentPeer) return;
     pendingFreqName = (e.payload && e.payload.name) ? e.payload.name : '';
+    // Enregistrer le code PERMANENT de l'autre (pas l'éphémère de la connexion).
+    pendingFreqCode = (e.payload && e.payload.code) ? e.payload.code : currentPeer;
     let label = pendingFreqName.trim();
     if (!label) {
-      label = fpCache[currentPeer];
-      if (!label) { try { label = await invoke('fingerprint', { code: currentPeer }); fpCache[currentPeer] = label; } catch (e2) { label = shortId(currentPeer); } }
+      label = fpCache[pendingFreqCode];
+      if (!label) { try { label = await invoke('fingerprint', { code: pendingFreqCode }); fpCache[pendingFreqCode] = label; } catch (e2) { label = shortId(pendingFreqCode); } }
     }
     $('#freqText').textContent = label + ' veut t’ajouter en ami.';
     $('#freqBanner').classList.remove('hidden');
@@ -314,7 +333,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   $('#btnFreqAccept').onclick = async () => {
     $('#freqBanner').classList.add('hidden');
     if (!currentPeer) return;
-    saveMutual(currentPeer, pendingFreqName);
+    saveMutual(pendingFreqCode || currentPeer, pendingFreqName);
     try { await invoke('send_faccept', { name: myName() }); } catch (e) {}
     log('Demande d’ami acceptée.');
   };
@@ -322,7 +341,8 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   listen('ghost-faccept', e => {
     if (!currentPeer) return;
     const nm = (e.payload && e.payload.name) ? e.payload.name : '';
-    saveMutual(currentPeer, nm);
+    const code = (e.payload && e.payload.code) ? e.payload.code : currentPeer;
+    saveMutual(code, nm);
     log('Ami ajouté (mutuel) ✓' + (nm ? ' — ' + nm : ''));
   });
 
@@ -351,11 +371,11 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   function setFile(path){ $('#filePath').value = path; $('#drop').innerHTML = '<span class="big">📄</span> ' + baseName(path); }
 
   // Envoi (avec débit + annulation)
-  let sT = 0, sB = 0;
+  let sT = 0, sB = 0, sSpd = 0, sLast = 0;
   $('#btnSend').onclick = async () => {
     const path = $('#filePath').value.trim();
     if (!path) { log('Glisse un fichier (ou colle son chemin).'); return; }
-    sT = 0; sB = 0;
+    sT = 0; sB = 0; sSpd = 0; sLast = 0;
     $('#sendBox').classList.remove('hidden'); $('#btnCancelSend').classList.remove('hidden');
     $('#sendName').textContent = baseName(path); $('#sendBar').style.width = '0%'; $('#sendPct').textContent = '0%';
     $('#btnSend').disabled = true;
@@ -365,23 +385,37 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   };
   $('#btnCancelSend').onclick = () => { invoke('cancel_send'); log('Annulation de l’envoi…'); };
   listen('ghost-send-progress', e => {
-    const {sent,size}=e.payload; const now=performance.now(); if(sT===0){sT=now;sB=0;}
-    const dt=(now-sT)/1000; const spd=dt>0?(sent-sB)/dt:0; const p=size?Math.round(sent/size*100):0;
-    $('#sendBar').style.width=p+'%'; $('#sendPct').textContent=p+'% · '+fmt(spd)+'/s'; sT=now; sB=sent;
+    const {sent,size}=e.payload; const now=performance.now();
+    const p=size?Math.round(sent/size*100):0;
+    $('#sendBar').style.width=p+'%';
+    if(sT===0){ sT=now; sB=sent; sLast=now; $('#sendPct').textContent=p+'%'; return; }
+    if(now-sLast < 400) return;                          // rafraîchir vitesse/ETA au plus 1×/0,4 s
+    const dt=(now-sT)/1000; const inst=dt>0?(sent-sB)/dt:0;
+    sSpd = sSpd>0 ? sSpd*0.6+inst*0.4 : inst;            // lissage (moyenne mobile)
+    const eta = sSpd>0 ? (size-sent)/sSpd : 0;
+    $('#sendPct').textContent = p+'% · '+fmt(sSpd)+'/s · ⏳ '+etaStr(eta);
+    sT=now; sB=sent; sLast=now;
   });
 
   // Réception (avec débit + annulation)
-  let rT = 0, rB = 0;
+  let rT = 0, rB = 0, rSpd = 0, rLast = 0;
   $('#btnCancelRecv').onclick = () => { invoke('cancel_recv'); log('Annulation de la réception…'); };
   listen('ghost-recv-start', e => {
     $('#recvBox').classList.remove('hidden'); $('#btnCancelRecv').classList.remove('hidden');
-    $('#recvName').textContent = e.payload.name; $('#recvBar').style.width='0%'; $('#recvPct').textContent='0%'; rT=0; rB=0;
+    $('#recvName').textContent = e.payload.name; $('#recvBar').style.width='0%'; $('#recvPct').textContent='0%'; rT=0; rB=0; rSpd=0; rLast=0;
     log('⬇️ Réception de « ' + e.payload.name + ' » (' + fmt(e.payload.size) + ')…');
   });
   listen('ghost-recv-progress', e => {
-    const {received,size}=e.payload; const now=performance.now(); if(rT===0){rT=now;rB=0;}
-    const dt=(now-rT)/1000; const spd=dt>0?(received-rB)/dt:0; const p=size?Math.round(received/size*100):0;
-    $('#recvBar').style.width=p+'%'; $('#recvPct').textContent=p+'% · '+fmt(spd)+'/s'; rT=now; rB=received;
+    const {received,size}=e.payload; const now=performance.now();
+    const p=size?Math.round(received/size*100):0;
+    $('#recvBar').style.width=p+'%';
+    if(rT===0){ rT=now; rB=received; rLast=now; $('#recvPct').textContent=p+'%'; return; }
+    if(now-rLast < 400) return;
+    const dt=(now-rT)/1000; const inst=dt>0?(received-rB)/dt:0;
+    rSpd = rSpd>0 ? rSpd*0.6+inst*0.4 : inst;
+    const eta = rSpd>0 ? (size-received)/rSpd : 0;
+    $('#recvPct').textContent = p+'% · '+fmt(rSpd)+'/s · ⏳ '+etaStr(eta);
+    rT=now; rB=received; rLast=now;
   });
   listen('ghost-recv-done', e => {
     $('#recvBox').classList.add('hidden');
@@ -393,6 +427,23 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     $('#recvList').prepend(d); log('Fichier reçu : ' + name);
   });
   listen('ghost-recv-cancel', e => { $('#recvBox').classList.add('hidden'); log('Réception annulée : ' + (e.payload && e.payload.name || '')); });
+
+  // Acceptation d'un fichier entrant (avant réception)
+  let fileOfferId = null;
+  listen('ghost-recv-offer', e => {
+    const p = e.payload || {}; fileOfferId = p.id;
+    $('#fileOfferText').textContent = '📥 « ' + (p.name || 'fichier') + ' » (' + fmt(p.size || 0) + ') — accepter ce fichier ?';
+    $('#fileOfferBanner').classList.remove('hidden');
+  });
+  $('#btnFileAccept').onclick = () => {
+    if (fileOfferId != null) invoke('respond_file', { id: fileOfferId, accept: true }).catch(() => {});
+    $('#fileOfferBanner').classList.add('hidden'); fileOfferId = null;
+  };
+  $('#btnFileReject').onclick = () => {
+    if (fileOfferId != null) invoke('respond_file', { id: fileOfferId, accept: false }).catch(() => {});
+    $('#fileOfferBanner').classList.add('hidden'); fileOfferId = null; log('Fichier refusé.');
+  };
+  listen('ghost-recv-rejected', e => { $('#recvBox').classList.add('hidden'); log('Fichier refusé : ' + (e.payload && e.payload.name || '')); });
 
   // Chat (texte chiffré par le canal iroh)
   function addMsg(text, who, author){
@@ -443,6 +494,130 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   };
   listen('ghost-refused', e => log('⛔ Connexion refusée (pair pas dans tes amis) : ' + shortId(e.payload)));
 
+  // Demande de connexion entrante (accepter / refuser)
+  let incomingId = null;
+  listen('ghost-incoming', async e => {
+    const p = e.payload || {};
+    incomingId = p.id;
+    let label = '';
+    const f = loadFriends().find(x => x.code === p.peer);
+    if (f) { label = f.name; }
+    else {
+      label = fpCache[p.peer];
+      if (!label) { try { label = await invoke('fingerprint', { code: p.peer }); fpCache[p.peer] = label; } catch (e2) { label = shortId(p.peer); } }
+    }
+    $('#incomingText').textContent = label + ' veut se connecter à toi.';
+    $('#incomingBanner').classList.remove('hidden');
+  });
+  $('#btnAccept').onclick = () => {
+    if (incomingId != null) invoke('respond_incoming', { id: incomingId, accept: true }).catch(() => {});
+    $('#incomingBanner').classList.add('hidden'); incomingId = null; log('Connexion acceptée.');
+  };
+  $('#btnRefuse').onclick = () => {
+    if (incomingId != null) invoke('respond_incoming', { id: incomingId, accept: false }).catch(() => {});
+    $('#incomingBanner').classList.add('hidden'); incomingId = null; log('Connexion refusée.');
+  };
+  listen('ghost-incoming-cancel', () => { $('#incomingBanner').classList.add('hidden'); incomingId = null; });
+
+  // Vocal — V1 : test local du micro (boucle micro → haut-parleur)
+  let voiceTesting = false;
+  $('#btnVoiceTest').onclick = async () => {
+    if (!voiceTesting) {
+      $('#btnVoiceTest').disabled = true; $('#voiceStatus').textContent = 'démarrage…';
+      try {
+        await invoke('voice_test_start');
+        voiceTesting = true;
+        $('#btnVoiceTest').textContent = '⏹ Arrêter';
+        $('#voiceStatus').textContent = 'tu devrais t’entendre (petit délai) — mets un casque pour éviter l’écho.';
+        log('🎙️ Test micro démarré.');
+      } catch (e) { $('#voiceStatus').textContent = 'erreur : ' + e; log('Test micro : ' + e); }
+      finally { $('#btnVoiceTest').disabled = false; }
+    } else {
+      try { await invoke('voice_test_stop'); } catch (e) {}
+      voiceTesting = false;
+      $('#btnVoiceTest').textContent = '🎙️ Tester le micro';
+      $('#voiceStatus').textContent = '';
+      log('Test micro arrêté.');
+    }
+  };
+
+  // Appel vocal (V3) — duplex via les datagrammes iroh
+  let inCall = false;
+  let muted = false;
+  function setCallUI(on){
+    inCall = on;
+    const b = $('#btnCall'); if (b) b.textContent = on ? '📵 Raccrocher' : '📞 Appeler';
+    const s = $('#callStatus'); if (s) s.textContent = on ? '🔊 En appel — parle ! (casque conseillé pour éviter l’écho)' : '';
+    const m = $('#btnMute');
+    if (m) { m.classList.toggle('hidden', !on); muted = false; m.textContent = '🔇 Couper le micro'; }
+  }
+  $('#btnMute').onclick = () => {
+    muted = !muted;
+    invoke('call_set_mute', { on: muted }).catch(() => {});
+    $('#btnMute').textContent = muted ? '🎙️ Réactiver le micro' : '🔇 Couper le micro';
+    $('#callStatus').textContent = muted ? '🔇 Micro coupé' : '🔊 En appel — parle !';
+  };
+  $('#btnCall').onclick = async () => {
+    if (!inCall) {
+      $('#btnCall').disabled = true;
+      try { await invoke('call_start', { signal: true }); setCallUI(true); log('📞 Appel démarré.'); }
+      catch (e) { log('Appel : ' + e); $('#callStatus').textContent = 'erreur : ' + e; }
+      finally { $('#btnCall').disabled = false; }
+    } else {
+      try { await invoke('call_stop', { signal: true }); } catch (e) {}
+      setCallUI(false); log('Appel terminé.');
+    }
+  };
+  // Appel entrant : NE PAS ouvrir le micro automatiquement — demander le consentement.
+  let callOfferTimer = null;
+  function hideCallOffer(){ const b = $('#callOfferBanner'); if (b) b.classList.add('hidden'); if (callOfferTimer){ clearTimeout(callOfferTimer); callOfferTimer = null; } }
+  listen('ghost-call-start', () => {
+    if (inCall) return;
+    $('#callOfferBanner').classList.remove('hidden');
+    if (callOfferTimer) clearTimeout(callOfferTimer);
+    callOfferTimer = setTimeout(() => { hideCallOffer(); invoke('call_stop', { signal: false }).catch(() => {}); }, 30000);
+    log('📞 Appel entrant — accepte pour activer ton micro.');
+  });
+  $('#btnCallAccept').onclick = async () => {
+    hideCallOffer();
+    if (inCall) return;
+    $('#btnCallAccept').disabled = true;
+    try { await invoke('call_start', { signal: false }); setCallUI(true); log('📞 Appel accepté.'); }
+    catch (e) { log('Appel : ' + e); }
+    finally { $('#btnCallAccept').disabled = false; }
+  };
+  $('#btnCallRefuse').onclick = () => {
+    hideCallOffer();
+    invoke('call_stop', { signal: true }).catch(() => {});   // prévient l'appelant du refus
+    log('Appel refusé.');
+  };
+  listen('ghost-call-stop', async () => {
+    hideCallOffer();                                          // l'appelant a annulé pendant la sonnerie
+    if (!inCall) return;
+    try { await invoke('call_stop', { signal: false }); } catch (e) {}
+    setCallUI(false); log('Le pair a raccroché.');
+  });
+
+  // Choix des périphériques audio (micro / haut-parleur)
+  function fillSel(sel, items, chosen){
+    sel.innerHTML = '';
+    const def = document.createElement('option'); def.value = ''; def.textContent = '(par défaut)'; sel.appendChild(def);
+    for (const n of items){ const o = document.createElement('option'); o.value = n; o.textContent = n; sel.appendChild(o); }
+    sel.value = chosen;
+  }
+  async function loadAudioDevices(){
+    try {
+      const r = await invoke('list_audio_devices');
+      const ins = (r && r[0]) || []; const outs = (r && r[1]) || [];
+      fillSel($('#selMic'), ins, localStorage.getItem('ghostlink_mic') || '');
+      fillSel($('#selSpk'), outs, localStorage.getItem('ghostlink_spk') || '');
+      invoke('set_audio_input', { name: localStorage.getItem('ghostlink_mic') || null }).catch(() => {});
+      invoke('set_audio_output', { name: localStorage.getItem('ghostlink_spk') || null }).catch(() => {});
+    } catch (e) {}
+  }
+  $('#selMic').onchange = () => { const v = $('#selMic').value; localStorage.setItem('ghostlink_mic', v); invoke('set_audio_input', { name: v || null }).catch(() => {}); };
+  $('#selSpk').onchange = () => { const v = $('#selSpk').value; localStorage.setItem('ghostlink_spk', v); invoke('set_audio_output', { name: v || null }).catch(() => {}); };
+
   // Session
   function setConnected(peer){
     currentPeer = peer;
@@ -451,15 +626,15 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     $('#connectForm').classList.add('hidden'); $('#sessionBox').classList.remove('hidden'); $('#btnConnect').disabled = false;
     $('#chatCard').classList.remove('hidden');
     showTab('transfert');
-    refreshSaveRow();
   }
   function setDisconnected(){
     currentPeer = null;
     $('#connStatus').className = 'conn s-idle'; $('#connStatus').querySelector('.conn-text').textContent = 'Déconnecté';
     $('#sessionBox').classList.add('hidden'); $('#connectForm').classList.remove('hidden'); $('#btnConnect').disabled = false;
     $('#sendBox').classList.add('hidden'); $('#recvBox').classList.add('hidden');
-    $('#savePeerRow').classList.add('hidden'); $('#savePeerName').value = '';
     $('#freqBanner').classList.add('hidden');
+    hideCallOffer();
+    if (inCall) { invoke('call_stop', { signal: false }).catch(() => {}); setCallUI(false); }
     $('#chatCard').classList.add('hidden'); $('#chatLog').innerHTML = ''; $('#chatInput').value = '';
     $('#filePath').value = ''; $('#drop').innerHTML = '<span class="big">📄</span> Glisse un fichier ici pour l\'envoyer';
   }
@@ -476,10 +651,12 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   showTab('transfert');
   renderFriends();
   loadFingerprints();
-  invoke('my_id').then(code => { $('#myId').value = code; showFp(code); }).catch(() => {});
+  invoke('perm_code').then(code => { myCode = code; }).catch(() => {});
+  invoke('eph_code').then(code => { $('#ephId').value = code; }).catch(() => {});
   invoke('app_version').then(v => { $('#appVer').textContent = v; }).catch(() => {});
   invoke('get_download_dir').then(d => { $('#setDir').value = d; }).catch(() => {});
   (function(){ const on = localStorage.getItem('ghostlink_onlyfriends') === '1'; $('#setOnlyFriends').checked = on; pushFriendsToBackend(); invoke('set_only_friends', { on }).catch(() => {}); })();
+  loadAudioDevices();
   setTimeout(() => checkUpdate(true), 5000);
   setTimeout(refreshPresence, 3000);
   setInterval(refreshPresence, 30000);

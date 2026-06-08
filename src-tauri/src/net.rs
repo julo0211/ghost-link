@@ -2,9 +2,9 @@
 // Modèle « session » : on se connecte une fois, puis on s'envoie autant de fichiers
 // qu'on veut (dans les deux sens). Avec débit, annulation et déconnexion propagée.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use iroh::{
@@ -19,12 +19,14 @@ use tokio::sync::Mutex;
 pub const ALPN: &[u8] = b"ghost-link/file/0";
 // Protocole léger de présence : si la connexion s'établit, le pair est en ligne.
 pub const PRESENCE_ALPN: &[u8] = b"ghost-link/presence/0";
-const CHUNK: usize = 64 * 1024;
+const CHUNK: usize = 256 * 1024;
 // Premier octet de chaque flux bi-directionnel : type de message.
 const KIND_FILE: u8 = 1;
 const KIND_CHAT: u8 = 2;
 const KIND_FREQ: u8 = 3; // demande d'ami
 const KIND_FACCEPT: u8 = 4; // acceptation d'ami
+const KIND_CALL_START: u8 = 5; // début d'appel vocal
+const KIND_CALL_STOP: u8 = 6; // fin d'appel vocal
 
 #[derive(Default)]
 pub struct ConnState {
@@ -33,7 +35,7 @@ pub struct ConnState {
 }
 pub type Slot = Arc<Mutex<ConnState>>;
 
-async fn current(slot: &Slot) -> Option<Connection> {
+pub async fn current(slot: &Slot) -> Option<Connection> {
     slot.lock().await.conn.clone()
 }
 
@@ -43,6 +45,8 @@ pub struct Settings {
     pub download_dir: Arc<StdMutex<Option<PathBuf>>>,
     pub only_friends: Arc<AtomicBool>,
     pub friends: Arc<StdMutex<HashSet<String>>>,
+    pub file_pending: Arc<StdMutex<HashMap<u64, tokio::sync::oneshot::Sender<bool>>>>,
+    pub file_counter: Arc<AtomicU64>,
 }
 
 impl Settings {
@@ -63,12 +67,27 @@ impl Settings {
     }
 }
 
+/// Connexions entrantes en attente d'autorisation (id → canal de réponse Accepter/Refuser).
+#[derive(Clone, Default)]
+pub struct Incoming {
+    pending: Arc<StdMutex<HashMap<u64, tokio::sync::oneshot::Sender<bool>>>>,
+    counter: Arc<AtomicU64>,
+}
+
+/// Réponse de l'utilisateur à une demande de connexion entrante.
+pub fn respond_incoming(incoming: &Incoming, id: u64, accept: bool) {
+    if let Some(tx) = incoming.pending.lock().unwrap().remove(&id) {
+        let _ = tx.send(accept);
+    }
+}
+
 #[derive(Clone)]
 pub struct Ghost {
     pub app: AppHandle,
     pub slot: Slot,
     pub recv_cancel: Arc<AtomicBool>,
     pub settings: Settings,
+    pub incoming: Incoming,
 }
 
 impl std::fmt::Debug for Ghost {
@@ -79,11 +98,30 @@ impl std::fmt::Debug for Ghost {
 
 impl ProtocolHandler for Ghost {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        // Filtre « amis uniquement » : on refuse les pairs inconnus avant tout.
         let peer = connection.remote_id().to_string();
+        // Filtre « amis uniquement » : on refuse les pairs inconnus avant tout.
         if !self.settings.allows(&peer) {
             connection.close(0u32.into(), b"not-a-friend");
             let _ = self.app.emit("ghost-refused", &peer);
+            return Ok(());
+        }
+        // Demander l'autorisation à l'utilisateur (toujours), avec délai de 45 s.
+        let id = self.incoming.counter.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        self.incoming.pending.lock().unwrap().insert(id, tx);
+        let _ = self
+            .app
+            .emit("ghost-incoming", serde_json::json!({ "id": id, "peer": peer }));
+        let accepted = matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(45), rx).await,
+            Ok(Ok(true))
+        );
+        self.incoming.pending.lock().unwrap().remove(&id);
+        if !accepted {
+            connection.close(0u32.into(), b"refused");
+            let _ = self
+                .app
+                .emit("ghost-incoming-cancel", serde_json::json!({ "id": id }));
             return Ok(());
         }
         run_conn(
@@ -109,11 +147,20 @@ impl ProtocolHandler for Presence {
 }
 
 pub struct Net {
-    pub endpoint: Endpoint,
+    pub app: AppHandle,
+    pub perm: Endpoint,
+    _perm_router: Router,
+    pub eph: Arc<Mutex<Eph>>,
     pub slot: Slot,
     pub send_cancel: Arc<AtomicBool>,
     pub recv_cancel: Arc<AtomicBool>,
     pub settings: Settings,
+    pub incoming: Incoming,
+}
+
+/// Identité éphémère : clé aléatoire en mémoire, remplaçable à chaud (rotation).
+pub struct Eph {
+    endpoint: Endpoint,
     _router: Router,
 }
 
@@ -128,24 +175,124 @@ fn identity_path() -> PathBuf {
 fn load_or_create_secret() -> SecretKey {
     let path = identity_path();
     if let Ok(bytes) = std::fs::read(&path) {
+        // Priorité au format chiffré (DPAPI) ; sinon ancien format clair (32 octets) → migration.
+        if let Some(arr) = decrypt_key(&bytes) {
+            return SecretKey::from_bytes(&arr);
+        }
         if bytes.len() == 32 {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
-            return SecretKey::from_bytes(&arr);
+            let sk = SecretKey::from_bytes(&arr);
+            save_secret(&path, &sk); // ré-écrit la clé chiffrée
+            return sk;
         }
     }
     let sk = SecretKey::generate();
+    save_secret(&path, &sk);
+    sk
+}
+
+/// Écrit la clé d'identité, chiffrée au repos. Sous Windows via DPAPI : déchiffrable
+/// uniquement par la même session Windows (illisible via une copie du fichier ou un autre compte).
+fn save_secret(path: &Path, sk: &SecretKey) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if std::fs::write(&path, sk.to_bytes()).is_ok() {
+    let data = encrypt_key(&sk.to_bytes());
+    if std::fs::write(path, &data).is_ok() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
     }
-    sk
+}
+
+#[cfg(windows)]
+fn encrypt_key(plain: &[u8]) -> Vec<u8> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
+    unsafe {
+        let in_blob = CRYPT_INTEGER_BLOB {
+            cbData: plain.len() as u32,
+            pbData: plain.as_ptr() as *mut u8,
+        };
+        let mut out_blob = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        let ok = CryptProtectData(
+            &in_blob as *const CRYPT_INTEGER_BLOB,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            &mut out_blob as *mut CRYPT_INTEGER_BLOB,
+        );
+        if ok != 0 && !out_blob.pbData.is_null() {
+            let v = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
+            let _ = LocalFree(out_blob.pbData as *mut core::ffi::c_void);
+            v
+        } else {
+            // Échec DPAPI : on ne bloque pas l'app (retombe sur le format clair).
+            plain.to_vec()
+        }
+    }
+}
+
+#[cfg(windows)]
+fn decrypt_key(stored: &[u8]) -> Option<[u8; 32]> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
+    unsafe {
+        let in_blob = CRYPT_INTEGER_BLOB {
+            cbData: stored.len() as u32,
+            pbData: stored.as_ptr() as *mut u8,
+        };
+        let mut out_blob = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        let ok = CryptUnprotectData(
+            &in_blob as *const CRYPT_INTEGER_BLOB,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            &mut out_blob as *mut CRYPT_INTEGER_BLOB,
+        );
+        if ok == 0 || out_blob.pbData.is_null() {
+            return None;
+        }
+        let slice = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize);
+        let res = if slice.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(slice);
+            Some(arr)
+        } else {
+            None
+        };
+        let _ = LocalFree(out_blob.pbData as *mut core::ffi::c_void);
+        res
+    }
+}
+
+#[cfg(not(windows))]
+fn encrypt_key(plain: &[u8]) -> Vec<u8> {
+    plain.to_vec()
+}
+
+#[cfg(not(windows))]
+fn decrypt_key(stored: &[u8]) -> Option<[u8; 32]> {
+    if stored.len() == 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(stored);
+        Some(arr)
+    } else {
+        None
+    }
 }
 
 /// Fichier mémorisant le dossier de réception choisi.
@@ -193,14 +340,80 @@ pub fn set_friends(settings: &Settings, codes: Vec<String>) {
     }
 }
 
-pub async fn start(app: AppHandle) -> anyhow::Result<Net> {
-    // Identité persistante : même clé (donc même code ami) à chaque lancement.
-    let secret = load_or_create_secret();
-    let endpoint = Endpoint::builder(presets::N0)
+/// Réponse de l'utilisateur à une offre de fichier entrante (true = accepter, false = refuser).
+pub fn respond_file(settings: &Settings, id: u64, accept: bool) {
+    if let Some(tx) = settings.file_pending.lock().unwrap().remove(&id) {
+        let _ = tx.send(accept);
+    }
+}
+
+/// Construit un endpoint iroh (fenêtres QUIC élargies pour viser ~1 Gbps).
+async fn build_endpoint(secret: SecretKey) -> anyhow::Result<Endpoint> {
+    let transport = iroh::endpoint::QuicTransportConfig::builder()
+        .stream_receive_window(iroh::endpoint::VarInt::from_u32(16 * 1024 * 1024))
+        .receive_window(iroh::endpoint::VarInt::from_u32(64 * 1024 * 1024))
+        .send_window(64 * 1024 * 1024)
+        .build();
+    Endpoint::builder(presets::N0)
         .secret_key(secret)
+        .transport_config(transport)
         .bind()
         .await
-        .map_err(|e| anyhow::anyhow!("bind iroh: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("bind iroh: {e}"))
+}
+
+/// Démarre le Router (protocoles fichier/chat/voix + présence) sur un endpoint.
+fn build_router(
+    endpoint: &Endpoint,
+    app: &AppHandle,
+    slot: &Slot,
+    recv_cancel: &Arc<AtomicBool>,
+    settings: &Settings,
+    incoming: &Incoming,
+) -> Router {
+    Router::builder(endpoint.clone())
+        .accept(
+            ALPN,
+            Ghost {
+                app: app.clone(),
+                slot: slot.clone(),
+                recv_cancel: recv_cancel.clone(),
+                settings: settings.clone(),
+                incoming: incoming.clone(),
+            },
+        )
+        .accept(PRESENCE_ALPN, Presence)
+        .spawn()
+}
+
+/// Code permanent (identité stable, à partager seulement avec les amis).
+pub fn perm_code(net: &Net) -> String {
+    net.perm.addr().id.to_string()
+}
+
+/// Code éphémère du moment (jetable, régénéré à chaque lancement).
+pub async fn eph_code(net: &Net) -> String {
+    net.eph.lock().await.endpoint.addr().id.to_string()
+}
+
+/// Régénère le code éphémère : nouvel endpoint aléatoire, l'ancien est jeté.
+pub async fn rotate_eph(net: &Net) -> anyhow::Result<String> {
+    let endpoint = build_endpoint(SecretKey::generate()).await?;
+    let router = build_router(
+        &endpoint,
+        &net.app,
+        &net.slot,
+        &net.recv_cancel,
+        &net.settings,
+        &net.incoming,
+    );
+    let id = endpoint.addr().id.to_string();
+    let mut g = net.eph.lock().await;
+    *g = Eph { endpoint, _router: router };
+    Ok(id)
+}
+
+pub async fn start(app: AppHandle) -> anyhow::Result<Net> {
     let slot: Slot = Arc::new(Mutex::new(ConnState::default()));
     let send_cancel = Arc::new(AtomicBool::new(false));
     let recv_cancel = Arc::new(AtomicBool::new(false));
@@ -208,50 +421,45 @@ pub async fn start(app: AppHandle) -> anyhow::Result<Net> {
     if let Some(dir) = load_download_dir() {
         *settings.download_dir.lock().unwrap() = Some(dir);
     }
-    let router = Router::builder(endpoint.clone())
-        .accept(
-            ALPN,
-            Ghost {
-                app,
-                slot: slot.clone(),
-                recv_cancel: recv_cancel.clone(),
-                settings: settings.clone(),
-            },
-        )
-        .accept(PRESENCE_ALPN, Presence)
-        .spawn();
+    let incoming = Incoming::default();
+
+    // Identité PERMANENTE : clé persistante = code ami stable.
+    let perm = build_endpoint(load_or_create_secret()).await?;
+    let _perm_router = build_router(&perm, &app, &slot, &recv_cancel, &settings, &incoming);
+
+    // Identité ÉPHÉMÈRE : clé aléatoire en mémoire, régénérée à chaque lancement.
+    let eph_ep = build_endpoint(SecretKey::generate()).await?;
+    let eph_router = build_router(&eph_ep, &app, &slot, &recv_cancel, &settings, &incoming);
+    let eph = Arc::new(Mutex::new(Eph {
+        endpoint: eph_ep,
+        _router: eph_router,
+    }));
+
     Ok(Net {
-        endpoint,
+        app,
+        perm,
+        _perm_router,
+        eph,
         slot,
         send_cancel,
         recv_cancel,
         settings,
-        _router: router,
+        incoming,
     })
-}
-
-pub async fn my_addr(ep: &Endpoint) -> anyhow::Result<String> {
-    ep.online().await;
-    serde_json::to_string(&ep.addr()).map_err(|e| anyhow::anyhow!("sérialisation adresse: {e}"))
-}
-
-/// « Code ami » = l'identité publique du nœud (EndpointId). Court, stable, partageable.
-/// Un ami qui l'a peut nous retrouver via la découverte, sans coller d'adresse.
-pub async fn my_id(ep: &Endpoint) -> anyhow::Result<String> {
-    Ok(ep.addr().id.to_string())
 }
 
 /// Sonde un ami par son code : tente une connexion légère (ALPN présence) avec un délai borné.
 /// Renvoie true s'il est joignable (donc en ligne), false sinon.
-pub async fn probe(ep: &Endpoint, id_str: &str) -> bool {
+pub async fn probe(net: &Net, id_str: &str) -> bool {
     let id: EndpointId = match id_str.trim().parse() {
         Ok(i) => i,
         Err(_) => return false,
     };
     let addr = EndpointAddr::from(id);
+    // On sonde via l'identité permanente (les amis nous connaissent par elle).
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        ep.connect(addr, PRESENCE_ALPN),
+        net.perm.connect(addr, PRESENCE_ALPN),
     )
     .await
     {
@@ -263,35 +471,34 @@ pub async fn probe(ep: &Endpoint, id_str: &str) -> bool {
     }
 }
 
-pub async fn connect(
-    ep: &Endpoint,
-    app: &AppHandle,
-    slot: &Slot,
-    recv_cancel: &Arc<AtomicBool>,
-    settings: &Settings,
-    input: &str,
-) -> anyhow::Result<String> {
+pub async fn connect(net: &Net, input: &str) -> anyhow::Result<String> {
     let input = input.trim();
-    // Accepte soit une adresse complète (JSON), soit un simple « code ami » (EndpointId).
-    // Avec un code seul, la découverte (presets::N0) résout l'adresse courante du pair.
+    // Accepte soit une adresse complète (JSON), soit un simple « code » (EndpointId).
     let addr: EndpointAddr = match serde_json::from_str::<EndpointAddr>(input) {
         Ok(a) => a,
         Err(_) => {
             let id: EndpointId = input
                 .parse()
-                .map_err(|_| anyhow::anyhow!("code ami ou adresse invalide"))?;
+                .map_err(|_| anyhow::anyhow!("code ou adresse invalide"))?;
             EndpointAddr::from(id)
         }
     };
-    let conn = ep
-        .connect(addr, ALPN)
-        .await
-        .map_err(|e| anyhow::anyhow!("connexion: {e}"))?;
+    // Auto : ami connu → identité PERMANENTE (il nous reconnaît, marche avec « amis uniquement ») ;
+    // inconnu → identité ÉPHÉMÈRE (on ne révèle pas notre code permanent).
+    let target = addr.id.to_string();
+    let is_friend = net.settings.friends.lock().unwrap().contains(&target);
+    let conn = if is_friend {
+        net.perm.connect(addr, ALPN).await
+    } else {
+        let ep = net.eph.lock().await.endpoint.clone();
+        ep.connect(addr, ALPN).await
+    }
+    .map_err(|e| anyhow::anyhow!("connexion: {e}"))?;
     let peer = conn.remote_id().to_string();
-    let app2 = app.clone();
-    let slot2 = slot.clone();
-    let rc = recv_cancel.clone();
-    let st = settings.clone();
+    let app2 = net.app.clone();
+    let slot2 = net.slot.clone();
+    let rc = net.recv_cancel.clone();
+    let st = net.settings.clone();
     tokio::spawn(async move { run_conn(app2, slot2, rc, st, conn).await });
     Ok(peer)
 }
@@ -368,19 +575,35 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                         return;
                     }
                     if kind[0] == KIND_FREQ || kind[0] == KIND_FACCEPT {
-                        // [u16 nom_len][nom]
-                        let name = async {
+                        // [u16 nom_len][nom] puis (depuis 0.14.1) [u16 code_len][code permanent]
+                        let (name, code) = async {
                             let mut l2 = [0u8; 2];
                             AsyncReadExt::read_exact(&mut recv, &mut l2).await?;
                             let nlen = u16::from_be_bytes(l2) as usize;
                             let mut nbuf = vec![0u8; nlen];
                             AsyncReadExt::read_exact(&mut recv, &mut nbuf).await?;
-                            anyhow::Ok(String::from_utf8_lossy(&nbuf).to_string())
+                            let name = String::from_utf8_lossy(&nbuf).to_string();
+                            // Code permanent — best-effort (compat avec un ancien pair sans code).
+                            let mut code = String::new();
+                            let mut c2 = [0u8; 2];
+                            if AsyncReadExt::read_exact(&mut recv, &mut c2).await.is_ok() {
+                                let clen = u16::from_be_bytes(c2) as usize;
+                                let mut cbuf = vec![0u8; clen];
+                                if AsyncReadExt::read_exact(&mut recv, &mut cbuf).await.is_ok() {
+                                    code = String::from_utf8_lossy(&cbuf).to_string();
+                                }
+                            }
+                            anyhow::Ok::<(String, String)>((name, code))
                         }
                         .await
                         .unwrap_or_default();
                         let ev = if kind[0] == KIND_FREQ { "ghost-freq" } else { "ghost-faccept" };
-                        let _ = a.emit(ev, serde_json::json!({ "name": name }));
+                        let _ = a.emit(ev, serde_json::json!({ "name": name, "code": code }));
+                        return;
+                    }
+                    if kind[0] == KIND_CALL_START || kind[0] == KIND_CALL_STOP {
+                        let ev = if kind[0] == KIND_CALL_START { "ghost-call-start" } else { "ghost-call-stop" };
+                        let _ = a.emit(ev, serde_json::json!({}));
                         return;
                     }
 
@@ -404,15 +627,39 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                         Err(_) => return,
                     };
 
+                    // Demander l'autorisation AVANT de recevoir le fichier.
+                    let offer_id = settings.file_counter.fetch_add(1, Ordering::SeqCst);
+                    let (otx, orx) = tokio::sync::oneshot::channel::<bool>();
+                    settings.file_pending.lock().unwrap().insert(offer_id, otx);
+                    let _ = a.emit("ghost-recv-offer", serde_json::json!({ "id": offer_id, "name": name, "size": size }));
+                    let accepted = matches!(
+                        tokio::time::timeout(std::time::Duration::from_secs(120), orx).await,
+                        Ok(Ok(true))
+                    );
+                    settings.file_pending.lock().unwrap().remove(&offer_id);
+                    if !accepted {
+                        let _ = AsyncWriteExt::write_all(&mut send, &[0u8]).await; // refus
+                        let _ = send.finish();
+                        let _ = recv.stop(0u32.into());
+                        let _ = a.emit("ghost-recv-rejected", serde_json::json!({ "id": offer_id, "name": name }));
+                        return;
+                    }
+                    let _ = AsyncWriteExt::write_all(&mut send, &[1u8]).await; // accepté
+
                     let dir = settings.recv_dir();
                     let dest = unique_path(&dir, &name);
                     let _ = a.emit("ghost-recv-start", serde_json::json!({ "name": name, "size": size }));
 
                     // Corps (Ok(true) = terminé, Ok(false) = annulé, Err = flux coupé)
                     let body: anyhow::Result<bool> = async {
-                        let mut file = tokio::fs::File::create(&dest).await?;
+                        let mut file = tokio::io::BufWriter::with_capacity(
+                            1 << 20,
+                            tokio::fs::File::create(&dest).await?,
+                        );
                         let mut buf = vec![0u8; CHUNK];
                         let mut got: u64 = 0;
+                        let mut last_emit = std::time::Instant::now();
+                        let _ = a.emit("ghost-recv-progress", serde_json::json!({ "name": name, "received": 0u64, "size": size }));
                         while got < size {
                             if cancel.load(Ordering::SeqCst) {
                                 return Ok(false);
@@ -421,7 +668,11 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                             AsyncReadExt::read_exact(&mut recv, &mut buf[..want]).await?;
                             AsyncWriteExt::write_all(&mut file, &buf[..want]).await?;
                             got += want as u64;
-                            let _ = a.emit("ghost-recv-progress", serde_json::json!({ "name": name, "received": got, "size": size }));
+                            // Émettre la progression au plus 10×/s pour ne pas saturer l'IPC.
+                            if last_emit.elapsed().as_millis() >= 100 {
+                                let _ = a.emit("ghost-recv-progress", serde_json::json!({ "name": name, "received": got, "size": size }));
+                                last_emit = std::time::Instant::now();
+                            }
                         }
                         AsyncWriteExt::flush(&mut file).await?;
                         Ok(true)
@@ -493,11 +744,22 @@ pub async fn send_file(
         .await
         .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
 
+    // Attendre que le pair accepte (ou refuse) le fichier avant d'envoyer les octets.
+    let mut decision = [0u8; 1];
+    AsyncReadExt::read_exact(&mut recv, &mut decision)
+        .await
+        .map_err(|e| anyhow::anyhow!("le pair n'a pas répondu: {e}"))?;
+    if decision[0] != 1 {
+        return Err(anyhow::anyhow!("refusé par le pair"));
+    }
+
     let mut file = tokio::fs::File::open(p)
         .await
         .map_err(|e| anyhow::anyhow!("ouverture: {e}"))?;
     let mut buf = vec![0u8; CHUNK];
     let mut sent: u64 = 0;
+    let mut last_emit = std::time::Instant::now();
+    let _ = app.emit("ghost-send-progress", serde_json::json!({ "name": name, "sent": 0u64, "size": size }));
     loop {
         if send_cancel.load(Ordering::SeqCst) {
             let _ = send.reset(0u32.into());
@@ -513,7 +775,11 @@ pub async fn send_file(
             .await
             .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
         sent += n as u64;
-        let _ = app.emit("ghost-send-progress", serde_json::json!({ "name": name, "sent": sent, "size": size }));
+        // Émettre la progression au plus 10×/s pour ne pas saturer l'IPC.
+        if last_emit.elapsed().as_millis() >= 100 {
+            let _ = app.emit("ghost-send-progress", serde_json::json!({ "name": name, "sent": sent, "size": size }));
+            last_emit = std::time::Instant::now();
+        }
     }
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
 
@@ -553,7 +819,7 @@ pub async fn send_chat(slot: &Slot, name: &str, text: &str) -> anyhow::Result<()
 }
 
 /// Envoie un message « type + nom d'affichage » (demandes d'ami) sur la connexion ouverte.
-async fn send_named(slot: &Slot, kind: u8, name: &str) -> anyhow::Result<()> {
+async fn send_named(slot: &Slot, kind: u8, name: &str, code: &str) -> anyhow::Result<()> {
     let conn = current(slot)
         .await
         .ok_or_else(|| anyhow::anyhow!("pas connecté à un pair"))?;
@@ -571,18 +837,52 @@ async fn send_named(slot: &Slot, kind: u8, name: &str) -> anyhow::Result<()> {
     AsyncWriteExt::write_all(&mut send, nb)
         .await
         .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
+    // Code PERMANENT de l'expéditeur : l'ami enregistre ce code (stable), pas l'éphémère.
+    let cb = code.as_bytes();
+    AsyncWriteExt::write_all(&mut send, &(cb.len() as u16).to_be_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
+    AsyncWriteExt::write_all(&mut send, cb)
+        .await
+        .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
     Ok(())
 }
 
-/// Demande d'ami (au pair connecté), avec le nom d'affichage.
-pub async fn send_freq(slot: &Slot, name: &str) -> anyhow::Result<()> {
-    send_named(slot, KIND_FREQ, name).await
+/// Demande d'ami (au pair connecté) : nom d'affichage + code permanent.
+pub async fn send_freq(slot: &Slot, name: &str, code: &str) -> anyhow::Result<()> {
+    send_named(slot, KIND_FREQ, name, code).await
 }
 
-/// Acceptation d'une demande d'ami, avec le nom d'affichage.
-pub async fn send_faccept(slot: &Slot, name: &str) -> anyhow::Result<()> {
-    send_named(slot, KIND_FACCEPT, name).await
+/// Acceptation d'une demande d'ami : nom d'affichage + code permanent.
+pub async fn send_faccept(slot: &Slot, name: &str, code: &str) -> anyhow::Result<()> {
+    send_named(slot, KIND_FACCEPT, name, code).await
+}
+
+/// Envoie un simple signal (un octet) — utilisé pour la signalisation d'appel vocal.
+async fn send_kind_only(slot: &Slot, kind: u8) -> anyhow::Result<()> {
+    let conn = current(slot)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("pas connecté à un pair"))?;
+    let (mut send, _recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("ouverture du flux: {e}"))?;
+    AsyncWriteExt::write_all(&mut send, &[kind])
+        .await
+        .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
+    send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+    Ok(())
+}
+
+/// Signale au pair le début d'un appel vocal.
+pub async fn send_call_start(slot: &Slot) -> anyhow::Result<()> {
+    send_kind_only(slot, KIND_CALL_START).await
+}
+
+/// Signale au pair la fin d'un appel vocal.
+pub async fn send_call_stop(slot: &Slot) -> anyhow::Result<()> {
+    send_kind_only(slot, KIND_CALL_STOP).await
 }
 
 /// Empreinte lisible d'un code (8 premiers octets de SHA-256, en 4 groupes hex).
@@ -606,9 +906,11 @@ fn sanitize(name: &str) -> String {
         .unwrap_or("fichier");
     let cleaned: String = base
         .chars()
-        .filter(|c| !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
         .collect();
-    if cleaned.trim().is_empty() {
+    // Windows ignore les points/espaces de fin → on les retire (collisions / noms pièges).
+    let cleaned = cleaned.trim().trim_end_matches(['.', ' ']).to_string();
+    if cleaned.is_empty() {
         "fichier".to_string()
     } else {
         cleaned
