@@ -591,11 +591,15 @@ async fn receive_voice(
 
 // ===== Appel vocal de GROUPE (maillage : diffusion + mixage multi-flux) =====
 
+/// Tampons de mixage par pair : code → (gain, échantillons en attente).
+type Peers = Arc<Mutex<HashMap<String, (f32, VecDeque<f32>)>>>;
+
 /// Appel de groupe en cours : diffuse le micro à tous les pairs et mixe leurs flux.
 #[derive(Clone, Default)]
 pub struct GroupCall {
     flag: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     muted: Arc<AtomicBool>,
+    peers: Peers,
 }
 
 impl GroupCall {
@@ -608,8 +612,11 @@ impl GroupCall {
     ) -> anyhow::Result<()> {
         self.stop();
         self.muted.store(false, Ordering::SeqCst);
+        if let Ok(mut p) = self.peers.lock() {
+            p.clear();
+        }
         let stop = Arc::new(AtomicBool::new(false));
-        let peers: Arc<Mutex<HashMap<String, VecDeque<f32>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let peers = self.peers.clone();
         let conn_list: Vec<Connection> = conns.iter().map(|(_, c)| c.clone()).collect();
         // Capture micro → diffusion à tous + sortie mixée. Renvoie le taux de sortie.
         let out_rate = start_group_capture_mix(
@@ -626,6 +633,12 @@ impl GroupCall {
         *self.flag.lock().unwrap() = Some(stop);
         Ok(())
     }
+    /// Règle le volume (gain) d'un pair dans le mixage. 1.0 = normal, 0 = muet, 2.0 = ×2.
+    pub fn set_gain(&self, code: &str, gain: f32) {
+        if let Ok(mut p) = self.peers.lock() {
+            p.entry(code.to_string()).or_insert((1.0, VecDeque::new())).0 = gain;
+        }
+    }
     pub fn set_mute(&self, on: bool) {
         self.muted.store(on, Ordering::SeqCst);
     }
@@ -641,7 +654,7 @@ fn build_group_output(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     fmt: SampleFormat,
-    peers: Arc<Mutex<HashMap<String, VecDeque<f32>>>>,
+    peers: Peers,
     ch: usize,
 ) -> anyhow::Result<cpal::Stream> {
     macro_rules! build {
@@ -652,8 +665,8 @@ fn build_group_output(
                     if let Ok(mut m) = peers.lock() {
                         for chunk in data.chunks_mut(ch) {
                             let mut s = 0.0f32;
-                            for buf in m.values_mut() {
-                                s += buf.pop_front().unwrap_or(0.0);
+                            for (gain, buf) in m.values_mut() {
+                                s += *gain * buf.pop_front().unwrap_or(0.0);
                             }
                             let v = $conv(s.clamp(-1.0, 1.0));
                             for x in chunk.iter_mut() {
@@ -684,7 +697,7 @@ fn build_group_output(
 
 fn open_group_output(
     device: &cpal::Device,
-    peers: Arc<Mutex<HashMap<String, VecDeque<f32>>>>,
+    peers: Peers,
 ) -> anyhow::Result<(cpal::Stream, u32)> {
     let mut candidates: Vec<cpal::SupportedStreamConfig> = Vec::new();
     if let Ok(def) = device.default_output_config() {
@@ -718,7 +731,7 @@ fn open_group_output(
 fn start_group_capture_mix(
     conns: Vec<Connection>,
     stop: Arc<AtomicBool>,
-    peers: Arc<Mutex<HashMap<String, VecDeque<f32>>>>,
+    peers: Peers,
     cfg: AudioCfg,
     muted: Arc<AtomicBool>,
 ) -> anyhow::Result<u32> {
@@ -796,7 +809,7 @@ fn start_group_capture_mix(
 async fn receive_group_voice(
     conn: Connection,
     stop: Arc<AtomicBool>,
-    peers: Arc<Mutex<HashMap<String, VecDeque<f32>>>>,
+    peers: Peers,
     peer: String,
     out_rate: u32,
 ) {
@@ -816,12 +829,12 @@ async fn receive_group_voice(
                             if let Ok(samples) = decoder.decode_float(Some(&dg[1..]), &mut decoded[..], false) {
                                 let play = resample_block(&decoded[..samples], out_frame);
                                 if let Ok(mut m) = peers.lock() {
-                                    let q = m.entry(peer.clone()).or_default();
+                                    let e = m.entry(peer.clone()).or_insert((1.0, VecDeque::new()));
                                     for &s in play.iter() {
-                                        q.push_back(s);
+                                        e.1.push_back(s);
                                     }
-                                    while q.len() > out_cap {
-                                        q.pop_front();
+                                    while e.1.len() > out_cap {
+                                        e.1.pop_front();
                                     }
                                 }
                             }

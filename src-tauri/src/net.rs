@@ -34,6 +34,7 @@ const GKIND_CHAT: u8 = 1; // message de channel de groupe
 const GKIND_INVITE: u8 = 2; // invitation à un groupe
 const GKIND_CALL: u8 = 3; // signal de début d'appel de groupe
 const GKIND_SIGNAL: u8 = 4; // signalisation WebRTC (vidéo) pair-à-pair
+const GKIND_GFILE: u8 = 5; // fichier diffusé dans le groupe
 
 #[derive(Default)]
 pub struct ConnState {
@@ -429,7 +430,7 @@ impl ProtocolHandler for GroupHandler {
             connection.close(0u32.into(), b"not-a-friend");
             return Ok(());
         }
-        run_mesh_conn(self.app.clone(), self.mesh.clone(), peer, connection).await;
+        run_mesh_conn(self.app.clone(), self.mesh.clone(), self.settings.clone(), peer, connection).await;
         Ok(())
     }
 }
@@ -467,7 +468,7 @@ async fn write_lp32<W: AsyncWriteExt + Unpin>(send: &mut W, s: &str) -> anyhow::
 }
 
 /// Boucle de réception d'une connexion de maillage (un pair du groupe).
-async fn run_mesh_conn(app: AppHandle, mesh: Mesh, peer: String, connection: Connection) {
+async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, peer: String, connection: Connection) {
     let token = MESH_SEQ.fetch_add(1, Ordering::SeqCst);
     if let Some((_, old)) = mesh
         .lock()
@@ -483,6 +484,7 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, peer: String, connection: Con
             Ok((_send, mut recv)) => {
                 let a = app.clone();
                 let from = peer.clone();
+                let settings = settings.clone();
                 tokio::spawn(async move {
                     let mut kind = [0u8; 1];
                     if recv.read_exact(&mut kind).await.is_err() {
@@ -512,6 +514,8 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, peer: String, connection: Con
                         if let Ok(data) = read_lp32(&mut recv).await {
                             let _ = a.emit("ghost-signal", serde_json::json!({ "from": from, "data": data }));
                         }
+                    } else if kind[0] == GKIND_GFILE {
+                        let _ = recv_gfile(&a, &settings, &from, &mut recv).await;
                     }
                 });
             }
@@ -543,9 +547,10 @@ async fn ensure_mesh(net: &Net, code: &str) -> anyhow::Result<Connection> {
     .map_err(|e| anyhow::anyhow!("connexion groupe: {e}"))?;
     let app = net.app.clone();
     let mesh = net.mesh.clone();
+    let settings = net.settings.clone();
     let peer = code.to_string();
     let c2 = conn.clone();
-    tokio::spawn(async move { run_mesh_conn(app, mesh, peer, c2).await });
+    tokio::spawn(async move { run_mesh_conn(app, mesh, settings, peer, c2).await });
     Ok(conn)
 }
 
@@ -559,6 +564,7 @@ pub async fn open_group(net: &Net, members: Vec<String>) {
         let perm = net.perm.clone();
         let mesh = net.mesh.clone();
         let app = net.app.clone();
+        let settings = net.settings.clone();
         tokio::spawn(async move {
             let id: EndpointId = match code.parse() {
                 Ok(i) => i,
@@ -574,7 +580,7 @@ pub async fn open_group(net: &Net, members: Vec<String>) {
                 Ok(Ok(c)) => c,
                 _ => return, // membre hors ligne / échec
             };
-            run_mesh_conn(app, mesh, code, conn).await;
+            run_mesh_conn(app, mesh, settings, code, conn).await;
         });
     }
 }
@@ -672,6 +678,92 @@ pub async fn send_signal(net: &Net, peer: &str, data: &str) -> anyhow::Result<()
         .await
         .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
     write_lp32(&mut send, data).await?;
+    send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+    Ok(())
+}
+
+/// Reçoit un fichier de groupe (entête + octets) et l'enregistre dans le dossier de réception.
+async fn recv_gfile<R: AsyncReadExt + Unpin>(
+    app: &AppHandle,
+    settings: &Settings,
+    from: &str,
+    recv: &mut R,
+) -> anyhow::Result<()> {
+    let mut l2 = [0u8; 2];
+    recv.read_exact(&mut l2).await?;
+    let nlen = u16::from_be_bytes(l2) as usize;
+    let mut nbuf = vec![0u8; nlen];
+    recv.read_exact(&mut nbuf).await?;
+    let name = sanitize(&String::from_utf8_lossy(&nbuf));
+    let mut s8 = [0u8; 8];
+    recv.read_exact(&mut s8).await?;
+    let size = u64::from_be_bytes(s8);
+    let dir = settings.recv_dir();
+    let dest = unique_path(&dir, &name);
+    let _ = app.emit("ghost-grecv-start", serde_json::json!({ "name": name, "size": size, "from": from }));
+    let mut file = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create(&dest).await?);
+    let mut buf = vec![0u8; CHUNK];
+    let mut got: u64 = 0;
+    while got < size {
+        let want = std::cmp::min(CHUNK as u64, size - got) as usize;
+        recv.read_exact(&mut buf[..want]).await?;
+        AsyncWriteExt::write_all(&mut file, &buf[..want]).await?;
+        got += want as u64;
+    }
+    AsyncWriteExt::flush(&mut file).await?;
+    let _ = app.emit("ghost-grecv-done", serde_json::json!({ "name": name, "from": from, "path": dest.to_string_lossy() }));
+    Ok(())
+}
+
+/// Envoie un fichier à tous les membres en ligne du groupe (un flux par membre, sans accusé).
+pub async fn send_gfile(net: &Net, members: Vec<String>, path: &str) -> anyhow::Result<()> {
+    let conns = group_conns(net, &members);
+    if conns.is_empty() {
+        anyhow::bail!("aucun membre du groupe en ligne");
+    }
+    let p = Path::new(path);
+    let name = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("fichier")
+        .to_string();
+    let size = tokio::fs::metadata(p)
+        .await
+        .map_err(|e| anyhow::anyhow!("fichier introuvable: {e}"))?
+        .len();
+    let app = net.app.clone();
+    for (peer, conn) in conns {
+        let app = app.clone();
+        let name = name.clone();
+        let path = path.to_string();
+        tokio::spawn(async move {
+            if send_one_gfile(&conn, &path, &name, size).await.is_ok() {
+                let _ = app.emit("ghost-gsent", serde_json::json!({ "name": name, "to": peer }));
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn send_one_gfile(conn: &Connection, path: &str, name: &str, size: u64) -> anyhow::Result<()> {
+    let (mut send, _recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("flux: {e}"))?;
+    send.write_all(&[GKIND_GFILE]).await?;
+    let nb = name.as_bytes();
+    send.write_all(&(nb.len() as u16).to_be_bytes()).await?;
+    send.write_all(nb).await?;
+    send.write_all(&size.to_be_bytes()).await?;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = AsyncReadExt::read(&mut file, &mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        send.write_all(&buf[..n]).await?;
+    }
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
     Ok(())
 }
