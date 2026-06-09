@@ -33,6 +33,7 @@ pub const GROUP_ALPN: &[u8] = b"ghost-link/group/0";
 const GKIND_CHAT: u8 = 1; // message de channel de groupe
 const GKIND_INVITE: u8 = 2; // invitation à un groupe
 const GKIND_CALL: u8 = 3; // signal de début d'appel de groupe
+const GKIND_SIGNAL: u8 = 4; // signalisation WebRTC (vidéo) pair-à-pair
 
 #[derive(Default)]
 pub struct ConnState {
@@ -507,6 +508,10 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, peer: String, connection: Con
                         if let Ok(gid) = read_lp16(&mut recv).await {
                             let _ = a.emit("ghost-gcall", serde_json::json!({ "group": gid, "from": from }));
                         }
+                    } else if kind[0] == GKIND_SIGNAL {
+                        if let Ok(data) = read_lp32(&mut recv).await {
+                            let _ = a.emit("ghost-signal", serde_json::json!({ "from": from, "data": data }));
+                        }
                     }
                 });
             }
@@ -652,6 +657,22 @@ pub async fn send_gcall(net: &Net, members: Vec<String>, gid: &str) -> anyhow::R
             let _ = send.finish();
         }
     }
+    Ok(())
+}
+
+/// Envoie un message de signalisation WebRTC (vidéo) à UN pair précis du maillage.
+pub async fn send_signal(net: &Net, peer: &str, data: &str) -> anyhow::Result<()> {
+    let conn = net.mesh.lock().unwrap().get(peer.trim()).map(|(_, c)| c.clone());
+    let conn = conn.ok_or_else(|| anyhow::anyhow!("pair non connecté"))?;
+    let (mut send, _recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("flux: {e}"))?;
+    send.write_all(&[GKIND_SIGNAL])
+        .await
+        .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
+    write_lp32(&mut send, data).await?;
+    send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
     Ok(())
 }
 

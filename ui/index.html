@@ -142,6 +142,8 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     </div>
     <p class="hint" id="groupMembersLine" style="margin:6px 0 10px"></p>
     <div class="row" style="margin:0 0 10px"><button class="btn sm" id="btnGroupCall">📞 Appel de groupe</button><button class="btn sm ghost-btn hidden" id="btnGroupMute">🔇 Couper</button><span class="hint" id="groupCallStatus" style="margin:0"></span></div>
+    <div class="row" style="margin:0 0 10px"><button class="btn sm ghost-btn" id="btnGroupCam">📹 Caméra</button><button class="btn sm ghost-btn" id="btnGroupScreen">🖥️ Écran</button></div>
+    <div id="groupVideos" class="hidden" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:10px"></div>
     <div class="chat" id="groupChatLog"></div>
     <div class="row"><input type="text" id="groupChatInput" placeholder="Message au groupe…" style="flex:1 1 auto;width:auto;min-width:0"><button class="btn sm" id="btnGroupSend">Envoyer</button></div>
   </div>
@@ -213,7 +215,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
 
   <div class="card"><h2>📜 Journal</h2><div id="log" class="log"></div></div>
 
-  <div class="foot">ghost link · noyau natif v0.16.0 · 👻</div>
+  <div class="foot">ghost link · noyau natif v0.17.0 · 👻</div>
 </div>
 
 <script>
@@ -754,7 +756,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     renderGroupMsgs();
     refreshGroupCallUI();
   }
-  function closeGroup(){ if (inGroupCall && groupCallId === openGroupId) stopGroupCall(); openGroupId = null; $('#groupChannelCard').classList.add('hidden'); }
+  function closeGroup(){ if (inGroupCall && groupCallId === openGroupId) stopGroupCall(); stopVideo(); openGroupId = null; $('#groupChannelCard').classList.add('hidden'); }
   $('#btnCloseGroup').onclick = closeGroup;
   function addGroupMsgDom(author, text, who){
     const box = $('#groupChatLog');
@@ -852,6 +854,94 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     startGroupCall(g, false);
   };
   $('#btnDeclineGCall').onclick = () => { $('#gcallBanner').classList.add('hidden'); pendingGCall = null; };
+
+  // --- Vidéo de groupe (webcam + partage d'écran) via WebRTC ---
+  const RTC_CFG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+  let localStream = null, localKind = null;
+  const pcs = {};   // code du pair -> { pc, makingOffer, polite }
+  function vgrid(){ return $('#groupVideos'); }
+  function tileFor(peer, label){
+    if (!document.getElementById('vidw_' + peer)) {
+      const w = document.createElement('div'); w.id = 'vidw_' + peer;
+      w.style.cssText = 'position:relative;border-radius:12px;overflow:hidden;background:#000';
+      const v = document.createElement('video'); v.id = 'vid_' + peer; v.autoplay = true; v.playsInline = true;
+      v.style.cssText = 'width:100%;aspect-ratio:4/3;object-fit:cover;display:block';
+      const tag = document.createElement('div');
+      tag.style.cssText = 'position:absolute;bottom:4px;left:6px;font-size:11px;font-weight:700;color:#fff;text-shadow:0 1px 3px #000';
+      tag.textContent = label || shortId(peer);
+      w.appendChild(v); w.appendChild(tag); vgrid().appendChild(w);
+    }
+    return document.getElementById('vid_' + peer);
+  }
+  function removeTile(peer){ const w = document.getElementById('vidw_' + peer); if (w) w.remove(); }
+  function sigSend(peer, payload){ invoke('send_signal', { peer, data: JSON.stringify(payload) }).catch(() => {}); }
+  function getPc(peer){
+    if (pcs[peer]) return pcs[peer];
+    const pc = new RTCPeerConnection(RTC_CFG);
+    const st = { pc, makingOffer: false, polite: (myCode || '') < peer };
+    pcs[peer] = st;
+    if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    pc.onnegotiationneeded = async () => {
+      try { st.makingOffer = true; await pc.setLocalDescription(); sigSend(peer, { description: pc.localDescription }); }
+      catch (e) { log('Vidéo: ' + e); }
+      finally { st.makingOffer = false; }
+    };
+    pc.onicecandidate = ev => { if (ev.candidate) sigSend(peer, { candidate: ev.candidate }); };
+    pc.ontrack = ev => { const v = tileFor(peer); if (ev.streams[0]) v.srcObject = ev.streams[0]; };
+    pc.onconnectionstatechange = () => { if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) removeTile(peer); };
+    return st;
+  }
+  listen('ghost-signal', async e => {
+    const p = e.payload || {}; const peer = p.from; if (!peer) return;
+    let msg; try { msg = JSON.parse(p.data); } catch { return; }
+    const st = getPc(peer); const pc = st.pc;
+    try {
+      if (msg.description) {
+        const collision = msg.description.type === 'offer' && (st.makingOffer || pc.signalingState !== 'stable');
+        if (collision && !st.polite) return;                 // glare : l'impoli ignore
+        await pc.setRemoteDescription(msg.description);       // le poli annule son offre implicitement
+        if (msg.description.type === 'offer') {
+          await pc.setLocalDescription();
+          sigSend(peer, { description: pc.localDescription });
+        }
+      } else if (msg.candidate) {
+        try { await pc.addIceCandidate(msg.candidate); } catch (err) {}
+      }
+    } catch (err) { log('Vidéo: ' + err); }
+  });
+  async function startLocalMedia(kind){
+    const g = loadGroups().find(x => x.id === openGroupId);
+    if (!g) { log('Ouvre un groupe d\'abord.'); return; }
+    let s;
+    try {
+      s = kind === 'screen'
+        ? await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
+        : await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    } catch (e) { log('Vidéo : accès refusé ou indisponible (' + e + ')'); return; }
+    if (localStream) localStream.getTracks().forEach(t => t.stop());
+    localStream = s; localKind = kind;
+    const me = tileFor('moi', 'Moi'); me.srcObject = s; me.muted = true;
+    g.members.forEach(code => {
+      const st = getPc(code);
+      st.pc.getSenders().filter(se => se.track && se.track.kind === 'video').forEach(se => { try { st.pc.removeTrack(se); } catch {} });
+      s.getTracks().forEach(t => st.pc.addTrack(t, s));
+    });
+    vgrid().classList.remove('hidden');
+    $('#btnGroupCam').textContent = kind === 'cam' ? '⏹️ Arrêter' : '📹 Caméra';
+    $('#btnGroupScreen').textContent = kind === 'screen' ? '⏹️ Arrêter' : '🖥️ Écran';
+    const vt = s.getVideoTracks()[0]; if (vt) vt.onended = () => stopVideo();
+    log(kind === 'screen' ? '🖥️ Partage d\'écran lancé.' : '📹 Caméra activée.');
+  }
+  function stopVideo(){
+    if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+    localKind = null; removeTile('moi');
+    Object.keys(pcs).forEach(peer => { try { pcs[peer].pc.close(); } catch {} removeTile(peer); delete pcs[peer]; });
+    const grid = $('#groupVideos'); if (grid) grid.classList.add('hidden');
+    const bc = $('#btnGroupCam'); if (bc) bc.textContent = '📹 Caméra';
+    const bs = $('#btnGroupScreen'); if (bs) bs.textContent = '🖥️ Écran';
+  }
+  $('#btnGroupCam').onclick = () => { if (localKind === 'cam') stopVideo(); else startLocalMedia('cam'); };
+  $('#btnGroupScreen').onclick = () => { if (localKind === 'screen') stopVideo(); else startLocalMedia('screen'); };
   invoke('app_version').then(v => { $('#appVer').textContent = v; }).catch(() => {});
   invoke('get_download_dir').then(d => { $('#setDir').value = d; }).catch(() => {});
   (function(){ const on = localStorage.getItem('ghostlink_onlyfriends') === '1'; $('#setOnlyFriends').checked = on; pushFriendsToBackend(); invoke('set_only_friends', { on }).catch(() => {}); })();

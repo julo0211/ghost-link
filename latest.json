@@ -1,11 +1,11 @@
 {
-  "version": "0.14.3",
-  "notes": "Onglet Identite nettoye : nom d'affichage deplace ici, boutons realignes.",
-  "pub_date": "2026-06-09T13:35:17.177Z",
+  "version": "0.16.0",
+  "notes": "Appels audio de groupe (mixage multi-flux).",
+  "pub_date": "2026-06-09T20:35:33.072Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVo2a0poYzFtWTNsT1N5UHBMSnBNeGw4eXFXRGR1ZUg4S2pOaC8rSFlDUXNZMDU4QlhqWXJpQ3lWZ3p2MGZKZFFzdjZ3cElUdzQyVFNWeWVsQzIxYWdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxMDEyMTExCWZpbGU6Z2hvc3QtbGlua18wLjE0LjNfeDY0LXNldHVwLmV4ZQo4RXJlR0FRUFVHUmNSbkJtR2lNZDk5U3FNdmdidjQ3MGV5RElLQVY4NXRUZWJ5SVRBSUt2N3FsMXhORGluQ1lOeCt4T3J6Y0VvVXhwZndDWnV6NmhEUT09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.14.3_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVJNdmtHdGRvc3RiMW13SXNHOFdlT09ub0JZOThpUzZGTXFkcGYvQktOdUQyaXpZOGsrMjUrOGluRk5HWmZuOWtmck5XM2psZVphZmpwaHVrRmNpOGdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxMDM3MzMwCWZpbGU6Z2hvc3QtbGlua18wLjE2LjBfeDY0LXNldHVwLmV4ZQpFZ0l3NUFwODhoM3VIVTg1ckpNMzlUeTIxcFlaWnNtY25MWnZXK3BPY0pTeWNZVTcyTURaelFjZGpEUk1peXNKMWZSenpDRFFvQUN3ejB5YUcrb2VDQT09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.16.0_x64-setup.exe"
     }
   }
 }

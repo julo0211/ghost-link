@@ -200,6 +200,11 @@ fn group_call_mute(call: State<'_, audio::GroupCall>, on: bool) {
 }
 
 #[tauri::command]
+async fn send_signal(state: State<'_, Net>, peer: String, data: String) -> Result<(), String> {
+    net::send_signal(state.inner(), &peer, &data).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn list_audio_devices() -> (Vec<String>, Vec<String>) {
     audio::list_devices()
 }
@@ -311,7 +316,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             perm_code, eph_code, rotate_eph_code, probe, connect, send_file, send_chat, send_freq, send_faccept, open_group, send_gchat, send_ginvite,
-            group_call_start, group_call_stop, group_call_mute,
+            group_call_start, group_call_stop, group_call_mute, send_signal,
             fingerprint, app_version, check_update, install_update, set_download_dir,
             get_download_dir, set_only_friends, set_friends, voice_test_start, voice_test_stop,
             call_start, call_stop, call_set_mute, list_audio_devices, set_audio_input,
