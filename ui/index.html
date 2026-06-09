@@ -107,9 +107,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
 
   <div class="card hidden" id="settingsCard">
     <div class="row" style="justify-content:space-between;flex-wrap:nowrap"><h2 style="margin:0">⚙️ Réglages</h2><button class="btn sm ghost-btn" id="btnCloseSettings">Fermer</button></div>
-    <p class="hint" style="margin:14px 0 4px">Nom d'affichage (vu par tes pairs dans le chat et les demandes d'ami)</p>
-    <div class="row"><input type="text" id="setName" placeholder="ex. ton pseudo" style="flex:1;width:auto;min-width:0"><button class="btn sm" id="btnSaveName">Enregistrer</button></div>
-    <p class="hint" style="margin:16px 0 4px">Dossier de réception des fichiers</p>
+    <p class="hint" style="margin:14px 0 4px">Dossier de réception des fichiers</p>
     <div class="row"><input type="text" id="setDir" placeholder="(par défaut : Téléchargements)" style="flex:1;width:auto;min-width:0;font-family:ui-monospace,monospace;font-size:12px"><button class="btn sm" id="btnSaveDir">Définir</button></div>
     <p class="hint" style="margin:6px 0 0">Colle le chemin d'un dossier (vide = Téléchargements).</p>
     <label class="row" style="margin-top:16px;cursor:pointer;gap:8px"><input type="checkbox" id="setOnlyFriends" style="width:auto;flex:0 0 auto"> <span style="font-size:13.5px">N'accepter que les connexions de mes amis</span></label>
@@ -125,18 +123,18 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   <div class="card" data-pane="identite">
     <h2>🪪 Mon identité</h2>
 
-    <p class="hint"><b>🎲 Code éphémère</b> — jetable, régénéré à chaque lancement. À donner pour un premier contact ou un partage ponctuel.</p>
-    <div class="row">
-      <input type="text" id="ephId" readonly placeholder="(génération…)" style="flex:1 1 200px;width:auto;min-width:120px;font-family:ui-monospace,monospace;font-size:13px">
-      <button class="btn sm ghost-btn" id="btnCopyEph">📋 Copier</button>
-      <button class="btn sm" id="btnRotateEph">🔄 Changer</button>
-    </div>
+    <p class="hint" style="margin:6px 0 5px">Ton nom d'affichage (vu par tes pairs dans le chat et les demandes d'ami) :</p>
+    <div class="row"><input type="text" id="setName" placeholder="ex. ton pseudo" style="flex:1 1 auto;width:auto;min-width:0"><button class="btn sm" id="btnSaveName">Enregistrer</button></div>
 
-    <p class="hint" style="margin-top:18px"><b>🔑 Code permanent (ami)</b> — stable. À partager <b>seulement avec tes amis</b> (ou en vous ajoutant pendant une connexion). C'est par lui qu'ils te retrouvent.</p>
-    <div class="row"><button class="btn" id="btnId">✨ Afficher</button><button class="btn sm ghost-btn" id="btnCopyId">📋 Copier</button></div>
-    <input type="text" id="myId" readonly placeholder="(clique sur « Afficher »)" style="margin-top:10px;font-family:ui-monospace,monospace;font-size:13px">
+    <p class="hint" style="margin:22px 0 6px"><b>🎲 Code du moment</b> — jetable, change à chaque lancement. À donner pour un premier contact.</p>
+    <input type="text" id="ephId" readonly placeholder="(génération…)" style="width:100%;font-family:ui-monospace,monospace;font-size:13px">
+    <div class="row" style="margin-top:8px"><button class="btn sm ghost-btn" id="btnCopyEph">📋 Copier</button><button class="btn sm ghost-btn" id="btnRotateEph">🔄 Changer</button></div>
+
+    <p class="hint" style="margin:22px 0 6px"><b>🔑 Code permanent</b> — stable, à partager <b>seulement avec tes amis</b>. C'est par lui qu'ils te retrouvent.</p>
+    <input type="text" id="myId" readonly placeholder="(masqué — clique sur Afficher)" style="width:100%;font-family:ui-monospace,monospace;font-size:13px">
+    <div class="row" style="margin-top:8px"><button class="btn sm" id="btnId">✨ Afficher</button><button class="btn sm ghost-btn" id="btnCopyId">📋 Copier</button></div>
     <div id="fpBox" class="hidden" style="margin-top:12px"><span class="hint">Empreinte du code permanent (compare-la de vive voix avec ton ami) :</span><div class="fp" id="myFp" style="margin-top:5px"></div></div>
-    <p class="hint" style="margin:12px 0 0">🔒 Aucun des deux codes ne contient ton adresse IP.</p>
+    <p class="hint" style="margin:14px 0 0">🔒 Aucun des deux codes ne contient ton adresse IP.</p>
     <div style="margin-top:16px;border-top:1px solid var(--hair);padding-top:14px">
       <div class="row" style="justify-content:space-between;flex-wrap:nowrap"><h2 style="margin:0;font-size:14px">⬆️ Mises à jour</h2><button class="btn sm ghost-btn" id="btnCheckUpdate">Vérifier</button></div>
       <p class="hint" id="updateStatus" style="margin:8px 0 0">Version actuelle : <span id="appVer">…</span></p>
@@ -189,7 +187,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
 
   <div class="card"><h2>📜 Journal</h2><div id="log" class="log"></div></div>
 
-  <div class="foot">ghost link · noyau natif v0.14.2 · 👻</div>
+  <div class="foot">ghost link · noyau natif v0.14.3 · 👻</div>
 </div>
 
 <script>
@@ -653,6 +651,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   loadFingerprints();
   invoke('perm_code').then(code => { myCode = code; }).catch(() => {});
   invoke('eph_code').then(code => { $('#ephId').value = code; }).catch(() => {});
+  $('#setName').value = myName();
   invoke('app_version').then(v => { $('#appVer').textContent = v; }).catch(() => {});
   invoke('get_download_dir').then(d => { $('#setDir').value = d; }).catch(() => {});
   (function(){ const on = localStorage.getItem('ghostlink_onlyfriends') === '1'; $('#setOnlyFriends').checked = on; pushFriendsToBackend(); invoke('set_only_friends', { on }).catch(() => {}); })();
