@@ -1,11 +1,11 @@
 {
-  "version": "0.14.2",
-  "notes": "Deux codes (ephemere + permanent), appels compatibles plus de casques, accepter/refuser un fichier, consentement micro, transferts plus rapides, cle d'identite chiffree.",
-  "pub_date": "2026-06-08T21:17:13.524Z",
+  "version": "0.14.3",
+  "notes": "Onglet Identite nettoye : nom d'affichage deplace ici, boutons realignes.",
+  "pub_date": "2026-06-09T13:35:17.177Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRWVBaWt1TDFGTUZobnEvVjczYmpqRDJkSHFOMUd4a1FlZzhTaDk4Z24wdDc5VkJEd2Q5a3d0NVFNTE1XNEp5V2FEeGpFcURDcktCNXFXRmJTc1F1U2dJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgwOTUzNDE3CWZpbGU6Z2hvc3QtbGlua18wLjE0LjJfeDY0LXNldHVwLmV4ZQppYU9ValU5elR0VmhnVGVoRUVnU1M1M3BLUGNzVVZGelA4M1lNS2YxeUxEZStreUNjOHR0cDkwckpIcGI5UmRmNVV4Q2Y5K0s4WUpaV0xZTVR4d0FDUT09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.14.2_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVo2a0poYzFtWTNsT1N5UHBMSnBNeGw4eXFXRGR1ZUg4S2pOaC8rSFlDUXNZMDU4QlhqWXJpQ3lWZ3p2MGZKZFFzdjZ3cElUdzQyVFNWeWVsQzIxYWdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxMDEyMTExCWZpbGU6Z2hvc3QtbGlua18wLjE0LjNfeDY0LXNldHVwLmV4ZQo4RXJlR0FRUFVHUmNSbkJtR2lNZDk5U3FNdmdidjQ3MGV5RElLQVY4NXRUZWJ5SVRBSUt2N3FsMXhORGluQ1lOeCt4T3J6Y0VvVXhwZndDWnV6NmhEUT09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.14.3_x64-setup.exe"
     }
   }
 }

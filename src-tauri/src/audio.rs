@@ -3,7 +3,7 @@
 // périphérique (f32/i16/u16) et on ré-échantillonne automatiquement vers/depuis 48 kHz,
 // pour que l'appel fonctionne quelle que soit la carte son (ex. micro en 44,1 kHz).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -586,5 +586,254 @@ async fn receive_voice(
                 // re-vérifie le drapeau d'arrêt même sans datagramme entrant
             }
         }
+    }
+}
+
+// ===== Appel vocal de GROUPE (maillage : diffusion + mixage multi-flux) =====
+
+/// Appel de groupe en cours : diffuse le micro à tous les pairs et mixe leurs flux.
+#[derive(Clone, Default)]
+pub struct GroupCall {
+    flag: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    muted: Arc<AtomicBool>,
+}
+
+impl GroupCall {
+    /// Démarre l'appel de groupe avec la liste des pairs (code, connexion du maillage).
+    pub fn start(
+        &self,
+        conns: Vec<(String, Connection)>,
+        rt: tokio::runtime::Handle,
+        cfg: AudioCfg,
+    ) -> anyhow::Result<()> {
+        self.stop();
+        self.muted.store(false, Ordering::SeqCst);
+        let stop = Arc::new(AtomicBool::new(false));
+        let peers: Arc<Mutex<HashMap<String, VecDeque<f32>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let conn_list: Vec<Connection> = conns.iter().map(|(_, c)| c.clone()).collect();
+        // Capture micro → diffusion à tous + sortie mixée. Renvoie le taux de sortie.
+        let out_rate = start_group_capture_mix(
+            conn_list,
+            stop.clone(),
+            peers.clone(),
+            cfg,
+            self.muted.clone(),
+        )?;
+        // Une tâche de réception par pair → décodage → tampon du pair (mixé à la lecture).
+        for (peer, conn) in conns {
+            rt.spawn(receive_group_voice(conn, stop.clone(), peers.clone(), peer, out_rate));
+        }
+        *self.flag.lock().unwrap() = Some(stop);
+        Ok(())
+    }
+    pub fn set_mute(&self, on: bool) {
+        self.muted.store(on, Ordering::SeqCst);
+    }
+    pub fn stop(&self) {
+        if let Some(f) = self.flag.lock().unwrap().take() {
+            f.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Sortie audio qui MIXE plusieurs flux (somme des pairs + écrêtage), un échantillon par pair.
+fn build_group_output(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    fmt: SampleFormat,
+    peers: Arc<Mutex<HashMap<String, VecDeque<f32>>>>,
+    ch: usize,
+) -> anyhow::Result<cpal::Stream> {
+    macro_rules! build {
+        ($t:ty, $conv:path) => {
+            device.build_output_stream(
+                config,
+                move |data: &mut [$t], _: &cpal::OutputCallbackInfo| {
+                    if let Ok(mut m) = peers.lock() {
+                        for chunk in data.chunks_mut(ch) {
+                            let mut s = 0.0f32;
+                            for buf in m.values_mut() {
+                                s += buf.pop_front().unwrap_or(0.0);
+                            }
+                            let v = $conv(s.clamp(-1.0, 1.0));
+                            for x in chunk.iter_mut() {
+                                *x = v;
+                            }
+                        }
+                    } else {
+                        let z = $conv(0.0);
+                        for x in data.iter_mut() {
+                            *x = z;
+                        }
+                    }
+                },
+                |e| eprintln!("erreur flux sortie groupe: {e}"),
+                None,
+            )
+        };
+    }
+    let stream = match fmt {
+        SampleFormat::F32 => build!(f32, f32_out),
+        SampleFormat::I16 => build!(i16, i16_out),
+        SampleFormat::U16 => build!(u16, u16_out),
+        other => return Err(anyhow::anyhow!("format sortie non géré: {other:?}")),
+    }
+    .map_err(|e| anyhow::anyhow!("ouverture du flux sortie groupe: {e}"))?;
+    Ok(stream)
+}
+
+fn open_group_output(
+    device: &cpal::Device,
+    peers: Arc<Mutex<HashMap<String, VecDeque<f32>>>>,
+) -> anyhow::Result<(cpal::Stream, u32)> {
+    let mut candidates: Vec<cpal::SupportedStreamConfig> = Vec::new();
+    if let Ok(def) = device.default_output_config() {
+        candidates.push(def);
+    }
+    if let Ok(list) = device.supported_output_configs() {
+        for range in list {
+            let sr = if range.min_sample_rate().0 <= 48000 && 48000 <= range.max_sample_rate().0 {
+                cpal::SampleRate(48000)
+            } else {
+                range.max_sample_rate()
+            };
+            candidates.push(range.with_sample_rate(sr));
+        }
+    }
+    let mut last = anyhow::anyhow!("aucune configuration sortie disponible");
+    for sup in candidates {
+        let fmt = sup.sample_format();
+        let config: cpal::StreamConfig = sup.into();
+        let ch = (config.channels as usize).max(1);
+        let rate = config.sample_rate.0;
+        match build_group_output(device, &config, fmt, peers.clone(), ch) {
+            Ok(s) => return Ok((s, rate)),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// Capture micro → 48 kHz → Opus → diffusion en datagramme à TOUS les pairs ; sortie mixée.
+fn start_group_capture_mix(
+    conns: Vec<Connection>,
+    stop: Arc<AtomicBool>,
+    peers: Arc<Mutex<HashMap<String, VecDeque<f32>>>>,
+    cfg: AudioCfg,
+    muted: Arc<AtomicBool>,
+) -> anyhow::Result<u32> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+    std::thread::spawn(move || {
+        type S = (
+            cpal::Stream,
+            cpal::Stream,
+            Arc<Mutex<VecDeque<f32>>>,
+            usize,
+            audiopus::coder::Encoder,
+        );
+        let setup = (|| -> anyhow::Result<(S, u32)> {
+            let host = cpal::default_host();
+            let input = pick_input(&host, &cfg.input_name())
+                .ok_or_else(|| anyhow::anyhow!("aucun micro détecté"))?;
+            let output = pick_output(&host, &cfg.output_name())
+                .ok_or_else(|| anyhow::anyhow!("aucune sortie audio détectée"))?;
+            let in_buf: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
+            let (input_stream, in_rate) = open_input_stream(&input, in_buf.clone())?;
+            let (output_stream, out_rate) = open_group_output(&output, peers.clone())?;
+            let in_frame = (in_rate as usize) / 50;
+            let encoder = new_encoder()?;
+            input_stream.play()?;
+            output_stream.play()?;
+            Ok(((input_stream, output_stream, in_buf, in_frame, encoder), out_rate))
+        })();
+        match setup {
+            Ok(((_in_s, _out_s, in_buf, in_frame, encoder), out_rate)) => {
+                let _ = tx.send(Ok(out_rate));
+                let mut packet = vec![0u8; 4000];
+                let mut framebuf = vec![0f32; in_frame];
+                while !stop.load(Ordering::SeqCst) {
+                    let got = if let Ok(mut q) = in_buf.lock() {
+                        if q.len() >= in_frame {
+                            for x in framebuf.iter_mut() {
+                                *x = q.pop_front().unwrap_or(0.0);
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if got {
+                        if !muted.load(Ordering::SeqCst) {
+                            let frame48 = resample_block(&framebuf, OPUS_FRAME);
+                            if let Ok(n) = encoder.encode_float(&frame48, &mut packet[1..]) {
+                                packet[0] = VOICE_TAG;
+                                let dg = bytes::Bytes::copy_from_slice(&packet[..1 + n]);
+                                for c in &conns {
+                                    let _ = c.send_datagram(dg.clone());
+                                }
+                            }
+                        }
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(3));
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e.to_string()));
+            }
+        }
+    });
+    match rx.recv() {
+        Ok(Ok(out_rate)) => Ok(out_rate),
+        Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+        Err(_) => Err(anyhow::anyhow!("démarrage audio interrompu")),
+    }
+}
+
+/// Reçoit les datagrammes voix d'UN pair, décode, ré-échantillonne, remplit son tampon de mixage.
+async fn receive_group_voice(
+    conn: Connection,
+    stop: Arc<AtomicBool>,
+    peers: Arc<Mutex<HashMap<String, VecDeque<f32>>>>,
+    peer: String,
+    out_rate: u32,
+) {
+    let mut decoder = match new_decoder() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let out_frame = (out_rate as usize) / 50;
+    let out_cap = out_frame * 50;
+    let mut decoded = vec![0f32; OPUS_FRAME];
+    while !stop.load(Ordering::SeqCst) {
+        tokio::select! {
+            res = conn.read_datagram() => {
+                match res {
+                    Ok(dg) => {
+                        if dg.len() > 1 && dg[0] == VOICE_TAG {
+                            if let Ok(samples) = decoder.decode_float(Some(&dg[1..]), &mut decoded[..], false) {
+                                let play = resample_block(&decoded[..samples], out_frame);
+                                if let Ok(mut m) = peers.lock() {
+                                    let q = m.entry(peer.clone()).or_default();
+                                    for &s in play.iter() {
+                                        q.push_back(s);
+                                    }
+                                    while q.len() > out_cap {
+                                        q.pop_front();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
+    }
+    if let Ok(mut m) = peers.lock() {
+        m.remove(&peer);
     }
 }

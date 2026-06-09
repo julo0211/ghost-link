@@ -99,10 +99,15 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
 
   <div id="callOfferBanner" class="banner hidden"><span id="callOfferText">📞 Appel entrant…</span><span class="sp"></span><button class="btn sm" id="btnCallAccept">Accepter</button><button class="btn sm ghost-btn" id="btnCallRefuse">Refuser</button></div>
 
+  <div id="groupInviteBanner" class="banner hidden"><span id="groupInviteText">Invitation à un groupe.</span><span class="sp"></span><button class="btn sm" id="btnJoinGroup">Rejoindre</button><button class="btn sm ghost-btn" id="btnDeclineGroup">Refuser</button></div>
+
+  <div id="gcallBanner" class="banner hidden"><span id="gcallText">Appel de groupe en cours.</span><span class="sp"></span><button class="btn sm" id="btnJoinGCall">Rejoindre</button><button class="btn sm ghost-btn" id="btnDeclineGCall">Refuser</button></div>
+
   <div class="tabs">
     <button class="tab active" data-tab="transfert" type="button">📤 Transfert</button>
     <button class="tab" data-tab="amis" type="button">👥 Amis</button>
     <button class="tab" data-tab="identite" type="button">🪪 Identité</button>
+    <button class="tab" data-tab="groupes" type="button">👪 Groupes</button>
   </div>
 
   <div class="card hidden" id="settingsCard">
@@ -118,6 +123,27 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     <p class="hint" style="margin:12px 0 4px">Haut-parleur</p>
     <select id="selSpk" style="width:100%;background:var(--field);color:var(--text);border:1px solid var(--gborder);border-radius:13px;padding:10px 12px;font-size:13px"></select>
     <p class="hint" style="margin:6px 0 0">Appliqué au prochain test micro / appel.</p>
+  </div>
+
+  <div class="card" data-pane="groupes">
+    <h2>👪 Groupes</h2>
+    <p class="hint">Crée un groupe avec tes amis (mutuels) : un channel de discussion partagé. Petits groupes, 100 % P2P.</p>
+    <input type="text" id="groupName" placeholder="Nom du groupe" style="margin-bottom:10px">
+    <p class="hint" style="margin:0 0 6px">Membres :</p>
+    <div id="groupFriends" style="display:flex;flex-direction:column;gap:7px;margin-bottom:12px"></div>
+    <button class="btn sm" id="btnCreateGroup">➕ Créer le groupe</button>
+    <div id="groupList" style="margin-top:16px;display:flex;flex-direction:column;gap:8px"></div>
+  </div>
+
+  <div class="card hidden" id="groupChannelCard" data-pane="groupes">
+    <div class="row" style="justify-content:space-between;flex-wrap:nowrap">
+      <h2 style="margin:0" id="groupChannelName">👪 Groupe</h2>
+      <button class="btn sm ghost-btn" id="btnCloseGroup">Fermer</button>
+    </div>
+    <p class="hint" id="groupMembersLine" style="margin:6px 0 10px"></p>
+    <div class="row" style="margin:0 0 10px"><button class="btn sm" id="btnGroupCall">📞 Appel de groupe</button><button class="btn sm ghost-btn hidden" id="btnGroupMute">🔇 Couper</button><span class="hint" id="groupCallStatus" style="margin:0"></span></div>
+    <div class="chat" id="groupChatLog"></div>
+    <div class="row"><input type="text" id="groupChatInput" placeholder="Message au groupe…" style="flex:1 1 auto;width:auto;min-width:0"><button class="btn sm" id="btnGroupSend">Envoyer</button></div>
   </div>
 
   <div class="card" data-pane="identite">
@@ -187,7 +213,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
 
   <div class="card"><h2>📜 Journal</h2><div id="log" class="log"></div></div>
 
-  <div class="foot">ghost link · noyau natif v0.14.3 · 👻</div>
+  <div class="foot">ghost link · noyau natif v0.16.0 · 👻</div>
 </div>
 
 <script>
@@ -298,7 +324,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     document.querySelectorAll('[data-pane]').forEach(el => el.classList.toggle('pane-hidden', el.getAttribute('data-pane') !== name));
     document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.getAttribute('data-tab') === name));
   }
-  document.querySelectorAll('.tab').forEach(b => b.onclick = () => showTab(b.getAttribute('data-tab')));
+  document.querySelectorAll('.tab').forEach(b => b.onclick = () => { const t = b.getAttribute('data-tab'); showTab(t); if (t === 'groupes') { renderGroupFriends(); renderGroups(); } });
 
   // Demandes d'ami (mutuelles)
   function saveMutual(code, name){
@@ -652,6 +678,180 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
   invoke('perm_code').then(code => { myCode = code; }).catch(() => {});
   invoke('eph_code').then(code => { $('#ephId').value = code; }).catch(() => {});
   $('#setName').value = myName();
+
+  // ===== Groupes (channel de discussion à plusieurs) =====
+  const GKEY = 'ghostlink_groups';
+  function loadGroups(){ try { return JSON.parse(localStorage.getItem(GKEY)) || []; } catch { return []; } }
+  function saveGroups(a){ localStorage.setItem(GKEY, JSON.stringify(a)); }
+  const groupMsgs = {};
+  let openGroupId = null;
+  let pendingInvite = null;
+  const meshOnline = new Set();
+  function updateGroupLine(g){
+    const total = g.members.length + 1;
+    const online = 1 + g.members.filter(c => meshOnline.has(c)).length;
+    $('#groupMembersLine').textContent = '👥 ' + total + ' membres · ' + online + ' en ligne';
+  }
+  function refreshGroupCounts(){
+    const g = loadGroups().find(x => x.id === openGroupId);
+    if (g) updateGroupLine(g);
+    renderGroups();
+  }
+  listen('ghost-mesh-up', e => { if (e.payload) meshOnline.add(e.payload); refreshGroupCounts(); });
+  listen('ghost-mesh-down', e => { if (e.payload) meshOnline.delete(e.payload); refreshGroupCounts(); });
+  function renderGroupFriends(){
+    const box = $('#groupFriends'); if (!box) return; box.innerHTML = '';
+    const fr = loadFriends();
+    if (!fr.length) { box.innerHTML = '<span class="hint">Ajoute d\'abord des amis (onglet Amis).</span>'; return; }
+    fr.forEach(f => {
+      const lab = document.createElement('label'); lab.className = 'row'; lab.style.cssText = 'gap:8px;cursor:pointer';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.value = f.code; cb.style.cssText = 'width:auto;flex:0 0 auto';
+      const sp = document.createElement('span'); sp.style.fontSize = '13.5px'; sp.textContent = f.name + (f.mutual ? '' : ' (non mutuel)');
+      lab.appendChild(cb); lab.appendChild(sp); box.appendChild(lab);
+    });
+  }
+  function renderGroups(){
+    const box = $('#groupList'); if (!box) return; box.innerHTML = '';
+    const gs = loadGroups();
+    if (!gs.length) { box.innerHTML = '<span class="hint">Aucun groupe.</span>'; return; }
+    gs.forEach((g, i) => {
+      const d = document.createElement('div'); d.className = 'xfer';
+      const meta = document.createElement('div'); meta.className = 'meta';
+      const nm = document.createElement('div'); nm.className = 'nm'; nm.textContent = g.name;
+      const pth = document.createElement('div'); pth.className = 'pth';
+      const onl = 1 + g.members.filter(c => meshOnline.has(c)).length;
+      pth.textContent = (g.members.length + 1) + ' membres · ' + onl + ' en ligne';
+      meta.appendChild(nm); meta.appendChild(pth);
+      const open = document.createElement('button'); open.className = 'btn sm'; open.textContent = 'Ouvrir'; open.onclick = () => openGroup(g.id);
+      const del = document.createElement('button'); del.className = 'btn sm ghost-btn'; del.textContent = '✕'; del.title = 'Supprimer / quitter';
+      del.onclick = () => { if (!confirm('Supprimer / quitter le groupe « ' + g.name + ' » ?')) return; const a = loadGroups(); a.splice(i, 1); saveGroups(a); renderGroups(); if (openGroupId === g.id) closeGroup(); };
+      d.appendChild(meta); d.appendChild(open); d.appendChild(del); box.appendChild(d);
+    });
+  }
+  $('#btnCreateGroup').onclick = () => {
+    const name = $('#groupName').value.trim();
+    if (!name) { log('Donne un nom au groupe.'); return; }
+    const selected = Array.from($('#groupFriends').querySelectorAll('input:checked')).map(c => c.value).filter(Boolean);
+    if (!selected.length) { log('Sélectionne au moins un ami.'); return; }
+    if (!myCode) { log('Code permanent indisponible — ré-essaie dans une seconde.'); return; }
+    const id = 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    const full = [myCode, ...selected];
+    saveGroups([...loadGroups(), { id, name, members: selected }]);
+    $('#groupName').value = ''; renderGroups();
+    const fullCsv = full.join(',');
+    selected.forEach(code => invoke('send_ginvite', { member: code, gid: id, name, members: fullCsv }).catch(() => {}));
+    invoke('open_group', { members: selected }).catch(() => {});
+    log('Groupe « ' + name + ' » créé — invitations envoyées aux membres en ligne.');
+    openGroup(id);
+  };
+  function openGroup(id){
+    const g = loadGroups().find(x => x.id === id); if (!g) return;
+    openGroupId = id;
+    $('#groupChannelName').textContent = '👪 ' + g.name;
+    updateGroupLine(g);
+    $('#groupChannelCard').classList.remove('hidden');
+    invoke('open_group', { members: g.members }).catch(() => {});
+    renderGroupMsgs();
+    refreshGroupCallUI();
+  }
+  function closeGroup(){ if (inGroupCall && groupCallId === openGroupId) stopGroupCall(); openGroupId = null; $('#groupChannelCard').classList.add('hidden'); }
+  $('#btnCloseGroup').onclick = closeGroup;
+  function addGroupMsgDom(author, text, who){
+    const box = $('#groupChatLog');
+    const m = document.createElement('div'); m.className = 'msg ' + (who === 'me' ? 'me' : 'them');
+    if (who !== 'me' && author) { const au = document.createElement('div'); au.style.cssText = 'font-size:11px;font-weight:700;opacity:.8;margin-bottom:2px'; au.textContent = author; m.appendChild(au); }
+    const b = document.createElement('div'); b.textContent = text; m.appendChild(b);
+    box.appendChild(m); box.scrollTop = box.scrollHeight;
+  }
+  function renderGroupMsgs(){
+    const box = $('#groupChatLog'); box.innerHTML = '';
+    (groupMsgs[openGroupId] || []).forEach(m => addGroupMsgDom(m.author, m.text, m.who));
+  }
+  function pushGroupMsg(id, author, text, who){
+    (groupMsgs[id] = groupMsgs[id] || []).push({ author, text, who });
+    if (groupMsgs[id].length > 200) groupMsgs[id].shift();
+    if (openGroupId === id) addGroupMsgDom(author, text, who);
+  }
+  function sendGroupMsg(){
+    if (!openGroupId) return;
+    const text = $('#groupChatInput').value.trim(); if (!text) return;
+    const g = loadGroups().find(x => x.id === openGroupId); if (!g) return;
+    invoke('send_gchat', { members: g.members, gid: g.id, name: myName(), text }).catch(e => log('Groupe : ' + e));
+    pushGroupMsg(g.id, myName() || 'moi', text, 'me');
+    $('#groupChatInput').value = '';
+  }
+  $('#btnGroupSend').onclick = sendGroupMsg;
+  $('#groupChatInput').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); sendGroupMsg(); } };
+  listen('ghost-gchat', e => {
+    const p = e.payload || {};
+    if (!loadGroups().some(x => x.id === p.group)) return;
+    pushGroupMsg(p.group, p.author || '?', p.text || '', 'them');
+  });
+  listen('ghost-ginvite', e => {
+    const p = e.payload || {};
+    const full = (p.members || '').split(',').map(s => s.trim()).filter(Boolean);
+    pendingInvite = { id: p.id, name: p.name || 'Groupe', full };
+    $('#groupInviteText').textContent = '👪 Invitation au groupe « ' + (p.name || '?') + ' » (' + full.length + ' membres).';
+    $('#groupInviteBanner').classList.remove('hidden');
+  });
+  $('#btnJoinGroup').onclick = () => {
+    $('#groupInviteBanner').classList.add('hidden');
+    if (!pendingInvite) return;
+    const members = pendingInvite.full.filter(c => c && c !== myCode);
+    if (!loadGroups().some(x => x.id === pendingInvite.id)) {
+      saveGroups([...loadGroups(), { id: pendingInvite.id, name: pendingInvite.name, members }]);
+    }
+    invoke('open_group', { members }).catch(() => {});
+    renderGroups();
+    log('Groupe « ' + pendingInvite.name + ' » rejoint.');
+    pendingInvite = null;
+  };
+  $('#btnDeclineGroup').onclick = () => { $('#groupInviteBanner').classList.add('hidden'); pendingInvite = null; };
+
+  // --- Appel de groupe (audio multi-flux) ---
+  let inGroupCall = false, groupMuted = false, groupCallId = null, pendingGCall = null;
+  function refreshGroupCallUI(){
+    const active = inGroupCall && groupCallId === openGroupId;
+    const b = $('#btnGroupCall'); if (b) b.textContent = active ? '📵 Raccrocher' : '📞 Appel de groupe';
+    const m = $('#btnGroupMute'); if (m) m.classList.toggle('hidden', !active);
+    const s = $('#groupCallStatus'); if (s) s.textContent = active ? (groupMuted ? '🔇 Micro coupé' : '🔊 En appel') : (inGroupCall ? '🔊 En appel (autre groupe)' : '');
+  }
+  async function startGroupCall(g, announce){
+    $('#btnGroupCall').disabled = true;
+    try {
+      await invoke('group_call_start', { members: g.members, gid: g.id, announce });
+      inGroupCall = true; groupCallId = g.id; groupMuted = false;
+      refreshGroupCallUI(); log('📞 Appel de groupe ' + (announce ? 'lancé' : 'rejoint') + '.');
+    } catch (e) { log('Appel groupe : ' + e); const s = $('#groupCallStatus'); if (s) s.textContent = 'erreur : ' + e; }
+    finally { $('#btnGroupCall').disabled = false; }
+  }
+  function stopGroupCall(){ invoke('group_call_stop').catch(() => {}); inGroupCall = false; groupCallId = null; refreshGroupCallUI(); log('Appel de groupe terminé.'); }
+  $('#btnGroupCall').onclick = () => {
+    const g = loadGroups().find(x => x.id === openGroupId); if (!g) return;
+    if (inGroupCall && groupCallId === g.id) { stopGroupCall(); return; }
+    startGroupCall(g, true);
+  };
+  $('#btnGroupMute').onclick = () => {
+    groupMuted = !groupMuted;
+    invoke('group_call_mute', { on: groupMuted }).catch(() => {});
+    refreshGroupCallUI();
+  };
+  listen('ghost-gcall', e => {
+    const p = e.payload || {};
+    if (inGroupCall) return;
+    const g = loadGroups().find(x => x.id === p.group); if (!g) return;
+    pendingGCall = g.id;
+    $('#gcallText').textContent = '📞 Appel dans le groupe « ' + g.name + ' » — rejoindre ?';
+    $('#gcallBanner').classList.remove('hidden');
+  });
+  $('#btnJoinGCall').onclick = () => {
+    $('#gcallBanner').classList.add('hidden');
+    const g = loadGroups().find(x => x.id === pendingGCall); pendingGCall = null;
+    if (!g || inGroupCall) return;
+    openGroup(g.id);
+    startGroupCall(g, false);
+  };
+  $('#btnDeclineGCall').onclick = () => { $('#gcallBanner').classList.add('hidden'); pendingGCall = null; };
   invoke('app_version').then(v => { $('#appVer').textContent = v; }).catch(() => {});
   invoke('get_download_dir').then(d => { $('#setDir').value = d; }).catch(() => {});
   (function(){ const on = localStorage.getItem('ghostlink_onlyfriends') === '1'; $('#setOnlyFriends').checked = on; pushFriendsToBackend(); invoke('set_only_friends', { on }).catch(() => {}); })();

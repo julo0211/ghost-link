@@ -67,6 +67,22 @@ async fn send_faccept(state: State<'_, Net>, name: String) -> Result<(), String>
 }
 
 #[tauri::command]
+async fn open_group(state: State<'_, Net>, members: Vec<String>) -> Result<(), String> {
+    net::open_group(state.inner(), members).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn send_gchat(state: State<'_, Net>, members: Vec<String>, gid: String, name: String, text: String) -> Result<(), String> {
+    net::send_gchat(state.inner(), members, &gid, &name, &text).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn send_ginvite(state: State<'_, Net>, member: String, gid: String, name: String, members: String) -> Result<(), String> {
+    net::send_ginvite(state.inner(), &member, &gid, &name, &members).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn set_download_dir(state: State<'_, Net>, path: String) {
     net::set_download_dir(&state.settings, &path);
 }
@@ -144,6 +160,42 @@ async fn call_stop(
 
 #[tauri::command]
 fn call_set_mute(call: State<'_, audio::Call>, on: bool) {
+    call.set_mute(on);
+}
+
+#[tauri::command]
+async fn group_call_start(
+    net: State<'_, Net>,
+    call: State<'_, audio::GroupCall>,
+    cfg: State<'_, audio::AudioCfg>,
+    members: Vec<String>,
+    gid: String,
+    announce: bool,
+) -> Result<(), String> {
+    let conns = net::group_conns(net.inner(), &members);
+    if conns.is_empty() {
+        return Err("aucun membre du groupe en ligne".to_string());
+    }
+    let c = call.inner().clone();
+    let acfg = cfg.inner().clone();
+    let rt = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || c.start(conns, rt, acfg))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    if announce {
+        let _ = net::send_gcall(net.inner(), members, &gid).await;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn group_call_stop(call: State<'_, audio::GroupCall>) {
+    call.stop();
+}
+
+#[tauri::command]
+fn group_call_mute(call: State<'_, audio::GroupCall>, on: bool) {
     call.set_mute(on);
 }
 
@@ -253,11 +305,13 @@ fn main() {
             app.manage(PendingUpdate(std::sync::Mutex::new(None)));
             app.manage(audio::Voice::default());
             app.manage(audio::Call::default());
+            app.manage(audio::GroupCall::default());
             app.manage(audio::AudioCfg::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            perm_code, eph_code, rotate_eph_code, probe, connect, send_file, send_chat, send_freq, send_faccept,
+            perm_code, eph_code, rotate_eph_code, probe, connect, send_file, send_chat, send_freq, send_faccept, open_group, send_gchat, send_ginvite,
+            group_call_start, group_call_stop, group_call_mute,
             fingerprint, app_version, check_update, install_update, set_download_dir,
             get_download_dir, set_only_friends, set_friends, voice_test_start, voice_test_stop,
             call_start, call_stop, call_set_mute, list_audio_devices, set_audio_input,

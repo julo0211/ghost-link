@@ -28,12 +28,22 @@ const KIND_FACCEPT: u8 = 4; // acceptation d'ami
 const KIND_CALL_START: u8 = 5; // début d'appel vocal
 const KIND_CALL_STOP: u8 = 6; // fin d'appel vocal
 
+// --- Groupes (maillage, ALPN séparé du 1-à-1) ---
+pub const GROUP_ALPN: &[u8] = b"ghost-link/group/0";
+const GKIND_CHAT: u8 = 1; // message de channel de groupe
+const GKIND_INVITE: u8 = 2; // invitation à un groupe
+const GKIND_CALL: u8 = 3; // signal de début d'appel de groupe
+
 #[derive(Default)]
 pub struct ConnState {
     generation: u64,
     conn: Option<Connection>,
 }
 pub type Slot = Arc<Mutex<ConnState>>;
+
+/// Maillage de groupe : code permanent du pair → (jeton unique, connexion).
+pub type Mesh = Arc<StdMutex<HashMap<String, (u64, Connection)>>>;
+static MESH_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub async fn current(slot: &Slot) -> Option<Connection> {
     slot.lock().await.conn.clone()
@@ -156,6 +166,7 @@ pub struct Net {
     pub recv_cancel: Arc<AtomicBool>,
     pub settings: Settings,
     pub incoming: Incoming,
+    pub mesh: Mesh,
 }
 
 /// Identité éphémère : clé aléatoire en mémoire, remplaçable à chaud (rotation).
@@ -370,6 +381,7 @@ fn build_router(
     recv_cancel: &Arc<AtomicBool>,
     settings: &Settings,
     incoming: &Incoming,
+    mesh: &Mesh,
 ) -> Router {
     Router::builder(endpoint.clone())
         .accept(
@@ -382,8 +394,265 @@ fn build_router(
                 incoming: incoming.clone(),
             },
         )
+        .accept(
+            GROUP_ALPN,
+            GroupHandler {
+                app: app.clone(),
+                mesh: mesh.clone(),
+                settings: settings.clone(),
+            },
+        )
         .accept(PRESENCE_ALPN, Presence)
         .spawn()
+}
+
+// ===== Maillage de groupe (chat à plusieurs) =====
+
+#[derive(Clone)]
+pub struct GroupHandler {
+    pub app: AppHandle,
+    pub mesh: Mesh,
+    pub settings: Settings,
+}
+impl std::fmt::Debug for GroupHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GroupHandler")
+    }
+}
+impl ProtocolHandler for GroupHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let peer = connection.remote_id().to_string();
+        // Le maillage de groupe n'accepte que les amis connus.
+        let is_friend = self.settings.friends.lock().unwrap().contains(&peer);
+        if !is_friend {
+            connection.close(0u32.into(), b"not-a-friend");
+            return Ok(());
+        }
+        run_mesh_conn(self.app.clone(), self.mesh.clone(), peer, connection).await;
+        Ok(())
+    }
+}
+
+async fn read_lp16<R: AsyncReadExt + Unpin>(recv: &mut R) -> anyhow::Result<String> {
+    let mut l = [0u8; 2];
+    recv.read_exact(&mut l).await?;
+    let n = u16::from_be_bytes(l) as usize;
+    let mut b = vec![0u8; n];
+    recv.read_exact(&mut b).await?;
+    Ok(String::from_utf8_lossy(&b).to_string())
+}
+async fn read_lp32<R: AsyncReadExt + Unpin>(recv: &mut R) -> anyhow::Result<String> {
+    let mut l = [0u8; 4];
+    recv.read_exact(&mut l).await?;
+    let n = u32::from_be_bytes(l) as usize;
+    if n > 512 * 1024 {
+        anyhow::bail!("message trop long");
+    }
+    let mut b = vec![0u8; n];
+    recv.read_exact(&mut b).await?;
+    Ok(String::from_utf8_lossy(&b).to_string())
+}
+async fn write_lp16<W: AsyncWriteExt + Unpin>(send: &mut W, s: &str) -> anyhow::Result<()> {
+    let b = s.as_bytes();
+    send.write_all(&(b.len() as u16).to_be_bytes()).await?;
+    send.write_all(b).await?;
+    Ok(())
+}
+async fn write_lp32<W: AsyncWriteExt + Unpin>(send: &mut W, s: &str) -> anyhow::Result<()> {
+    let b = s.as_bytes();
+    send.write_all(&(b.len() as u32).to_be_bytes()).await?;
+    send.write_all(b).await?;
+    Ok(())
+}
+
+/// Boucle de réception d'une connexion de maillage (un pair du groupe).
+async fn run_mesh_conn(app: AppHandle, mesh: Mesh, peer: String, connection: Connection) {
+    let token = MESH_SEQ.fetch_add(1, Ordering::SeqCst);
+    if let Some((_, old)) = mesh
+        .lock()
+        .unwrap()
+        .insert(peer.clone(), (token, connection.clone()))
+    {
+        old.close(0u32.into(), b"reconnect");
+    }
+    let _ = app.emit("ghost-mesh-up", &peer);
+
+    loop {
+        match connection.accept_bi().await {
+            Ok((_send, mut recv)) => {
+                let a = app.clone();
+                let from = peer.clone();
+                tokio::spawn(async move {
+                    let mut kind = [0u8; 1];
+                    if recv.read_exact(&mut kind).await.is_err() {
+                        return;
+                    }
+                    if kind[0] == GKIND_CHAT {
+                        if let (Ok(gid), Ok(author), Ok(text)) = (
+                            read_lp16(&mut recv).await,
+                            read_lp16(&mut recv).await,
+                            read_lp32(&mut recv).await,
+                        ) {
+                            let _ = a.emit("ghost-gchat", serde_json::json!({ "group": gid, "author": author, "text": text, "from": from }));
+                        }
+                    } else if kind[0] == GKIND_INVITE {
+                        if let (Ok(gid), Ok(name), Ok(members)) = (
+                            read_lp16(&mut recv).await,
+                            read_lp16(&mut recv).await,
+                            read_lp32(&mut recv).await,
+                        ) {
+                            let _ = a.emit("ghost-ginvite", serde_json::json!({ "id": gid, "name": name, "members": members, "from": from }));
+                        }
+                    } else if kind[0] == GKIND_CALL {
+                        if let Ok(gid) = read_lp16(&mut recv).await {
+                            let _ = a.emit("ghost-gcall", serde_json::json!({ "group": gid, "from": from }));
+                        }
+                    }
+                });
+            }
+            Err(_) => break,
+        }
+    }
+    {
+        let mut m = mesh.lock().unwrap();
+        if m.get(&peer).map(|(t, _)| *t == token).unwrap_or(false) {
+            m.remove(&peer);
+        }
+    }
+    let _ = app.emit("ghost-mesh-down", &peer);
+}
+
+/// Renvoie la connexion de maillage vers `code`, en l'ouvrant si besoin (ALPN groupe).
+async fn ensure_mesh(net: &Net, code: &str) -> anyhow::Result<Connection> {
+    if let Some((_, c)) = net.mesh.lock().unwrap().get(code) {
+        return Ok(c.clone());
+    }
+    let id: EndpointId = code.trim().parse().map_err(|_| anyhow::anyhow!("code invalide"))?;
+    let addr = EndpointAddr::from(id);
+    let conn = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        net.perm.connect(addr, GROUP_ALPN),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("délai dépassé"))?
+    .map_err(|e| anyhow::anyhow!("connexion groupe: {e}"))?;
+    let app = net.app.clone();
+    let mesh = net.mesh.clone();
+    let peer = code.to_string();
+    let c2 = conn.clone();
+    tokio::spawn(async move { run_mesh_conn(app, mesh, peer, c2).await });
+    Ok(conn)
+}
+
+/// Ouvre/rejoint un groupe : se connecte à chaque membre en ligne, en parallèle (non bloquant).
+pub async fn open_group(net: &Net, members: Vec<String>) {
+    for code in members {
+        let code = code.trim().to_string();
+        if code.is_empty() || net.mesh.lock().unwrap().contains_key(&code) {
+            continue;
+        }
+        let perm = net.perm.clone();
+        let mesh = net.mesh.clone();
+        let app = net.app.clone();
+        tokio::spawn(async move {
+            let id: EndpointId = match code.parse() {
+                Ok(i) => i,
+                Err(_) => return,
+            };
+            let addr = EndpointAddr::from(id);
+            let conn = match tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                perm.connect(addr, GROUP_ALPN),
+            )
+            .await
+            {
+                Ok(Ok(c)) => c,
+                _ => return, // membre hors ligne / échec
+            };
+            run_mesh_conn(app, mesh, code, conn).await;
+        });
+    }
+}
+
+/// Diffuse un message de channel aux membres du groupe présents dans le maillage.
+pub async fn send_gchat(
+    net: &Net,
+    members: Vec<String>,
+    gid: &str,
+    author: &str,
+    text: &str,
+) -> anyhow::Result<()> {
+    let targets: Vec<Connection> = {
+        let m = net.mesh.lock().unwrap();
+        members
+            .iter()
+            .filter_map(|code| m.get(code.trim()).map(|(_, c)| c.clone()))
+            .collect()
+    };
+    for conn in targets {
+        if let Ok((mut send, _recv)) = conn.open_bi().await {
+            let _ = send.write_all(&[GKIND_CHAT]).await;
+            let _ = write_lp16(&mut send, gid).await;
+            let _ = write_lp16(&mut send, author).await;
+            let _ = write_lp32(&mut send, text).await;
+            let _ = send.finish();
+        }
+    }
+    Ok(())
+}
+
+/// Envoie une invitation de groupe à un membre (le connecte au maillage si besoin).
+pub async fn send_ginvite(
+    net: &Net,
+    member: &str,
+    gid: &str,
+    name: &str,
+    members_csv: &str,
+) -> anyhow::Result<()> {
+    let conn = ensure_mesh(net, member).await?;
+    let (mut send, _recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("flux: {e}"))?;
+    send.write_all(&[GKIND_INVITE])
+        .await
+        .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
+    write_lp16(&mut send, gid).await?;
+    write_lp16(&mut send, name).await?;
+    write_lp32(&mut send, members_csv).await?;
+    send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+    Ok(())
+}
+
+/// Renvoie les connexions du maillage vers les membres donnés (ceux présents en ligne).
+pub fn group_conns(net: &Net, members: &[String]) -> Vec<(String, Connection)> {
+    let m = net.mesh.lock().unwrap();
+    members
+        .iter()
+        .filter_map(|code| {
+            let code = code.trim();
+            m.get(code).map(|(_, c)| (code.to_string(), c.clone()))
+        })
+        .collect()
+}
+
+/// Annonce le début d'un appel de groupe aux membres (ils proposeront de rejoindre).
+pub async fn send_gcall(net: &Net, members: Vec<String>, gid: &str) -> anyhow::Result<()> {
+    let targets: Vec<Connection> = {
+        let m = net.mesh.lock().unwrap();
+        members
+            .iter()
+            .filter_map(|code| m.get(code.trim()).map(|(_, c)| c.clone()))
+            .collect()
+    };
+    for conn in targets {
+        if let Ok((mut send, _recv)) = conn.open_bi().await {
+            let _ = send.write_all(&[GKIND_CALL]).await;
+            let _ = write_lp16(&mut send, gid).await;
+            let _ = send.finish();
+        }
+    }
+    Ok(())
 }
 
 /// Code permanent (identité stable, à partager seulement avec les amis).
@@ -406,6 +675,7 @@ pub async fn rotate_eph(net: &Net) -> anyhow::Result<String> {
         &net.recv_cancel,
         &net.settings,
         &net.incoming,
+        &net.mesh,
     );
     let id = endpoint.addr().id.to_string();
     let mut g = net.eph.lock().await;
@@ -422,14 +692,15 @@ pub async fn start(app: AppHandle) -> anyhow::Result<Net> {
         *settings.download_dir.lock().unwrap() = Some(dir);
     }
     let incoming = Incoming::default();
+    let mesh: Mesh = Arc::new(StdMutex::new(HashMap::new()));
 
     // Identité PERMANENTE : clé persistante = code ami stable.
     let perm = build_endpoint(load_or_create_secret()).await?;
-    let _perm_router = build_router(&perm, &app, &slot, &recv_cancel, &settings, &incoming);
+    let _perm_router = build_router(&perm, &app, &slot, &recv_cancel, &settings, &incoming, &mesh);
 
     // Identité ÉPHÉMÈRE : clé aléatoire en mémoire, régénérée à chaque lancement.
     let eph_ep = build_endpoint(SecretKey::generate()).await?;
-    let eph_router = build_router(&eph_ep, &app, &slot, &recv_cancel, &settings, &incoming);
+    let eph_router = build_router(&eph_ep, &app, &slot, &recv_cancel, &settings, &incoming, &mesh);
     let eph = Arc::new(Mutex::new(Eph {
         endpoint: eph_ep,
         _router: eph_router,
@@ -445,6 +716,7 @@ pub async fn start(app: AppHandle) -> anyhow::Result<Net> {
         recv_cancel,
         settings,
         incoming,
+        mesh,
     })
 }
 
