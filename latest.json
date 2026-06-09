@@ -1,11 +1,11 @@
 {
-  "version": "0.16.0",
-  "notes": "Appels audio de groupe (mixage multi-flux).",
-  "pub_date": "2026-06-09T20:35:33.072Z",
+  "version": "0.17.0",
+  "notes": "Groupes : chat, appels audio et video (webcam + partage d'ecran).",
+  "pub_date": "2026-06-09T21:14:14.810Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVJNdmtHdGRvc3RiMW13SXNHOFdlT09ub0JZOThpUzZGTXFkcGYvQktOdUQyaXpZOGsrMjUrOGluRk5HWmZuOWtmck5XM2psZVphZmpwaHVrRmNpOGdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxMDM3MzMwCWZpbGU6Z2hvc3QtbGlua18wLjE2LjBfeDY0LXNldHVwLmV4ZQpFZ0l3NUFwODhoM3VIVTg1ckpNMzlUeTIxcFlaWnNtY25MWnZXK3BPY0pTeWNZVTcyTURaelFjZGpEUk1peXNKMWZSenpDRFFvQUN3ejB5YUcrb2VDQT09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.16.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRWRUVjNPNVI5bkM4dUVKOFA2WnAzY3FPUXRsQ3RESWVGZUIrZTQza09hWlROblBjZm5KYXBGL3czdlBHM2VNb0lHT1NGV0c5U0RRUnVuWUZ2dXdvanc4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxMDM5NjQzCWZpbGU6Z2hvc3QtbGlua18wLjE3LjBfeDY0LXNldHVwLmV4ZQpJbzczYWJ2MHR4d256dlh0QWpSZEVTUlMwdUpsTitvZDR0QzRMWmovZHNDV29tOGxZMnRIZzV3OVVYL3RhZGtLRkpqY05XWFZreTJLUlJmQUhhKzVBdz09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.17.0_x64-setup.exe"
     }
   }
 }

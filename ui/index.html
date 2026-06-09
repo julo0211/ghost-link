@@ -215,7 +215,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
 
   <div class="card"><h2>📜 Journal</h2><div id="log" class="log"></div></div>
 
-  <div class="foot">ghost link · noyau natif v0.17.0 · 👻</div>
+  <div class="foot">ghost link · noyau natif v0.17.1 · 👻</div>
 </div>
 
 <script>
@@ -827,7 +827,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     } catch (e) { log('Appel groupe : ' + e); const s = $('#groupCallStatus'); if (s) s.textContent = 'erreur : ' + e; }
     finally { $('#btnGroupCall').disabled = false; }
   }
-  function stopGroupCall(){ invoke('group_call_stop').catch(() => {}); inGroupCall = false; groupCallId = null; refreshGroupCallUI(); log('Appel de groupe terminé.'); }
+  function stopGroupCall(){ invoke('group_call_stop').catch(() => {}); inGroupCall = false; groupCallId = null; refreshGroupCallUI(); stopVideo(); log('Appel de groupe terminé.'); }
   $('#btnGroupCall').onclick = () => {
     const g = loadGroups().find(x => x.id === openGroupId); if (!g) return;
     if (inGroupCall && groupCallId === g.id) { stopGroupCall(); return; }
@@ -887,7 +887,11 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
       finally { st.makingOffer = false; }
     };
     pc.onicecandidate = ev => { if (ev.candidate) sigSend(peer, { candidate: ev.candidate }); };
-    pc.ontrack = ev => { const v = tileFor(peer); if (ev.streams[0]) v.srcObject = ev.streams[0]; };
+    pc.ontrack = ev => {
+      vgrid().classList.remove('hidden');           // afficher la grille même si on ne partage rien
+      const v = tileFor(peer); if (ev.streams[0]) v.srcObject = ev.streams[0];
+      ev.track.onended = () => removeTile(peer);     // l'autre a coupé → retirer sa vignette
+    };
     pc.onconnectionstatechange = () => { if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) removeTile(peer); };
     return st;
   }
