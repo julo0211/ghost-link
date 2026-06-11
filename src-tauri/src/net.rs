@@ -28,6 +28,9 @@ const KIND_FACCEPT: u8 = 4; // acceptation d'ami
 const KIND_CALL_START: u8 = 5; // début d'appel vocal
 const KIND_CALL_STOP: u8 = 6; // fin d'appel vocal
 const KIND_HELLO: u8 = 7; // poignée de main applicative : l'initiateur n'est « connecté » qu'après l'ack du pair
+const KIND_FDATA: u8 = 8; // flux de données d'un transfert (multi-flux parallèles)
+const NSTREAMS: u64 = 4; // nombre de flux parallèles par fichier
+static FILE_SEQ: AtomicU64 = AtomicU64::new(1); // identifiants de transfert
 
 // --- Groupes (maillage, ALPN séparé du 1-à-1) ---
 pub const GROUP_ALPN: &[u8] = b"ghost-link/group/0";
@@ -1030,6 +1033,33 @@ pub async fn disconnect(app: &AppHandle, slot: &Slot) {
     }
 }
 
+/// Transfert de fichier entrant en cours de réassemblage (plusieurs flux écrivent à leur offset).
+struct Inbound {
+    file: tokio::sync::Mutex<tokio::fs::File>,
+    received: AtomicU64,
+    cancelled: AtomicBool,
+}
+type Inbounds = Arc<StdMutex<HashMap<u64, Arc<Inbound>>>>;
+
+/// SHA-256 d'un fichier (vérification d'intégrité après réassemblage multi-flux).
+async fn sha256_file(path: &Path) -> anyhow::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let mut f = tokio::fs::File::open(path).await?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = AsyncReadExt::read(&mut f, &mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    let out = h.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&out);
+    Ok(arr)
+}
+
 async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, settings: Settings, connection: Connection) {
     let peer = connection.remote_id().to_string();
     let mygen = {
@@ -1042,6 +1072,7 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
         g.generation
     };
     let _ = app.emit("ghost-connected", &peer);
+    let inbounds: Inbounds = Arc::new(StdMutex::new(HashMap::new()));
 
     loop {
         match connection.accept_bi().await {
@@ -1049,6 +1080,7 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                 let a = app.clone();
                 let cancel = recv_cancel.clone();
                 let settings = settings.clone();
+                let inbounds = inbounds.clone();
                 tokio::spawn(async move {
                     // Premier octet : type de flux (1 = fichier, 2 = chat).
                     let mut kind = [0u8; 1];
@@ -1120,31 +1152,93 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                         let _ = send.finish();
                         return;
                     }
+                    if kind[0] == KIND_FDATA {
+                        // Flux de données d'un transfert : [u64 id][u64 offset][u64 len] puis les octets.
+                        let hdr: anyhow::Result<(u64, u64, u64)> = async {
+                            let mut b = [0u8; 8];
+                            AsyncReadExt::read_exact(&mut recv, &mut b).await?;
+                            let id = u64::from_be_bytes(b);
+                            AsyncReadExt::read_exact(&mut recv, &mut b).await?;
+                            let offset = u64::from_be_bytes(b);
+                            AsyncReadExt::read_exact(&mut recv, &mut b).await?;
+                            let len = u64::from_be_bytes(b);
+                            Ok((id, offset, len))
+                        }
+                        .await;
+                        let (id, offset, len) = match hdr {
+                            Ok(v) => v,
+                            Err(_) => return,
+                        };
+                        // Attendre que le flux de contrôle ait enregistré ce transfert (course réseau).
+                        let mut inb = None;
+                        for _ in 0..200 {
+                            if let Some(x) = inbounds.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
+                                inb = Some(x.clone());
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        let inb = match inb {
+                            Some(x) => x,
+                            None => return,
+                        };
+                        let mut buf = vec![0u8; CHUNK];
+                        let mut pos = offset;
+                        let mut remaining = len;
+                        while remaining > 0 {
+                            if inb.cancelled.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            let want = std::cmp::min(CHUNK as u64, remaining) as usize;
+                            if AsyncReadExt::read_exact(&mut recv, &mut buf[..want]).await.is_err() {
+                                return;
+                            }
+                            {
+                                use tokio::io::AsyncSeekExt;
+                                let mut f = inb.file.lock().await;
+                                if f.seek(std::io::SeekFrom::Start(pos)).await.is_err()
+                                    || AsyncWriteExt::write_all(&mut *f, &buf[..want]).await.is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            pos += want as u64;
+                            remaining -= want as u64;
+                            inb.received.fetch_add(want as u64, Ordering::SeqCst);
+                        }
+                        return;
+                    }
                     if kind[0] != KIND_FILE {
                         return; // type de flux inconnu : on ignore (compat ascendante + sécurité)
                     }
 
-                    // KIND_FILE : réception de fichier.
+                    // KIND_FILE (flux de contrôle d'un transfert multi-flux) :
+                    // [u64 id][u16 nom_len][nom][u64 taille][32 hash][u8 nflux]
                     cancel.store(false, Ordering::SeqCst);
-
-                    // En-tête
-                    let header: anyhow::Result<(String, u64)> = async {
+                    let header: anyhow::Result<(u64, String, u64, [u8; 32])> = async {
+                        let mut b8 = [0u8; 8];
+                        AsyncReadExt::read_exact(&mut recv, &mut b8).await?;
+                        let id = u64::from_be_bytes(b8);
                         let mut l2 = [0u8; 2];
                         AsyncReadExt::read_exact(&mut recv, &mut l2).await?;
                         let nlen = u16::from_be_bytes(l2) as usize;
                         let mut nbuf = vec![0u8; nlen];
                         AsyncReadExt::read_exact(&mut recv, &mut nbuf).await?;
-                        let mut s8 = [0u8; 8];
-                        AsyncReadExt::read_exact(&mut recv, &mut s8).await?;
-                        Ok((sanitize(&String::from_utf8_lossy(&nbuf)), u64::from_be_bytes(s8)))
+                        AsyncReadExt::read_exact(&mut recv, &mut b8).await?;
+                        let size = u64::from_be_bytes(b8);
+                        let mut hash = [0u8; 32];
+                        AsyncReadExt::read_exact(&mut recv, &mut hash).await?;
+                        let mut nflux = [0u8; 1];
+                        AsyncReadExt::read_exact(&mut recv, &mut nflux).await?;
+                        Ok((id, sanitize(&String::from_utf8_lossy(&nbuf)), size, hash))
                     }
                     .await;
-                    let (name, size) = match header {
+                    let (id, name, size, hash) = match header {
                         Ok(v) => v,
                         Err(_) => return,
                     };
 
-                    // Demander l'autorisation AVANT de recevoir le fichier.
+                    // Demander l'autorisation AVANT de recevoir.
                     let offer_id = settings.file_counter.fetch_add(1, Ordering::SeqCst);
                     let (otx, orx) = tokio::sync::oneshot::channel::<bool>();
                     settings.file_pending.lock().unwrap_or_else(|e| e.into_inner()).insert(offer_id, otx);
@@ -1155,58 +1249,78 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                     );
                     settings.file_pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&offer_id);
                     if !accepted {
-                        let _ = AsyncWriteExt::write_all(&mut send, &[0u8]).await; // refus
+                        let _ = AsyncWriteExt::write_all(&mut send, &[0u8]).await;
                         let _ = send.finish();
-                        let _ = recv.stop(0u32.into());
                         let _ = a.emit("ghost-recv-rejected", serde_json::json!({ "id": offer_id, "name": name }));
                         return;
                     }
-                    let _ = AsyncWriteExt::write_all(&mut send, &[1u8]).await; // accepté
+                    let _ = AsyncWriteExt::write_all(&mut send, &[1u8]).await;
 
                     let dir = settings.recv_dir();
                     let dest = unique_path(&dir, &name);
-                    let _ = a.emit("ghost-recv-start", serde_json::json!({ "name": name, "size": size }));
-
-                    // Corps (Ok(true) = terminé, Ok(false) = annulé, Err = flux coupé)
-                    let body: anyhow::Result<bool> = async {
-                        let mut file = tokio::io::BufWriter::with_capacity(
-                            1 << 20,
-                            tokio::fs::File::create(&dest).await?,
-                        );
-                        let mut buf = vec![0u8; CHUNK];
-                        let mut got: u64 = 0;
-                        let mut last_emit = std::time::Instant::now();
-                        let _ = a.emit("ghost-recv-progress", serde_json::json!({ "name": name, "received": 0u64, "size": size }));
-                        while got < size {
-                            if cancel.load(Ordering::SeqCst) {
-                                return Ok(false);
-                            }
-                            let want = std::cmp::min(CHUNK as u64, size - got) as usize;
-                            AsyncReadExt::read_exact(&mut recv, &mut buf[..want]).await?;
-                            AsyncWriteExt::write_all(&mut file, &buf[..want]).await?;
-                            got += want as u64;
-                            // Émettre la progression au plus 10×/s pour ne pas saturer l'IPC.
-                            if last_emit.elapsed().as_millis() >= 100 {
-                                let _ = a.emit("ghost-recv-progress", serde_json::json!({ "name": name, "received": got, "size": size }));
-                                last_emit = std::time::Instant::now();
-                            }
-                        }
-                        AsyncWriteExt::flush(&mut file).await?;
-                        Ok(true)
+                    let created = async {
+                        let f = tokio::fs::File::create(&dest).await?;
+                        f.set_len(size).await?; // pré-allouer : les flux écrivent à leur offset
+                        anyhow::Ok(f)
                     }
                     .await;
+                    let file = match created {
+                        Ok(f) => f,
+                        Err(_) => return,
+                    };
+                    let inb = Arc::new(Inbound {
+                        file: tokio::sync::Mutex::new(file),
+                        received: AtomicU64::new(0),
+                        cancelled: AtomicBool::new(false),
+                    });
+                    inbounds.lock().unwrap_or_else(|e| e.into_inner()).insert(id, inb.clone());
+                    let _ = a.emit("ghost-recv-start", serde_json::json!({ "name": name, "size": size }));
+                    let _ = a.emit("ghost-recv-progress", serde_json::json!({ "name": name, "received": 0u64, "size": size }));
 
-                    match body {
-                        Ok(true) => {
-                            let _ = AsyncWriteExt::write_all(&mut send, b"ok").await;
-                            let _ = send.finish();
-                            let _ = a.emit("ghost-recv-done", serde_json::json!({ "name": name, "size": size, "path": dest.to_string_lossy() }));
+                    // Attendre le réassemblage complet (les flux KIND_FDATA remplissent `received`).
+                    let mut last_emit = std::time::Instant::now();
+                    let mut last_got = 0u64;
+                    let mut stall = 0u64;
+                    let mut done = false;
+                    loop {
+                        if cancel.load(Ordering::SeqCst) {
+                            inb.cancelled.store(true, Ordering::SeqCst);
+                            break;
                         }
-                        _ => {
-                            let _ = recv.stop(0u32.into());
-                            let _ = tokio::fs::remove_file(&dest).await;
-                            let _ = a.emit("ghost-recv-cancel", serde_json::json!({ "name": name }));
+                        let got = inb.received.load(Ordering::SeqCst);
+                        if got >= size {
+                            done = true;
+                            break;
                         }
+                        if got != last_got {
+                            last_got = got;
+                            stall = 0;
+                        } else {
+                            stall += 60;
+                        }
+                        if stall >= 60_000 {
+                            break; // 60 s sans progrès → abandon
+                        }
+                        if last_emit.elapsed().as_millis() >= 100 {
+                            let _ = a.emit("ghost-recv-progress", serde_json::json!({ "name": name, "received": got, "size": size }));
+                            last_emit = std::time::Instant::now();
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                    }
+                    inbounds.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                    {
+                        let mut f = inb.file.lock().await;
+                        let _ = AsyncWriteExt::flush(&mut *f).await;
+                    }
+                    let ok_hash = done && sha256_file(&dest).await.map(|h| h == hash).unwrap_or(false);
+                    if ok_hash {
+                        let _ = AsyncWriteExt::write_all(&mut send, b"ok").await;
+                        let _ = send.finish();
+                        let _ = a.emit("ghost-recv-done", serde_json::json!({ "name": name, "size": size, "path": dest.to_string_lossy() }));
+                    } else {
+                        let _ = tokio::fs::remove_file(&dest).await;
+                        let ev = if done { "ghost-recv-corrupt" } else { "ghost-recv-cancel" };
+                        let _ = a.emit(ev, serde_json::json!({ "name": name }));
                     }
                 });
             }
@@ -1244,20 +1358,28 @@ pub async fn send_file(
         .map_err(|e| anyhow::anyhow!("fichier introuvable: {e}"))?
         .len();
 
+    // Empreinte SHA-256 du fichier : le pair vérifiera l'intégrité après réassemblage.
+    let hash = sha256_file(p)
+        .await
+        .map_err(|e| anyhow::anyhow!("lecture (hash): {e}"))?;
+    let id = FILE_SEQ.fetch_add(1, Ordering::SeqCst);
+
+    // Flux de CONTRÔLE : entête + accord du pair. Les octets passent par les flux de données.
     let (mut send, mut recv) = conn
         .open_bi()
         .await
         .map_err(|e| anyhow::anyhow!("ouverture du flux: {e}"))?;
 
-    AsyncWriteExt::write_all(&mut send, &[KIND_FILE])
-        .await
-        .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
+    let mut head = Vec::with_capacity(1 + 8 + 2 + name.len() + 8 + 32 + 1);
+    head.push(KIND_FILE);
+    head.extend_from_slice(&id.to_be_bytes());
     let nb = name.as_bytes();
-    AsyncWriteExt::write_all(&mut send, &(nb.len() as u16).to_be_bytes())
-        .await
-        .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
-    AsyncWriteExt::write_all(&mut send, nb).await.map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
-    AsyncWriteExt::write_all(&mut send, &size.to_be_bytes())
+    head.extend_from_slice(&(nb.len() as u16).to_be_bytes());
+    head.extend_from_slice(nb);
+    head.extend_from_slice(&size.to_be_bytes());
+    head.extend_from_slice(&hash);
+    head.push(NSTREAMS as u8);
+    AsyncWriteExt::write_all(&mut send, &head)
         .await
         .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
 
@@ -1271,39 +1393,125 @@ pub async fn send_file(
         return Err(anyhow::anyhow!("refusé par le pair"));
     }
 
-    let mut file = tokio::fs::File::open(p)
+    let _ = app.emit("ghost-send-progress", serde_json::json!({ "name": name, "sent": 0u64, "size": size }));
+
+    // Découper le fichier en NSTREAMS tranches contiguës, une par flux parallèle.
+    let part = if size == 0 { 0 } else { (size + NSTREAMS - 1) / NSTREAMS };
+    let sent = Arc::new(AtomicU64::new(0));
+    let mut tasks = Vec::new();
+    for i in 0..NSTREAMS {
+        let offset = i * part;
+        if offset >= size {
+            break; // fichier plus petit que NSTREAMS tranches
+        }
+        let len = std::cmp::min(part, size - offset);
+        let task = send_one_part(
+            conn.clone(),
+            id,
+            offset,
+            len,
+            p.to_path_buf(),
+            size,
+            send_cancel.clone(),
+            app.clone(),
+            name.clone(),
+            sent.clone(),
+        );
+        tasks.push(tokio::spawn(task));
+    }
+    // Attendre tous les flux ; la première erreur fait échouer l'envoi.
+    let mut first_err: Option<anyhow::Error> = None;
+    for t in tasks {
+        match t.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("tâche d'envoi: {e}"));
+                }
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        let _ = send.reset(0u32.into());
+        return Err(e);
+    }
+    let _ = send.finish();
+
+    // Accusé final du pair : "ok" si l'intégrité est vérifiée.
+    let mut ack = [0u8; 2];
+    match AsyncReadExt::read_exact(&mut recv, &mut ack).await {
+        Ok(_) if &ack == b"ok" => Ok(name),
+        _ => Err(anyhow::anyhow!(
+            "le pair a rejeté le fichier (intégrité non vérifiée ou transfert interrompu)"
+        )),
+    }
+}
+
+/// Envoie une tranche [offset, offset+len) du fichier sur son propre flux QUIC.
+/// En-tête du flux : [KIND_FDATA][u64 id][u64 offset][u64 len] puis les octets.
+#[allow(clippy::too_many_arguments)]
+async fn send_one_part(
+    conn: Connection,
+    id: u64,
+    offset: u64,
+    len: u64,
+    path: PathBuf,
+    total: u64,
+    send_cancel: Arc<AtomicBool>,
+    app: AppHandle,
+    name: String,
+    sent: Arc<AtomicU64>,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncSeekExt;
+    let (mut send, _recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("ouverture du flux: {e}"))?;
+    let mut hdr = Vec::with_capacity(25);
+    hdr.push(KIND_FDATA);
+    hdr.extend_from_slice(&id.to_be_bytes());
+    hdr.extend_from_slice(&offset.to_be_bytes());
+    hdr.extend_from_slice(&len.to_be_bytes());
+    AsyncWriteExt::write_all(&mut send, &hdr)
+        .await
+        .map_err(|e| anyhow::anyhow!("envoi entête: {e}"))?;
+
+    let mut file = tokio::fs::File::open(&path)
         .await
         .map_err(|e| anyhow::anyhow!("ouverture: {e}"))?;
+    file.seek(std::io::SeekFrom::Start(offset))
+        .await
+        .map_err(|e| anyhow::anyhow!("seek: {e}"))?;
+
     let mut buf = vec![0u8; CHUNK];
-    let mut sent: u64 = 0;
+    let mut remaining = len;
     let mut last_emit = std::time::Instant::now();
-    let _ = app.emit("ghost-send-progress", serde_json::json!({ "name": name, "sent": 0u64, "size": size }));
-    loop {
+    while remaining > 0 {
         if send_cancel.load(Ordering::SeqCst) {
             let _ = send.reset(0u32.into());
             return Err(anyhow::anyhow!("annulé"));
         }
-        let n = AsyncReadExt::read(&mut file, &mut buf)
+        let want = std::cmp::min(CHUNK as u64, remaining) as usize;
+        AsyncReadExt::read_exact(&mut file, &mut buf[..want])
             .await
             .map_err(|e| anyhow::anyhow!("lecture: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        AsyncWriteExt::write_all(&mut send, &buf[..n])
+        AsyncWriteExt::write_all(&mut send, &buf[..want])
             .await
             .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
-        sent += n as u64;
-        // Émettre la progression au plus 10×/s pour ne pas saturer l'IPC.
+        remaining -= want as u64;
+        let s = sent.fetch_add(want as u64, Ordering::SeqCst) + want as u64;
         if last_emit.elapsed().as_millis() >= 100 {
-            let _ = app.emit("ghost-send-progress", serde_json::json!({ "name": name, "sent": sent, "size": size }));
+            let _ = app.emit("ghost-send-progress", serde_json::json!({ "name": name, "sent": s, "size": total }));
             last_emit = std::time::Instant::now();
         }
     }
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
-
-    let mut ack = [0u8; 2];
-    let _ = AsyncReadExt::read_exact(&mut recv, &mut ack).await;
-    Ok(name)
+    Ok(())
 }
 
 /// Envoie un message de chat (avec le nom d'affichage) sur la connexion ouverte.

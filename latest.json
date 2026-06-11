@@ -1,11 +1,11 @@
 {
-  "version": "0.18.0",
-  "notes": "Groupes complets : cam+ecran simultanes, retrait fiable, partage de fichiers.",
-  "pub_date": "2026-06-09T22:32:43.390Z",
+  "version": "0.20.0",
+  "notes": "Transfert multi-flux (jusqu'a ~4x plus rapide) + verification d'integrite SHA-256",
+  "pub_date": "2026-06-11T15:42:16.060Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVRoZjVIbFRjNTFTOGdnMmZFeDVSb0dBSzF4bTF4UU9JWEp0UXYraUxvRFNKMi9UUmpZY2hkU282M0doK2dOR21xVThBeWZNdHhXWXQwczRjUWVrVEE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxMDQ0MzQ3CWZpbGU6Z2hvc3QtbGlua18wLjE4LjBfeDY0LXNldHVwLmV4ZQpuY1VCblFXWEdkdDl5NUxLUGJBUEg1Yk5IRVNtdE5tbXRoK2s3ZC9ibUVhall3UE85TGRtTFMyTEpiR2pXdVZKbDhPd293UGdUNkNNVStFaE0xbVhCZz09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.18.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVdkdEZVeU9GeTdBZThaUWxES3I0QTR6Nk9JSUpEak4xZ0EzclhldEF0Nm9USmZJRWczUkE4WFJBeE53enpocGhxNUt2OENyQjM2RFNjS2Q1VW9tdndrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxMTkyNTM0CWZpbGU6Z2hvc3QtbGlua18wLjIwLjBfeDY0LXNldHVwLmV4ZQpSenliRDdWZCszM1lFckMrK3pxM1R3SDNTL2JxcVYwVXRQRjBiazBneDMxdkUraHVKanNzQ1JHci8wQ1VtbEFkZ1lxUHIvdVRicHc1LzRRTHZlTFBDZz09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.20.0_x64-setup.exe"
     }
   }
 }
