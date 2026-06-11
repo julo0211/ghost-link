@@ -27,6 +27,7 @@ const KIND_FREQ: u8 = 3; // demande d'ami
 const KIND_FACCEPT: u8 = 4; // acceptation d'ami
 const KIND_CALL_START: u8 = 5; // début d'appel vocal
 const KIND_CALL_STOP: u8 = 6; // fin d'appel vocal
+const KIND_HELLO: u8 = 7; // poignée de main applicative : l'initiateur n'est « connecté » qu'après l'ack du pair
 
 // --- Groupes (maillage, ALPN séparé du 1-à-1) ---
 pub const GROUP_ALPN: &[u8] = b"ghost-link/group/0";
@@ -47,6 +48,12 @@ pub type Slot = Arc<Mutex<ConnState>>;
 pub type Mesh = Arc<StdMutex<HashMap<String, (u64, Connection)>>>;
 static MESH_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// Codes dont une connexion de maillage est EN COURS d'établissement.
+/// Évite que deux appels concurrents (invitation + open_group, ou deux groupes
+/// partageant un membre au démarrage) ne composent le même pair en parallèle —
+/// la 2ᵉ connexion fermait alors la 1ʳᵉ, faisant parfois perdre l'invitation.
+pub type Connecting = Arc<StdMutex<HashSet<String>>>;
+
 pub async fn current(slot: &Slot) -> Option<Connection> {
     slot.lock().await.conn.clone()
 }
@@ -59,6 +66,9 @@ pub struct Settings {
     pub friends: Arc<StdMutex<HashSet<String>>>,
     pub file_pending: Arc<StdMutex<HashMap<u64, tokio::sync::oneshot::Sender<bool>>>>,
     pub file_counter: Arc<AtomicU64>,
+    // Offres de fichiers de GROUPE en attente d'autorisation (comme le 1-à-1).
+    pub gfile_pending: Arc<StdMutex<HashMap<u64, tokio::sync::oneshot::Sender<bool>>>>,
+    pub gfile_counter: Arc<AtomicU64>,
 }
 
 impl Settings {
@@ -75,7 +85,7 @@ impl Settings {
         if !self.only_friends.load(Ordering::SeqCst) {
             return true;
         }
-        self.friends.lock().unwrap().contains(peer_id)
+        self.friends.lock().unwrap_or_else(|e| e.into_inner()).contains(peer_id)
     }
 }
 
@@ -88,7 +98,7 @@ pub struct Incoming {
 
 /// Réponse de l'utilisateur à une demande de connexion entrante.
 pub fn respond_incoming(incoming: &Incoming, id: u64, accept: bool) {
-    if let Some(tx) = incoming.pending.lock().unwrap().remove(&id) {
+    if let Some(tx) = incoming.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
         let _ = tx.send(accept);
     }
 }
@@ -120,7 +130,7 @@ impl ProtocolHandler for Ghost {
         // Demander l'autorisation à l'utilisateur (toujours), avec délai de 45 s.
         let id = self.incoming.counter.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-        self.incoming.pending.lock().unwrap().insert(id, tx);
+        self.incoming.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(id, tx);
         let _ = self
             .app
             .emit("ghost-incoming", serde_json::json!({ "id": id, "peer": peer }));
@@ -128,7 +138,7 @@ impl ProtocolHandler for Ghost {
             tokio::time::timeout(std::time::Duration::from_secs(45), rx).await,
             Ok(Ok(true))
         );
-        self.incoming.pending.lock().unwrap().remove(&id);
+        self.incoming.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         if !accepted {
             connection.close(0u32.into(), b"refused");
             let _ = self
@@ -169,6 +179,7 @@ pub struct Net {
     pub settings: Settings,
     pub incoming: Incoming,
     pub mesh: Mesh,
+    pub connecting: Connecting,
 }
 
 /// Identité éphémère : clé aléatoire en mémoire, remplaçable à chaud (rotation).
@@ -333,7 +344,7 @@ fn save_download_dir(dir: &str) {
 /// Définit (et mémorise) le dossier de réception. Chaîne vide = défaut (Téléchargements).
 pub fn set_download_dir(settings: &Settings, path: &str) {
     let p = path.trim();
-    *settings.download_dir.lock().unwrap() = if p.is_empty() { None } else { Some(PathBuf::from(p)) };
+    *settings.download_dir.lock().unwrap_or_else(|e| e.into_inner()) = if p.is_empty() { None } else { Some(PathBuf::from(p)) };
     save_download_dir(p);
 }
 pub fn get_download_dir(settings: &Settings) -> String {
@@ -343,7 +354,7 @@ pub fn set_only_friends(settings: &Settings, on: bool) {
     settings.only_friends.store(on, Ordering::SeqCst);
 }
 pub fn set_friends(settings: &Settings, codes: Vec<String>) {
-    let mut s = settings.friends.lock().unwrap();
+    let mut s = settings.friends.lock().unwrap_or_else(|e| e.into_inner());
     s.clear();
     for c in codes {
         let c = c.trim();
@@ -355,7 +366,14 @@ pub fn set_friends(settings: &Settings, codes: Vec<String>) {
 
 /// Réponse de l'utilisateur à une offre de fichier entrante (true = accepter, false = refuser).
 pub fn respond_file(settings: &Settings, id: u64, accept: bool) {
-    if let Some(tx) = settings.file_pending.lock().unwrap().remove(&id) {
+    if let Some(tx) = settings.file_pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
+        let _ = tx.send(accept);
+    }
+}
+
+/// Réponse de l'utilisateur à une offre de fichier de GROUPE entrante.
+pub fn respond_gfile(settings: &Settings, id: u64, accept: bool) {
+    if let Some(tx) = settings.gfile_pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
         let _ = tx.send(accept);
     }
 }
@@ -425,7 +443,7 @@ impl ProtocolHandler for GroupHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let peer = connection.remote_id().to_string();
         // Le maillage de groupe n'accepte que les amis connus.
-        let is_friend = self.settings.friends.lock().unwrap().contains(&peer);
+        let is_friend = self.settings.friends.lock().unwrap_or_else(|e| e.into_inner()).contains(&peer);
         if !is_friend {
             connection.close(0u32.into(), b"not-a-friend");
             return Ok(());
@@ -472,7 +490,7 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, peer: Str
     let token = MESH_SEQ.fetch_add(1, Ordering::SeqCst);
     if let Some((_, old)) = mesh
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(peer.clone(), (token, connection.clone()))
     {
         old.close(0u32.into(), b"reconnect");
@@ -481,7 +499,7 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, peer: Str
 
     loop {
         match connection.accept_bi().await {
-            Ok((_send, mut recv)) => {
+            Ok((mut send, mut recv)) => {
                 let a = app.clone();
                 let from = peer.clone();
                 let settings = settings.clone();
@@ -515,7 +533,7 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, peer: Str
                             let _ = a.emit("ghost-signal", serde_json::json!({ "from": from, "data": data }));
                         }
                     } else if kind[0] == GKIND_GFILE {
-                        let _ = recv_gfile(&a, &settings, &from, &mut recv).await;
+                        let _ = recv_gfile(&a, &settings, &from, &mut send, &mut recv).await;
                     }
                 });
             }
@@ -523,7 +541,7 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, peer: Str
         }
     }
     {
-        let mut m = mesh.lock().unwrap();
+        let mut m = mesh.lock().unwrap_or_else(|e| e.into_inner());
         if m.get(&peer).map(|(t, _)| *t == token).unwrap_or(false) {
             m.remove(&peer);
         }
@@ -532,19 +550,46 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, peer: Str
 }
 
 /// Renvoie la connexion de maillage vers `code`, en l'ouvrant si besoin (ALPN groupe).
+/// Garde anti-course : si un autre appel compose déjà ce pair, on patiente que sa
+/// connexion apparaisse plutôt que d'en ouvrir une 2ᵉ (qui fermerait la 1ʳᵉ et
+/// pouvait faire perdre l'invitation portée par cette connexion).
 async fn ensure_mesh(net: &Net, code: &str) -> anyhow::Result<Connection> {
-    if let Some((_, c)) = net.mesh.lock().unwrap().get(code) {
+    if let Some((_, c)) = net.mesh.lock().unwrap_or_else(|e| e.into_inner()).get(code) {
         return Ok(c.clone());
     }
-    let id: EndpointId = code.trim().parse().map_err(|_| anyhow::anyhow!("code invalide"))?;
-    let addr = EndpointAddr::from(id);
-    let conn = tokio::time::timeout(
-        std::time::Duration::from_secs(8),
-        net.perm.connect(addr, GROUP_ALPN),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("délai dépassé"))?
-    .map_err(|e| anyhow::anyhow!("connexion groupe: {e}"))?;
+    // Réserver le dial, ou attendre brièvement qu'un dial concurrent aboutisse.
+    let mut waited = 0u64;
+    loop {
+        {
+            if let Some((_, c)) = net.mesh.lock().unwrap_or_else(|e| e.into_inner()).get(code) {
+                return Ok(c.clone());
+            }
+            let mut connecting = net.connecting.lock().unwrap_or_else(|e| e.into_inner());
+            if !connecting.contains(code) {
+                connecting.insert(code.to_string());
+                break; // c'est nous qui composons ce pair
+            }
+        }
+        if waited >= 8000 {
+            anyhow::bail!("connexion de groupe déjà en cours");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        waited += 80;
+    }
+    let dialed = async {
+        let id: EndpointId = code.trim().parse().map_err(|_| anyhow::anyhow!("code invalide"))?;
+        let addr = EndpointAddr::from(id);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            net.perm.connect(addr, GROUP_ALPN),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("délai dépassé"))?
+        .map_err(|e| anyhow::anyhow!("connexion groupe: {e}"))
+    }
+    .await;
+    net.connecting.lock().unwrap_or_else(|e| e.into_inner()).remove(code);
+    let conn = dialed?;
     let app = net.app.clone();
     let mesh = net.mesh.clone();
     let settings = net.settings.clone();
@@ -558,17 +603,32 @@ async fn ensure_mesh(net: &Net, code: &str) -> anyhow::Result<Connection> {
 pub async fn open_group(net: &Net, members: Vec<String>) {
     for code in members {
         let code = code.trim().to_string();
-        if code.is_empty() || net.mesh.lock().unwrap().contains_key(&code) {
+        if code.is_empty() {
             continue;
+        }
+        // Sauter si déjà connecté OU déjà en cours de connexion (garde anti double-dial).
+        {
+            if net.mesh.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&code) {
+                continue;
+            }
+            let mut connecting = net.connecting.lock().unwrap_or_else(|e| e.into_inner());
+            if connecting.contains(&code) {
+                continue;
+            }
+            connecting.insert(code.clone());
         }
         let perm = net.perm.clone();
         let mesh = net.mesh.clone();
         let app = net.app.clone();
         let settings = net.settings.clone();
+        let connecting = net.connecting.clone();
         tokio::spawn(async move {
             let id: EndpointId = match code.parse() {
                 Ok(i) => i,
-                Err(_) => return,
+                Err(_) => {
+                    connecting.lock().unwrap_or_else(|e| e.into_inner()).remove(&code);
+                    return;
+                }
             };
             let addr = EndpointAddr::from(id);
             let conn = match tokio::time::timeout(
@@ -578,8 +638,12 @@ pub async fn open_group(net: &Net, members: Vec<String>) {
             .await
             {
                 Ok(Ok(c)) => c,
-                _ => return, // membre hors ligne / échec
+                _ => {
+                    connecting.lock().unwrap_or_else(|e| e.into_inner()).remove(&code);
+                    return; // membre hors ligne / échec
+                }
             };
+            connecting.lock().unwrap_or_else(|e| e.into_inner()).remove(&code);
             run_mesh_conn(app, mesh, settings, code, conn).await;
         });
     }
@@ -594,7 +658,7 @@ pub async fn send_gchat(
     text: &str,
 ) -> anyhow::Result<()> {
     let targets: Vec<Connection> = {
-        let m = net.mesh.lock().unwrap();
+        let m = net.mesh.lock().unwrap_or_else(|e| e.into_inner());
         members
             .iter()
             .filter_map(|code| m.get(code.trim()).map(|(_, c)| c.clone()))
@@ -637,7 +701,7 @@ pub async fn send_ginvite(
 
 /// Renvoie les connexions du maillage vers les membres donnés (ceux présents en ligne).
 pub fn group_conns(net: &Net, members: &[String]) -> Vec<(String, Connection)> {
-    let m = net.mesh.lock().unwrap();
+    let m = net.mesh.lock().unwrap_or_else(|e| e.into_inner());
     members
         .iter()
         .filter_map(|code| {
@@ -650,7 +714,7 @@ pub fn group_conns(net: &Net, members: &[String]) -> Vec<(String, Connection)> {
 /// Annonce le début d'un appel de groupe aux membres (ils proposeront de rejoindre).
 pub async fn send_gcall(net: &Net, members: Vec<String>, gid: &str) -> anyhow::Result<()> {
     let targets: Vec<Connection> = {
-        let m = net.mesh.lock().unwrap();
+        let m = net.mesh.lock().unwrap_or_else(|e| e.into_inner());
         members
             .iter()
             .filter_map(|code| m.get(code.trim()).map(|(_, c)| c.clone()))
@@ -668,7 +732,7 @@ pub async fn send_gcall(net: &Net, members: Vec<String>, gid: &str) -> anyhow::R
 
 /// Envoie un message de signalisation WebRTC (vidéo) à UN pair précis du maillage.
 pub async fn send_signal(net: &Net, peer: &str, data: &str) -> anyhow::Result<()> {
-    let conn = net.mesh.lock().unwrap().get(peer.trim()).map(|(_, c)| c.clone());
+    let conn = net.mesh.lock().unwrap_or_else(|e| e.into_inner()).get(peer.trim()).map(|(_, c)| c.clone());
     let conn = conn.ok_or_else(|| anyhow::anyhow!("pair non connecté"))?;
     let (mut send, _recv) = conn
         .open_bi()
@@ -682,11 +746,12 @@ pub async fn send_signal(net: &Net, peer: &str, data: &str) -> anyhow::Result<()
     Ok(())
 }
 
-/// Reçoit un fichier de groupe (entête + octets) et l'enregistre dans le dossier de réception.
-async fn recv_gfile<R: AsyncReadExt + Unpin>(
+/// Reçoit un fichier de groupe : entête → DEMANDE D'AUTORISATION (comme le 1-à-1) → octets.
+async fn recv_gfile<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     app: &AppHandle,
     settings: &Settings,
     from: &str,
+    send: &mut W,
     recv: &mut R,
 ) -> anyhow::Result<()> {
     let mut l2 = [0u8; 2];
@@ -698,6 +763,26 @@ async fn recv_gfile<R: AsyncReadExt + Unpin>(
     let mut s8 = [0u8; 8];
     recv.read_exact(&mut s8).await?;
     let size = u64::from_be_bytes(s8);
+
+    // Demander l'autorisation AVANT de recevoir (plus de téléchargement silencieux).
+    let offer_id = settings.gfile_counter.fetch_add(1, Ordering::SeqCst);
+    let (otx, orx) = tokio::sync::oneshot::channel::<bool>();
+    settings.gfile_pending.lock().unwrap_or_else(|e| e.into_inner()).insert(offer_id, otx);
+    let _ = app.emit("ghost-grecv-offer", serde_json::json!({ "id": offer_id, "name": name, "size": size, "from": from }));
+    let accepted = matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(120), orx).await,
+        Ok(Ok(true))
+    );
+    settings.gfile_pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&offer_id);
+    if !accepted {
+        let _ = send.write_all(&[0u8]).await; // refus
+        let _ = send.flush().await;
+        let _ = app.emit("ghost-grecv-rejected", serde_json::json!({ "id": offer_id, "name": name, "from": from }));
+        return Ok(());
+    }
+    send.write_all(&[1u8]).await?; // accepté
+    send.flush().await?;
+
     let dir = settings.recv_dir();
     let dest = unique_path(&dir, &name);
     let _ = app.emit("ghost-grecv-start", serde_json::json!({ "name": name, "size": size, "from": from }));
@@ -746,7 +831,7 @@ pub async fn send_gfile(net: &Net, members: Vec<String>, path: &str) -> anyhow::
 }
 
 async fn send_one_gfile(conn: &Connection, path: &str, name: &str, size: u64) -> anyhow::Result<()> {
-    let (mut send, _recv) = conn
+    let (mut send, mut recv) = conn
         .open_bi()
         .await
         .map_err(|e| anyhow::anyhow!("flux: {e}"))?;
@@ -755,6 +840,14 @@ async fn send_one_gfile(conn: &Connection, path: &str, name: &str, size: u64) ->
     send.write_all(&(nb.len() as u16).to_be_bytes()).await?;
     send.write_all(nb).await?;
     send.write_all(&size.to_be_bytes()).await?;
+    // Attendre la décision du destinataire (accepté / refusé) avant d'envoyer les octets.
+    let mut decision = [0u8; 1];
+    AsyncReadExt::read_exact(&mut recv, &mut decision)
+        .await
+        .map_err(|e| anyhow::anyhow!("le pair n'a pas répondu: {e}"))?;
+    if decision[0] != 1 {
+        anyhow::bail!("refusé par le pair");
+    }
     let mut file = tokio::fs::File::open(path).await?;
     let mut buf = vec![0u8; CHUNK];
     loop {
@@ -802,10 +895,11 @@ pub async fn start(app: AppHandle) -> anyhow::Result<Net> {
     let recv_cancel = Arc::new(AtomicBool::new(false));
     let settings = Settings::default();
     if let Some(dir) = load_download_dir() {
-        *settings.download_dir.lock().unwrap() = Some(dir);
+        *settings.download_dir.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir);
     }
     let incoming = Incoming::default();
     let mesh: Mesh = Arc::new(StdMutex::new(HashMap::new()));
+    let connecting: Connecting = Arc::new(StdMutex::new(HashSet::new()));
 
     // Identité PERMANENTE : clé persistante = code ami stable.
     let perm = build_endpoint(load_or_create_secret()).await?;
@@ -830,6 +924,7 @@ pub async fn start(app: AppHandle) -> anyhow::Result<Net> {
         settings,
         incoming,
         mesh,
+        connecting,
     })
 }
 
@@ -843,7 +938,7 @@ pub async fn probe(net: &Net, id_str: &str) -> bool {
     let addr = EndpointAddr::from(id);
     // On sonde via l'identité permanente (les amis nous connaissent par elle).
     match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(3),
         net.perm.connect(addr, PRESENCE_ALPN),
     )
     .await
@@ -871,7 +966,7 @@ pub async fn connect(net: &Net, input: &str) -> anyhow::Result<String> {
     // Auto : ami connu → identité PERMANENTE (il nous reconnaît, marche avec « amis uniquement ») ;
     // inconnu → identité ÉPHÉMÈRE (on ne révèle pas notre code permanent).
     let target = addr.id.to_string();
-    let is_friend = net.settings.friends.lock().unwrap().contains(&target);
+    let is_friend = net.settings.friends.lock().unwrap_or_else(|e| e.into_inner()).contains(&target);
     let conn = if is_friend {
         net.perm.connect(addr, ALPN).await
     } else {
@@ -879,6 +974,34 @@ pub async fn connect(net: &Net, input: &str) -> anyhow::Result<String> {
         ep.connect(addr, ALPN).await
     }
     .map_err(|e| anyhow::anyhow!("connexion: {e}"))?;
+
+    // Poignée de main applicative : on n'est « connecté » qu'une fois que le pair a
+    // ACCEPTÉ (côté récepteur, l'ack n'est envoyé qu'après le clic « Accepter »).
+    // Évite le faux « Connecté » suivi d'un « Déconnecté » quand le pair refuse.
+    {
+        let (mut s, mut r) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("ouverture du flux: {e}"))?;
+        AsyncWriteExt::write_all(&mut s, &[KIND_HELLO])
+            .await
+            .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
+        let _ = s.finish();
+        let mut ack = [0u8; 1];
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(50),
+            AsyncReadExt::read_exact(&mut r, &mut ack),
+        )
+        .await
+        {
+            Ok(Ok(_)) if ack[0] == 1 => {}
+            _ => {
+                conn.close(0u32.into(), b"no-hello");
+                return Err(anyhow::anyhow!("connexion refusée ou pair injoignable"));
+            }
+        }
+    }
+
     let peer = conn.remote_id().to_string();
     let app2 = net.app.clone();
     let slot2 = net.slot.clone();
@@ -991,6 +1114,15 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                         let _ = a.emit(ev, serde_json::json!({}));
                         return;
                     }
+                    if kind[0] == KIND_HELLO {
+                        // Poignée de main : on a accepté la connexion → on confirme à l'initiateur.
+                        let _ = AsyncWriteExt::write_all(&mut send, &[1u8]).await;
+                        let _ = send.finish();
+                        return;
+                    }
+                    if kind[0] != KIND_FILE {
+                        return; // type de flux inconnu : on ignore (compat ascendante + sécurité)
+                    }
 
                     // KIND_FILE : réception de fichier.
                     cancel.store(false, Ordering::SeqCst);
@@ -1015,13 +1147,13 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                     // Demander l'autorisation AVANT de recevoir le fichier.
                     let offer_id = settings.file_counter.fetch_add(1, Ordering::SeqCst);
                     let (otx, orx) = tokio::sync::oneshot::channel::<bool>();
-                    settings.file_pending.lock().unwrap().insert(offer_id, otx);
+                    settings.file_pending.lock().unwrap_or_else(|e| e.into_inner()).insert(offer_id, otx);
                     let _ = a.emit("ghost-recv-offer", serde_json::json!({ "id": offer_id, "name": name, "size": size }));
                     let accepted = matches!(
                         tokio::time::timeout(std::time::Duration::from_secs(120), orx).await,
                         Ok(Ok(true))
                     );
-                    settings.file_pending.lock().unwrap().remove(&offer_id);
+                    settings.file_pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&offer_id);
                     if !accepted {
                         let _ = AsyncWriteExt::write_all(&mut send, &[0u8]).await; // refus
                         let _ = send.finish();
@@ -1130,6 +1262,7 @@ pub async fn send_file(
         .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
 
     // Attendre que le pair accepte (ou refuse) le fichier avant d'envoyer les octets.
+    let _ = app.emit("ghost-send-await", serde_json::json!({ "name": name }));
     let mut decision = [0u8; 1];
     AsyncReadExt::read_exact(&mut recv, &mut decision)
         .await

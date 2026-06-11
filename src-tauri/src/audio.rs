@@ -60,16 +60,16 @@ pub struct AudioCfg {
 }
 impl AudioCfg {
     pub fn set_input(&self, name: Option<String>) {
-        *self.input.lock().unwrap() = name.filter(|s| !s.trim().is_empty());
+        *self.input.lock().unwrap_or_else(|e| e.into_inner()) = name.filter(|s| !s.trim().is_empty());
     }
     pub fn set_output(&self, name: Option<String>) {
-        *self.output.lock().unwrap() = name.filter(|s| !s.trim().is_empty());
+        *self.output.lock().unwrap_or_else(|e| e.into_inner()) = name.filter(|s| !s.trim().is_empty());
     }
     fn input_name(&self) -> Option<String> {
-        self.input.lock().unwrap().clone()
+        self.input.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
     fn output_name(&self) -> Option<String> {
-        self.output.lock().unwrap().clone()
+        self.output.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -289,12 +289,12 @@ impl Voice {
     pub fn start(&self, cfg: AudioCfg) -> anyhow::Result<()> {
         self.stop();
         let f = start_loopback(cfg)?;
-        *self.flag.lock().unwrap() = Some(f);
+        *self.flag.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
         Ok(())
     }
     /// Coupe la boucle en cours (s'il y en a une).
     pub fn stop(&self) {
-        if let Some(f) = self.flag.lock().unwrap().take() {
+        if let Some(f) = self.flag.lock().unwrap_or_else(|e| e.into_inner()).take() {
             f.store(true, Ordering::SeqCst);
         }
     }
@@ -446,7 +446,7 @@ impl Call {
         )?;
         // 2) Réception des datagrammes → Opus (48 kHz) → ré-échantillonnage vers la sortie → lecture.
         rt.spawn(receive_voice(conn, stop.clone(), out_buf, out_rate));
-        *self.flag.lock().unwrap() = Some(stop);
+        *self.flag.lock().unwrap_or_else(|e| e.into_inner()) = Some(stop);
         Ok(())
     }
     /// Active/désactive le micro (muet) pendant l'appel.
@@ -455,7 +455,7 @@ impl Call {
     }
     /// Termine l'appel en cours (s'il y en a un).
     pub fn stop(&self) {
-        if let Some(f) = self.flag.lock().unwrap().take() {
+        if let Some(f) = self.flag.lock().unwrap_or_else(|e| e.into_inner()).take() {
             f.store(true, Ordering::SeqCst);
         }
     }
@@ -630,7 +630,7 @@ impl GroupCall {
         for (peer, conn) in conns {
             rt.spawn(receive_group_voice(conn, stop.clone(), peers.clone(), peer, out_rate));
         }
-        *self.flag.lock().unwrap() = Some(stop);
+        *self.flag.lock().unwrap_or_else(|e| e.into_inner()) = Some(stop);
         Ok(())
     }
     /// Règle le volume (gain) d'un pair dans le mixage. 1.0 = normal, 0 = muet, 2.0 = ×2.
@@ -643,7 +643,7 @@ impl GroupCall {
         self.muted.store(on, Ordering::SeqCst);
     }
     pub fn stop(&self) {
-        if let Some(f) = self.flag.lock().unwrap().take() {
+        if let Some(f) = self.flag.lock().unwrap_or_else(|e| e.into_inner()).take() {
             f.store(true, Ordering::SeqCst);
         }
     }

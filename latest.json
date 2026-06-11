@@ -1,11 +1,11 @@
 {
-  "version": "0.17.1",
-  "notes": "Video : voir un partage sans partager soi-meme ; raccrocher coupe la camera.",
-  "pub_date": "2026-06-09T21:46:15.400Z",
+  "version": "0.18.0",
+  "notes": "Groupes complets : cam+ecran simultanes, retrait fiable, partage de fichiers.",
+  "pub_date": "2026-06-09T22:32:43.390Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRWRWOTkwSkJTM1VYLysyVzBtT1JXbE9TTndacC8vRlFWQTZUT01sRzV3SDZYZEVnT1VmZStrNjk1REVpdHpBVFpUQVB4Y2lhWmwrMUVURmpKR1hzcHdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxMDQwODcyCWZpbGU6Z2hvc3QtbGlua18wLjE3LjFfeDY0LXNldHVwLmV4ZQp1VkdyTWFyZlRzdGJRelVQQUJlMzFzVGo1cVdCNnQ3L1NwN1dITFJGNmpkNXRjMFJXeUswRjFoSnVxZGdXeWxvcEFxWWN5TzBla0NUcEh0QmVob0RCdz09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.17.1_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVRoZjVIbFRjNTFTOGdnMmZFeDVSb0dBSzF4bTF4UU9JWEp0UXYraUxvRFNKMi9UUmpZY2hkU282M0doK2dOR21xVThBeWZNdHhXWXQwczRjUWVrVEE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxMDQ0MzQ3CWZpbGU6Z2hvc3QtbGlua18wLjE4LjBfeDY0LXNldHVwLmV4ZQpuY1VCblFXWEdkdDl5NUxLUGJBUEg1Yk5IRVNtdE5tbXRoK2s3ZC9ibUVhall3UE85TGRtTFMyTEpiR2pXdVZKbDhPd293UGdUNkNNVStFaE0xbVhCZz09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.18.0_x64-setup.exe"
     }
   }
 }

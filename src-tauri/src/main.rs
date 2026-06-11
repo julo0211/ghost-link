@@ -240,6 +240,11 @@ fn respond_file(net: State<'_, Net>, id: u64, accept: bool) {
 }
 
 #[tauri::command]
+fn respond_gfile(net: State<'_, Net>, id: u64, accept: bool) {
+    net::respond_gfile(&net.settings, id, accept);
+}
+
+#[tauri::command]
 fn fingerprint(code: String) -> String {
     net::fingerprint(&code)
 }
@@ -262,7 +267,7 @@ async fn check_update(
         .await
         .map_err(|e| e.to_string())?;
     let version = update.as_ref().map(|u| u.version.clone());
-    *pending.0.lock().unwrap() = update;
+    *pending.0.lock().unwrap_or_else(|e| e.into_inner()) = update;
     Ok(version)
 }
 
@@ -272,7 +277,7 @@ async fn install_update(
     app: tauri::AppHandle,
     pending: State<'_, PendingUpdate>,
 ) -> Result<(), String> {
-    let update = pending.0.lock().unwrap().take();
+    let update = pending.0.lock().unwrap_or_else(|e| e.into_inner()).take();
     let update = update.ok_or_else(|| "aucune mise à jour en attente".to_string())?;
     let app2 = app.clone();
     update
@@ -330,7 +335,7 @@ fn main() {
             fingerprint, app_version, check_update, install_update, set_download_dir,
             get_download_dir, set_only_friends, set_friends, voice_test_start, voice_test_stop,
             call_start, call_stop, call_set_mute, list_audio_devices, set_audio_input,
-            set_audio_output, respond_incoming, respond_file, disconnect, cancel_send, cancel_recv
+            set_audio_output, respond_incoming, respond_file, respond_gfile, disconnect, cancel_send, cancel_recv
         ])
         .build(tauri::generate_context!())
         .expect("erreur au lancement de ghost link")
