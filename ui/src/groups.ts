@@ -230,19 +230,19 @@ function pushGroupMsg(id: string, author: string, text: string, who: string): vo
 }
 function sendGroupMsg(): void {
   if (!S.openGroupId) return;
-  const text = $("#groupChatInput").value.trim();
+  const text = $<HTMLInputElement>("#groupChatInput").value.trim();
   if (!text) return;
   const g = loadGroups().find((x) => x.id === S.openGroupId);
   if (!g) return;
   invoke("send_gchat", { members: g.members, gid: g.id, name: myName(), text }).catch((e) => log("Groupe : " + e));
   pushGroupMsg(g.id, myName() || "moi", text, "me");
-  $("#groupChatInput").value = "";
+  $<HTMLInputElement>("#groupChatInput").value = "";
 }
 
 // ----- Appel de groupe (audio) -----
 function refreshGroupCallUI(): void {
   const active = S.inGroupCall && S.groupCallId === S.openGroupId;
-  const b = $("#btnGroupCall");
+  const b = $<HTMLButtonElement>("#btnGroupCall");
   if (b) b.textContent = active ? "📵 Raccrocher" : "📞 Appel de groupe";
   const m = $("#btnGroupMute");
   if (m) m.classList.toggle("hidden", !active);
@@ -259,7 +259,7 @@ function refreshGroupCallUI(): void {
   if (g) renderGroupMembers(g);
 }
 async function startGroupCall(g: Group, announce: boolean): Promise<void> {
-  $("#btnGroupCall").disabled = true;
+  $<HTMLButtonElement>("#btnGroupCall").disabled = true;
   try {
     await invoke("group_call_start", { members: g.members, gid: g.id, announce });
     S.inGroupCall = true;
@@ -272,7 +272,7 @@ async function startGroupCall(g: Group, announce: boolean): Promise<void> {
     const s = $("#groupCallStatus");
     if (s) s.textContent = "erreur : " + e;
   } finally {
-    $("#btnGroupCall").disabled = false;
+    $<HTMLButtonElement>("#btnGroupCall").disabled = false;
   }
 }
 function stopGroupCall(): void {
@@ -492,7 +492,7 @@ function stopVideo(): void {
 
 export function initGroups(): void {
   $("#btnCreateGroup").onclick = () => {
-    const name = $("#groupName").value.trim();
+    const name = $<HTMLInputElement>("#groupName").value.trim();
     if (!name) {
       log("Donne un nom au groupe.");
       return;
@@ -511,7 +511,7 @@ export function initGroups(): void {
     const id = "g" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
     const full = [S.myCode, ...selected];
     saveGroups([...loadGroups(), { id, name, members: selected }]);
-    $("#groupName").value = "";
+    $<HTMLInputElement>("#groupName").value = "";
     renderGroups();
     const fullCsv = full.join(",");
     selected.forEach((code: string) => {
@@ -523,13 +523,13 @@ export function initGroups(): void {
   };
   $("#btnCloseGroup").onclick = closeGroup;
   $("#btnGroupSend").onclick = sendGroupMsg;
-  $("#groupChatInput").onkeydown = (e: KeyboardEvent) => {
+  $<HTMLInputElement>("#groupChatInput").onkeydown = (e: KeyboardEvent) => {
     if (e.key === "Enter") {
       e.preventDefault();
       sendGroupMsg();
     }
   };
-  $("#btnGroupCall").onclick = () => {
+  $<HTMLButtonElement>("#btnGroupCall").onclick = () => {
     const g = loadGroups().find((x) => x.id === S.openGroupId);
     if (!g) return;
     if (S.inGroupCall && S.groupCallId === g.id) {
@@ -583,7 +583,7 @@ export function initGroups(): void {
   $("#btnGroupFile").onclick = () => {
     const g = loadGroups().find((x) => x.id === S.openGroupId);
     if (!g) return;
-    const path = $("#groupFilePath").value.trim();
+    const path = $<HTMLInputElement>("#groupFilePath").value.trim();
     if (!path) {
       log("Colle le chemin d'un fichier à envoyer.");
       return;
@@ -591,7 +591,7 @@ export function initGroups(): void {
     invoke("send_gfile", { members: g.members, path })
       .then(() => {
         log("📎 Fichier envoyé au groupe.");
-        $("#groupFilePath").value = "";
+        $<HTMLInputElement>("#groupFilePath").value = "";
       })
       .catch((e) => log("Fichier groupe : " + e));
   };

@@ -1,11 +1,11 @@
 {
-  "version": "0.21.0",
-  "notes": "Frontend en TypeScript (typage des appels backend), CSP durcie, alerte fichier corrompu. Aucun changement de protocole — compatible 0.20.0.",
-  "pub_date": "2026-06-15T16:33:00.303Z",
+  "version": "0.22.0",
+  "notes": "Durcissements: cle en Local + migration, anti-spam connexions, verif espace disque. Compatible 0.21.0.",
+  "pub_date": "2026-06-15T16:59:34.799Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRWYvQlVBcVZheERCdWlCR3p6akQ0WjVHOGRBZXc0OHVtalVBR2pLQ2hYV2M1WU9GZTJFQmdaejNjeGZ4QU53TVlDOEhiNTVNeXg2a1NocTA2anJBR3dFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNTQxMTc5CWZpbGU6Z2hvc3QtbGlua18wLjIxLjBfeDY0LXNldHVwLmV4ZQp6RjBiam8zQ0Fpd3F3QmpEcS8zNS9pTHlGWjJzdHh1d3pESVlKd0drQWpGWnA5SEcxMHIzbkhqTU1NQlZORUEyS2xpV3hwTUdxYXhqajcya00vS1dCQT09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.21.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVVJM1pCK3UySStYdnRJM2hqczZZQ3lWUDdtNnN2enUveU5qY3BjODZkRDl1T0M5Y0R6ZXNWSUFyK0tVUDk1NHJ0NTJPTFpxQ2kvS2MxKzFMY2RDTXdRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNTQyNzczCWZpbGU6Z2hvc3QtbGlua18wLjIyLjBfeDY0LXNldHVwLmV4ZQo2WUNMUUpxc0dsMTJJOHRHTytvUGhjQmhGYUhIaFE2MEVsaXVjL2p0QnU1NjNSUW5POEFIVGw3dXJwZFFHNm9JVU9tR1Z5dkE0SERIaHV0NHVHbUlEdz09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.22.0_x64-setup.exe"
     }
   }
 }

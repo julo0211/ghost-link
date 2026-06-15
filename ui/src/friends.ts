@@ -139,9 +139,9 @@ function saveMutual(code: string, name?: string): void {
 
 export function initFriends(): void {
   $("#btnAddFriend").onclick = () => {
-    if (addFriend($("#friendName").value, $("#friendCode").value)) {
-      $("#friendName").value = "";
-      $("#friendCode").value = "";
+    if (addFriend($<HTMLInputElement>("#friendName").value, $<HTMLInputElement>("#friendCode").value)) {
+      $<HTMLInputElement>("#friendName").value = "";
+      $<HTMLInputElement>("#friendCode").value = "";
       log("Ami ajouté.");
     }
   };

@@ -5,7 +5,7 @@ import { $, log, fmt, etaStr, baseName } from "./dom.js";
 import { S, myName } from "./state.js";
 
 function setFile(path: string): void {
-  $("#filePath").value = path;
+  $<HTMLInputElement>("#filePath").value = path;
   $("#drop").innerHTML = '<span class="big">📄</span> ' + baseName(path);
 }
 
@@ -31,12 +31,12 @@ function addMsg(text: string, who: string, author?: string): void {
   c.scrollTop = c.scrollHeight;
 }
 async function sendChat(): Promise<void> {
-  const text = $("#chatInput").value.trim();
+  const text = $<HTMLInputElement>("#chatInput").value.trim();
   if (!text) return;
   try {
     await invoke("send_chat", { text, name: myName() });
     addMsg(text, "me");
-    $("#chatInput").value = "";
+    $<HTMLInputElement>("#chatInput").value = "";
   } catch (e) {
     log("Chat : " + e);
   }
@@ -44,8 +44,8 @@ async function sendChat(): Promise<void> {
 
 export function initTransfer(): void {
   // Envoi (avec débit + annulation)
-  $("#btnSend").onclick = async () => {
-    const path = $("#filePath").value.trim();
+  $<HTMLButtonElement>("#btnSend").onclick = async () => {
+    const path = $<HTMLInputElement>("#filePath").value.trim();
     if (!path) {
       log("Glisse un fichier (ou colle son chemin).");
       return;
@@ -59,7 +59,7 @@ export function initTransfer(): void {
     $("#sendName").textContent = baseName(path);
     $("#sendBar").style.width = "0%";
     $("#sendPct").textContent = "0%";
-    $("#btnSend").disabled = true;
+    $<HTMLButtonElement>("#btnSend").disabled = true;
     try {
       const name = await invoke("send_file", { path });
       $("#sendBar").style.width = "100%";
@@ -69,7 +69,7 @@ export function initTransfer(): void {
       $("#sendPct").textContent = "✗ " + (String(e) === "annulé" ? "annulé" : "erreur");
       log("Envoi : " + e);
     } finally {
-      $("#btnSend").disabled = false;
+      $<HTMLButtonElement>("#btnSend").disabled = false;
       $("#btnCancelSend").classList.add("hidden");
     }
   };
@@ -166,6 +166,11 @@ export function initTransfer(): void {
     $("#recvBox").classList.add("hidden");
     log("⚠️ Fichier corrompu (intégrité invalide) — rejeté : " + ((e.payload && e.payload.name) || ""));
   });
+  // SEC-2 : espace disque insuffisant → fichier refusé automatiquement.
+  listen("ghost-recv-nospace", (e) => {
+    $("#recvBox").classList.add("hidden");
+    log("⚠️ Espace disque insuffisant — fichier refusé : " + ((e.payload && e.payload.name) || ""));
+  });
 
   // Acceptation d'un fichier entrant (avant réception)
   listen("ghost-recv-offer", (e) => {
@@ -193,7 +198,7 @@ export function initTransfer(): void {
 
   // Chat
   $("#btnChat").onclick = sendChat;
-  $("#chatInput").onkeydown = (e: KeyboardEvent) => {
+  $<HTMLInputElement>("#chatInput").onkeydown = (e: KeyboardEvent) => {
     if (e.key === "Enter") {
       e.preventDefault();
       sendChat();

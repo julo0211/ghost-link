@@ -168,6 +168,11 @@ export function initTransfer() {
         $("#recvBox").classList.add("hidden");
         log("⚠️ Fichier corrompu (intégrité invalide) — rejeté : " + ((e.payload && e.payload.name) || ""));
     });
+    // SEC-2 : espace disque insuffisant → fichier refusé automatiquement.
+    listen("ghost-recv-nospace", (e) => {
+        $("#recvBox").classList.add("hidden");
+        log("⚠️ Espace disque insuffisant — fichier refusé : " + ((e.payload && e.payload.name) || ""));
+    });
     // Acceptation d'un fichier entrant (avant réception)
     listen("ghost-recv-offer", (e) => {
         const p = e.payload || {};

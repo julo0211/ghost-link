@@ -1,10 +1,10 @@
 // Petits utilitaires DOM + formatage, partagés par toute l'UI.
-// `$` reste volontairement permissif (retour souple) pour ne pas alourdir
-// l'accès au DOM ; la valeur du typage est sur la frontière Tauri (tauri.ts)
-// et sur les structures de données de l'app (main.ts).
-/** Sélecteur court. Retour souple pour un accès DOM sans friction. */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const $ = (s) => document.querySelector(s);
+/** Sélecteur court, typé. Par défaut HTMLElement ; précise le type pour les
+ *  éléments spécifiques : `$<HTMLInputElement>("#x").value`. On considère que
+ *  l'élément existe (tous les id ciblés sont dans index.html). */
+export function $(s) {
+    return document.querySelector(s);
+}
 /** Ajoute une ligne au journal de l'app. */
 export function log(m) {
     const d = document.createElement("div");

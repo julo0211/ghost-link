@@ -6,7 +6,7 @@ import { S } from "./state.js";
 
 export function setCallUI(on: boolean): void {
   S.inCall = on;
-  const b = $("#btnCall");
+  const b = $<HTMLButtonElement>("#btnCall");
   if (b) b.textContent = on ? "📵 Raccrocher" : "📞 Appeler";
   const s = $("#callStatus");
   if (s) s.textContent = on ? "🔊 En appel — parle ! (casque conseillé pour éviter l'écho)" : "";
@@ -45,8 +45,8 @@ async function loadAudioDevices(): Promise<void> {
     const r = await invoke("list_audio_devices");
     const ins = (r && r[0]) || [];
     const outs = (r && r[1]) || [];
-    fillSel($("#selMic"), ins, localStorage.getItem("ghostlink_mic") || "");
-    fillSel($("#selSpk"), outs, localStorage.getItem("ghostlink_spk") || "");
+    fillSel($<HTMLSelectElement>("#selMic"), ins, localStorage.getItem("ghostlink_mic") || "");
+    fillSel($<HTMLSelectElement>("#selSpk"), outs, localStorage.getItem("ghostlink_spk") || "");
     invoke("set_audio_input", { name: localStorage.getItem("ghostlink_mic") || null }).catch(() => {});
     invoke("set_audio_output", { name: localStorage.getItem("ghostlink_spk") || null }).catch(() => {});
   } catch {
@@ -56,14 +56,14 @@ async function loadAudioDevices(): Promise<void> {
 
 export function initCall(): void {
   // Vocal — V1 : test local du micro (boucle micro → haut-parleur)
-  $("#btnVoiceTest").onclick = async () => {
+  $<HTMLButtonElement>("#btnVoiceTest").onclick = async () => {
     if (!S.voiceTesting) {
-      $("#btnVoiceTest").disabled = true;
+      $<HTMLButtonElement>("#btnVoiceTest").disabled = true;
       $("#voiceStatus").textContent = "démarrage…";
       try {
         await invoke("voice_test_start");
         S.voiceTesting = true;
-        $("#btnVoiceTest").textContent = "⏹ Arrêter";
+        $<HTMLButtonElement>("#btnVoiceTest").textContent = "⏹ Arrêter";
         $("#voiceStatus").textContent =
           "tu devrais t'entendre (petit délai) — mets un casque pour éviter l'écho.";
         log("🎙️ Test micro démarré.");
@@ -71,7 +71,7 @@ export function initCall(): void {
         $("#voiceStatus").textContent = "erreur : " + e;
         log("Test micro : " + e);
       } finally {
-        $("#btnVoiceTest").disabled = false;
+        $<HTMLButtonElement>("#btnVoiceTest").disabled = false;
       }
     } else {
       try {
@@ -80,7 +80,7 @@ export function initCall(): void {
         /* ignore */
       }
       S.voiceTesting = false;
-      $("#btnVoiceTest").textContent = "🎙️ Tester le micro";
+      $<HTMLButtonElement>("#btnVoiceTest").textContent = "🎙️ Tester le micro";
       $("#voiceStatus").textContent = "";
       log("Test micro arrêté.");
     }
@@ -93,9 +93,9 @@ export function initCall(): void {
     $("#btnMute").textContent = S.muted ? "🎙️ Réactiver le micro" : "🔇 Couper le micro";
     $("#callStatus").textContent = S.muted ? "🔇 Micro coupé" : "🔊 En appel — parle !";
   };
-  $("#btnCall").onclick = async () => {
+  $<HTMLButtonElement>("#btnCall").onclick = async () => {
     if (!S.inCall) {
-      $("#btnCall").disabled = true;
+      $<HTMLButtonElement>("#btnCall").disabled = true;
       try {
         await invoke("call_start", { signal: true });
         setCallUI(true);
@@ -104,7 +104,7 @@ export function initCall(): void {
         log("Appel : " + e);
         $("#callStatus").textContent = "erreur : " + e;
       } finally {
-        $("#btnCall").disabled = false;
+        $<HTMLButtonElement>("#btnCall").disabled = false;
       }
     } else {
       try {
@@ -127,10 +127,10 @@ export function initCall(): void {
     }, 30000);
     log("📞 Appel entrant — accepte pour activer ton micro.");
   });
-  $("#btnCallAccept").onclick = async () => {
+  $<HTMLButtonElement>("#btnCallAccept").onclick = async () => {
     hideCallOffer();
     if (S.inCall) return;
-    $("#btnCallAccept").disabled = true;
+    $<HTMLButtonElement>("#btnCallAccept").disabled = true;
     try {
       await invoke("call_start", { signal: false });
       setCallUI(true);
@@ -138,7 +138,7 @@ export function initCall(): void {
     } catch (e) {
       log("Appel : " + e);
     } finally {
-      $("#btnCallAccept").disabled = false;
+      $<HTMLButtonElement>("#btnCallAccept").disabled = false;
     }
   };
   $("#btnCallRefuse").onclick = () => {
@@ -159,13 +159,13 @@ export function initCall(): void {
   });
 
   // Choix des périphériques audio (micro / haut-parleur)
-  $("#selMic").onchange = () => {
-    const v = $("#selMic").value;
+  $<HTMLSelectElement>("#selMic").onchange = () => {
+    const v = $<HTMLSelectElement>("#selMic").value;
     localStorage.setItem("ghostlink_mic", v);
     invoke("set_audio_input", { name: v || null }).catch(() => {});
   };
-  $("#selSpk").onchange = () => {
-    const v = $("#selSpk").value;
+  $<HTMLSelectElement>("#selSpk").onchange = () => {
+    const v = $<HTMLSelectElement>("#selSpk").value;
     localStorage.setItem("ghostlink_spk", v);
     invoke("set_audio_output", { name: v || null }).catch(() => {});
   };

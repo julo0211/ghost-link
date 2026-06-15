@@ -20,34 +20,34 @@ export async function connectTo(addr: string): Promise<void> {
     log("Entre un code ami ou une adresse.");
     return;
   }
-  $("#btnConnect").disabled = true;
+  $<HTMLButtonElement>("#btnConnect").disabled = true;
   log("Connexion… (en attente de l'acceptation du pair)");
   try {
     await invoke("connect", { addr });
   } catch (e) {
     log("Erreur connexion : " + e);
-    $("#btnConnect").disabled = false;
+    $<HTMLButtonElement>("#btnConnect").disabled = false;
   }
 }
 
 function setConnected(peer: string): void {
   S.currentPeer = peer;
   $("#connStatus").className = "conn s-ok";
-  $("#connStatus").querySelector(".conn-text").textContent = "Connecté à " + shortId(peer);
+  ($("#connStatus").querySelector(".conn-text") as HTMLElement).textContent = "Connecté à " + shortId(peer);
   $("#peerLabel").textContent = "Connecté à " + shortId(peer);
   $("#connectForm").classList.add("hidden");
   $("#sessionBox").classList.remove("hidden");
-  $("#btnConnect").disabled = false;
+  $<HTMLButtonElement>("#btnConnect").disabled = false;
   $("#chatCard").classList.remove("hidden");
   showTab("transfert");
 }
 function setDisconnected(): void {
   S.currentPeer = null;
   $("#connStatus").className = "conn s-idle";
-  $("#connStatus").querySelector(".conn-text").textContent = "Déconnecté";
+  ($("#connStatus").querySelector(".conn-text") as HTMLElement).textContent = "Déconnecté";
   $("#sessionBox").classList.add("hidden");
   $("#connectForm").classList.remove("hidden");
-  $("#btnConnect").disabled = false;
+  $<HTMLButtonElement>("#btnConnect").disabled = false;
   $("#sendBox").classList.add("hidden");
   $("#recvBox").classList.add("hidden");
   $("#freqBanner").classList.add("hidden");
@@ -58,13 +58,13 @@ function setDisconnected(): void {
   }
   $("#chatCard").classList.add("hidden");
   $("#chatLog").innerHTML = "";
-  $("#chatInput").value = "";
-  $("#filePath").value = "";
+  $<HTMLInputElement>("#chatInput").value = "";
+  $<HTMLInputElement>("#filePath").value = "";
   $("#drop").innerHTML = '<span class="big">📄</span> Glisse un fichier ici pour l\'envoyer';
 }
 
 export function initSession(): void {
-  $("#btnConnect").onclick = () => connectTo($("#peerAddr").value);
+  $<HTMLButtonElement>("#btnConnect").onclick = () => connectTo($<HTMLTextAreaElement>("#peerAddr").value);
   $("#btnDisconnect").onclick = () => invoke("disconnect");
 
   // Demande de connexion entrante (accepter / refuser)

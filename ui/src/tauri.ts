@@ -1,8 +1,7 @@
 // Frontière typée avec le backend Rust (Tauri, mode withGlobalTauri).
 // Tout passe par `invoke` (commandes) et `listen` (événements) ci-dessous :
 // les noms de commandes/événements ET la forme de leurs données sont vérifiés
-// à la compilation. Une faute de frappe = erreur de build (fini les bugs
-// silencieux du type « refreshSaveRow is not defined »).
+// à la compilation. Une faute de frappe = erreur de build.
 
 declare global {
   interface Window {
@@ -85,6 +84,7 @@ export interface Events {
   "ghost-recv-offer": { id: number; name: string; size: number };
   "ghost-recv-rejected": { name: string };
   "ghost-recv-corrupt": { name: string };
+  "ghost-recv-nospace": { name?: string; size?: number; free?: number; from?: string };
 
   "ghost-chat": { text: string; name: string };
   "ghost-freq": { name?: string; code?: string };

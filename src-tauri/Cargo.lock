@@ -1468,6 +1468,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1758,13 +1768,14 @@ dependencies = [
 
 [[package]]
 name = "ghost-link"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "audiopus",
  "bytes",
  "cpal",
  "dirs",
+ "fs2",
  "iroh",
  "serde",
  "serde_json",

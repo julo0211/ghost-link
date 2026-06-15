@@ -4,7 +4,7 @@
 
 [package]
 name = "ghost-link"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2021"
 
 [build-dependencies]
@@ -21,6 +21,7 @@ tokio = { version = "1", features = ["full"] }
 iroh = "0.98"
 dirs = "6"
 sha2 = "0.10"
+fs2 = "0.4"
 tauri-plugin-updater = "2"
 cpal = "0.15"
 audiopus = "0.2"

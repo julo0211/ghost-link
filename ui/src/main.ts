@@ -14,15 +14,15 @@ import { initGroups, renderGroups, renderGroupFriends } from "./groups.js";
 function initIdentity(): void {
   // Mon code : caché par défaut, révélé/masqué via le bouton.
   $("#btnId").onclick = async () => {
-    if ($("#myId").value) {
-      $("#myId").value = "";
+    if ($<HTMLInputElement>("#myId").value) {
+      $<HTMLInputElement>("#myId").value = "";
       $("#fpBox").classList.add("hidden");
       $("#btnId").textContent = "✨ Afficher mon code";
       return;
     }
     try {
       if (!S.myCode) S.myCode = await invoke("perm_code");
-      $("#myId").value = S.myCode;
+      $<HTMLInputElement>("#myId").value = S.myCode;
       showFp(S.myCode);
       $("#btnId").textContent = "🙈 Masquer mon code";
       log("Code ghost affiché.");
@@ -39,22 +39,22 @@ function initIdentity(): void {
     }
   };
   $("#btnCopyEph").onclick = () => {
-    const v = $("#ephId").value;
+    const v = $<HTMLInputElement>("#ephId").value;
     if (v) {
       navigator.clipboard.writeText(v);
       log("Code éphémère copié ✅");
     }
   };
-  $("#btnRotateEph").onclick = async () => {
-    $("#btnRotateEph").disabled = true;
+  $<HTMLButtonElement>("#btnRotateEph").onclick = async () => {
+    $<HTMLButtonElement>("#btnRotateEph").disabled = true;
     try {
       const c = await invoke("rotate_eph_code");
-      $("#ephId").value = c;
+      $<HTMLInputElement>("#ephId").value = c;
       log("🔄 Nouveau code éphémère — l'ancien ne marche plus.");
     } catch (e) {
       log("Rotation : " + e);
     } finally {
-      $("#btnRotateEph").disabled = false;
+      $<HTMLButtonElement>("#btnRotateEph").disabled = false;
     }
   };
 }
@@ -77,15 +77,15 @@ async function checkUpdate(silent: boolean): Promise<void> {
 }
 function initUpdates(): void {
   $("#btnCheckUpdate").onclick = () => checkUpdate(false);
-  $("#btnInstallUpdate").onclick = async () => {
-    $("#btnInstallUpdate").disabled = true;
+  $<HTMLButtonElement>("#btnInstallUpdate").onclick = async () => {
+    $<HTMLButtonElement>("#btnInstallUpdate").disabled = true;
     S.dlBytes = 0;
     $("#updateStatus").textContent = "Téléchargement…";
     try {
       await invoke("install_update");
     } catch (e) {
       $("#updateStatus").textContent = "Échec : " + e;
-      $("#btnInstallUpdate").disabled = false;
+      $<HTMLButtonElement>("#btnInstallUpdate").disabled = false;
     }
   };
   listen("update-progress", (e) => {
@@ -102,21 +102,21 @@ function initSettings(): void {
   $("#btnSettings").onclick = () => $("#settingsCard").classList.toggle("hidden");
   $("#btnCloseSettings").onclick = () => $("#settingsCard").classList.add("hidden");
   $("#btnSaveName").onclick = () => {
-    localStorage.setItem("ghostlink_name", $("#setName").value.trim());
+    localStorage.setItem("ghostlink_name", $<HTMLInputElement>("#setName").value.trim());
     log("Nom d'affichage enregistré.");
   };
   $("#btnSaveDir").onclick = async () => {
     try {
-      await invoke("set_download_dir", { path: $("#setDir").value.trim() });
+      await invoke("set_download_dir", { path: $<HTMLInputElement>("#setDir").value.trim() });
       const d = await invoke("get_download_dir");
-      $("#setDir").value = d;
+      $<HTMLInputElement>("#setDir").value = d;
       log("Dossier de réception : " + d);
     } catch (e) {
       log("Dossier : " + e);
     }
   };
-  $("#setOnlyFriends").onchange = () => {
-    const on = $("#setOnlyFriends").checked;
+  $<HTMLInputElement>("#setOnlyFriends").onchange = () => {
+    const on = $<HTMLInputElement>("#setOnlyFriends").checked;
     localStorage.setItem("ghostlink_onlyfriends", on ? "1" : "0");
     pushFriendsToBackend();
     invoke("set_only_friends", { on }).catch(() => {});
@@ -188,10 +188,10 @@ invoke("perm_code")
   .catch(() => {});
 invoke("eph_code")
   .then((code) => {
-    $("#ephId").value = code;
+    $<HTMLInputElement>("#ephId").value = code;
   })
   .catch(() => {});
-$("#setName").value = (localStorage.getItem("ghostlink_name") || "").trim();
+$<HTMLInputElement>("#setName").value = (localStorage.getItem("ghostlink_name") || "").trim();
 // Au démarrage : reconnecter le maillage des groupes enregistrés, mais ÉTALÉ dans le temps
 // (BUG-4 : éviter la tempête de connexions simultanées qui ralentissait tout au lancement).
 setTimeout(
@@ -208,12 +208,12 @@ invoke("app_version")
   .catch(() => {});
 invoke("get_download_dir")
   .then((d) => {
-    $("#setDir").value = d;
+    $<HTMLInputElement>("#setDir").value = d;
   })
   .catch(() => {});
 (function () {
   const on = localStorage.getItem("ghostlink_onlyfriends") === "1";
-  $("#setOnlyFriends").checked = on;
+  $<HTMLInputElement>("#setOnlyFriends").checked = on;
   pushFriendsToBackend();
   invoke("set_only_friends", { on }).catch(() => {});
 })();

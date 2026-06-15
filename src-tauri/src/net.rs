@@ -72,6 +72,8 @@ pub struct Settings {
     // Offres de fichiers de GROUPE en attente d'autorisation (comme le 1-à-1).
     pub gfile_pending: Arc<StdMutex<HashMap<u64, tokio::sync::oneshot::Sender<bool>>>>,
     pub gfile_counter: Arc<AtomicU64>,
+    // F5 : horodatage de la derniere demande de connexion par pair (anti-spam de la banniere).
+    pub rate: Arc<StdMutex<HashMap<String, std::time::Instant>>>,
 }
 
 impl Settings {
@@ -124,6 +126,18 @@ impl std::fmt::Debug for Ghost {
 impl ProtocolHandler for Ghost {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let peer = connection.remote_id().to_string();
+        // F5 : anti-spam — ignorer les connexions repetees d'un meme pair trop rapprochees.
+        {
+            let mut r = self.settings.rate.lock().unwrap_or_else(|e| e.into_inner());
+            let now = std::time::Instant::now();
+            if let Some(t) = r.get(&peer) {
+                if now.duration_since(*t) < std::time::Duration::from_secs(2) {
+                    connection.close(0u32.into(), b"rate-limited");
+                    return Ok(());
+                }
+            }
+            r.insert(peer.clone(), now);
+        }
         // Filtre « amis uniquement » : on refuse les pairs inconnus avant tout.
         if !self.settings.allows(&peer) {
             connection.close(0u32.into(), b"not-a-friend");
@@ -193,14 +207,41 @@ pub struct Eph {
 
 /// Emplacement du fichier d'identité (clé secrète ed25519), dans le dossier de données de l'app.
 fn identity_path() -> PathBuf {
+    let base = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir);
+    base.join("ghost-link").join("identity.key")
+}
+
+/// Ancien emplacement (Roaming) — pour migrer une identite creee avant le passage en Local.
+fn legacy_identity_path() -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
     base.join("ghost-link").join("identity.key")
+}
+
+/// Espace disque disponible (octets) pour ce dossier, si mesurable.
+fn free_space(dir: &Path) -> Option<u64> {
+    fs2::available_space(dir).ok()
 }
 
 /// Charge la clé secrète persistante, ou en crée une (et la sauvegarde) au premier lancement.
 /// C'est elle qui fixe l'identité du nœud — donc le « code ami » — de façon stable dans le temps.
 fn load_or_create_secret() -> SecretKey {
     let path = identity_path();
+    // Migration : si une cle existe a l'ancien emplacement (Roaming) mais pas dans Local, la deplacer.
+    if !path.exists() {
+        let legacy = legacy_identity_path();
+        if legacy != path && legacy.exists() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::rename(&legacy, &path).is_err() {
+                if let Ok(b) = std::fs::read(&legacy) {
+                    if std::fs::write(&path, &b).is_ok() {
+                        let _ = std::fs::remove_file(&legacy);
+                    }
+                }
+            }
+        }
+    }
     if let Ok(bytes) = std::fs::read(&path) {
         // Priorité au format chiffré (DPAPI) ; sinon ancien format clair (32 octets) → migration.
         if let Some(arr) = decrypt_key(&bytes) {
@@ -767,6 +808,16 @@ async fn recv_gfile<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     recv.read_exact(&mut s8).await?;
     let size = u64::from_be_bytes(s8);
 
+    // SEC-2 : refuser si l'espace disque libre est insuffisant (marge 64 Mo).
+    if let Some(free) = free_space(&settings.recv_dir()) {
+        if size > free.saturating_sub(64 * 1024 * 1024) {
+            let _ = send.write_all(&[0u8]).await;
+            let _ = send.flush().await;
+            let _ = app.emit("ghost-recv-nospace", serde_json::json!({ "name": name, "size": size, "from": from }));
+            return Ok(());
+        }
+    }
+
     // Demander l'autorisation AVANT de recevoir (plus de téléchargement silencieux).
     let offer_id = settings.gfile_counter.fetch_add(1, Ordering::SeqCst);
     let (otx, orx) = tokio::sync::oneshot::channel::<bool>();
@@ -1237,6 +1288,16 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                         Ok(v) => v,
                         Err(_) => return,
                     };
+
+                    // SEC-2 : refuser d'emblee si l'espace disque libre est insuffisant (marge 64 Mo).
+                    if let Some(free) = free_space(&settings.recv_dir()) {
+                        if size > free.saturating_sub(64 * 1024 * 1024) {
+                            let _ = AsyncWriteExt::write_all(&mut send, &[0u8]).await;
+                            let _ = send.finish();
+                            let _ = a.emit("ghost-recv-nospace", serde_json::json!({ "name": name, "size": size, "free": free }));
+                            return;
+                        }
+                    }
 
                     // Demander l'autorisation AVANT de recevoir.
                     let offer_id = settings.file_counter.fetch_add(1, Ordering::SeqCst);
