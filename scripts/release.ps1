@@ -38,6 +38,20 @@ Write-Host "==> Release ghost link v$Version  (depot: $Repo)" -ForegroundColor C
 $cargoVer = (Select-String -Path "src-tauri\Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
 if ($cargoVer -ne $Version) { throw "Versions incohérentes : Cargo.toml=$cargoVer, tauri.conf.json=$Version. Aligne-les avant de publier." }
 
+# --- 0) Compiler le frontend TypeScript -> ui/js ---
+Write-Host "`n[0/5] Compilation du frontend TypeScript (tsc)..." -ForegroundColor Yellow
+if (Test-Path "package.json") {
+  # On vérifie le lanceur WINDOWS (tsc.cmd), pas juste le dossier : un node_modules
+  # installé sur un autre OS n'a pas les bons shims.
+  if (-not (Test-Path "node_modules\.bin\tsc.cmd")) {
+    Write-Host "    (Ré)installation des dépendances npm (Windows)..." -ForegroundColor DarkYellow
+    npm install --no-audit --no-fund
+    if ($LASTEXITCODE -ne 0) { throw "npm install a échoué." }
+  }
+  npm run build
+  if ($LASTEXITCODE -ne 0) { throw "La compilation TypeScript (tsc) a échoué — corrige les erreurs de type avant de publier." }
+}
+
 # --- 1) Build signé ---
 Write-Host "`n[1/5] Build signé (cargo tauri build)..." -ForegroundColor Yellow
 $env:TAURI_SIGNING_PRIVATE_KEY = Get-Content $KeyPath -Raw
@@ -79,6 +93,10 @@ if ($LASTEXITCODE -eq 0) {
     --repo $Repo --title "ghost link v$Version" --notes $Notes
 }
 if ($LASTEXITCODE -ne 0) { throw "La publication de la release a échoué." }
+
+# Garantir que la release est bien "Latest" et PAS une pré-release,
+# sinon l'updater (qui lit /releases/latest/) l'ignore.
+gh release edit "v$Version" --repo $Repo --prerelease=false --latest | Out-Null
 
 Write-Host "`n✅ Publié : https://github.com/$Repo/releases/tag/v$Version" -ForegroundColor Green
 Write-Host "Les apps en 0.19.0 verront la mise à jour (rappel : le multi-flux exige 0.20.0 des DEUX côtés)." -ForegroundColor Cyan

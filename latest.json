@@ -1,11 +1,11 @@
 {
-  "version": "0.20.0",
-  "notes": "Transfert multi-flux (jusqu'a ~4x plus rapide) + verification d'integrite SHA-256",
-  "pub_date": "2026-06-11T15:42:16.060Z",
+  "version": "0.21.0",
+  "notes": "Frontend en TypeScript (typage des appels backend), CSP durcie, alerte fichier corrompu. Aucun changement de protocole — compatible 0.20.0.",
+  "pub_date": "2026-06-15T16:33:00.303Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVdkdEZVeU9GeTdBZThaUWxES3I0QTR6Nk9JSUpEak4xZ0EzclhldEF0Nm9USmZJRWczUkE4WFJBeE53enpocGhxNUt2OENyQjM2RFNjS2Q1VW9tdndrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxMTkyNTM0CWZpbGU6Z2hvc3QtbGlua18wLjIwLjBfeDY0LXNldHVwLmV4ZQpSenliRDdWZCszM1lFckMrK3pxM1R3SDNTL2JxcVYwVXRQRjBiazBneDMxdkUraHVKanNzQ1JHci8wQ1VtbEFkZ1lxUHIvdVRicHc1LzRRTHZlTFBDZz09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.20.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRWYvQlVBcVZheERCdWlCR3p6akQ0WjVHOGRBZXc0OHVtalVBR2pLQ2hYV2M1WU9GZTJFQmdaejNjeGZ4QU53TVlDOEhiNTVNeXg2a1NocTA2anJBR3dFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNTQxMTc5CWZpbGU6Z2hvc3QtbGlua18wLjIxLjBfeDY0LXNldHVwLmV4ZQp6RjBiam8zQ0Fpd3F3QmpEcS8zNS9pTHlGWjJzdHh1d3pESVlKd0drQWpGWnA5SEcxMHIzbkhqTU1NQlZORUEyS2xpV3hwTUdxYXhqajcya00vS1dCQT09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.21.0_x64-setup.exe"
     }
   }
 }
