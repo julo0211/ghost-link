@@ -122,6 +122,12 @@ function initSettings(): void {
     invoke("set_only_friends", { on }).catch(() => {});
     log(on ? "Mode « amis uniquement » activé." : "Mode « amis uniquement » désactivé.");
   };
+  // Vidéo : serveur STUN/TURN (vide = LAN uniquement, max vie privée).
+  $<HTMLInputElement>("#setIce").value = localStorage.getItem("ghostlink_ice") ?? "stun:stun.l.google.com:19302";
+  $("#btnSaveIce").onclick = () => {
+    localStorage.setItem("ghostlink_ice", $<HTMLInputElement>("#setIce").value.trim());
+    log("Serveur vidéo enregistré (appliqué au prochain appel vidéo).");
+  };
 }
 
 // ===== Onglets =====

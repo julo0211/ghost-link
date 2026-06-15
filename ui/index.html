@@ -125,6 +125,9 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
     <p class="hint" style="margin:12px 0 4px">Haut-parleur</p>
     <select id="selSpk" style="width:100%;background:var(--field);color:var(--text);border:1px solid var(--gborder);border-radius:13px;padding:10px 12px;font-size:13px"></select>
     <p class="hint" style="margin:6px 0 0">Appliqué au prochain test micro / appel.</p>
+    <p class="hint" style="margin:16px 0 4px">Vidéo — serveur STUN/TURN (vide = LAN uniquement)</p>
+    <div class="row"><input type="text" id="setIce" placeholder="stun:stun.l.google.com:19302" style="flex:1;width:auto;min-width:0;font-family:ui-monospace,monospace;font-size:12px"><button class="btn sm" id="btnSaveIce">Définir</button></div>
+    <p class="hint" style="margin:6px 0 0">⚠️ Un STUN expose ton IP aux membres. Vide = vidéo en réseau local seulement.</p>
   </div>
 
   <div class="card" data-pane="groupes">
@@ -219,7 +222,7 @@ textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 
 
   <div class="card"><h2>📜 Journal</h2><div id="log" class="log"></div></div>
 
-  <div class="foot">ghost link · noyau natif v0.22.0 · 👻</div>
+  <div class="foot">ghost link · noyau natif v0.23.0 · 👻</div>
 </div>
 
 <script type="module" src="./js/main.js"></script>

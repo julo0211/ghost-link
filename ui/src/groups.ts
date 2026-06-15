@@ -6,7 +6,7 @@ import {
   S,
   PINV,
   GDECL,
-  RTC_CFG,
+  iceConfig,
   loadGroups,
   saveGroups,
   loadFriends,
@@ -331,7 +331,7 @@ function localStreams(): MediaStream[] {
 }
 function getPc(peer: string) {
   if (S.pcs[peer]) return S.pcs[peer];
-  const pc = new RTCPeerConnection(RTC_CFG);
+  const pc = new RTCPeerConnection(iceConfig());
   const st = { pc, makingOffer: false, polite: (S.myCode || "") < peer };
   S.pcs[peer] = st;
   localStreams().forEach((s) =>
@@ -707,5 +707,9 @@ export function initGroups(): void {
   listen("ghost-grecv-rejected", (e) => {
     const p = e.payload || ({} as { name?: string });
     log("Fichier de groupe refusé : " + (p.name || ""));
+  });
+  listen("ghost-grecv-corrupt", (e) => {
+    const p = e.payload || ({} as { name?: string });
+    log("⚠️ Fichier de groupe corrompu (intégrité invalide) — rejeté : " + (p.name || ""));
   });
 }

@@ -6,7 +6,12 @@ export const FKEY = "ghostlink_friends";
 export const GKEY = "ghostlink_groups";
 export const PINV = "ghostlink_pinv"; // invitations à (ré)envoyer
 export const GDECL = "ghostlink_declined"; // ids de groupes refusés
-export const RTC_CFG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+/** Config ICE pour la vidéo. Réglage utilisateur 'ghostlink_ice' : URL STUN/TURN,
+ *  ou vide = LAN uniquement (aucun tiers contacté). Défaut = STUN Google. */
+export function iceConfig() {
+    const v = (localStorage.getItem("ghostlink_ice") ?? "stun:stun.l.google.com:19302").trim();
+    return v ? { iceServers: [{ urls: v }] } : { iceServers: [] };
+}
 // Tout l'état mutable de l'app, regroupé (les modules font S.xxx).
 export const S = {
     myCode: "",

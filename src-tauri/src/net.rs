@@ -38,7 +38,8 @@ const GKIND_CHAT: u8 = 1; // message de channel de groupe
 const GKIND_INVITE: u8 = 2; // invitation à un groupe
 const GKIND_CALL: u8 = 3; // signal de début d'appel de groupe
 const GKIND_SIGNAL: u8 = 4; // signalisation WebRTC (vidéo) pair-à-pair
-const GKIND_GFILE: u8 = 5; // fichier diffusé dans le groupe
+const GKIND_GFILE: u8 = 5; // fichier diffusé dans le groupe (flux de contrôle)
+const GKIND_GFDATA: u8 = 6; // flux de données d'un fichier de groupe (multi-flux)
 
 #[derive(Default)]
 pub struct ConnState {
@@ -540,6 +541,7 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, peer: Str
         old.close(0u32.into(), b"reconnect");
     }
     let _ = app.emit("ghost-mesh-up", &peer);
+    let inbounds: Inbounds = Arc::new(StdMutex::new(HashMap::new()));
 
     loop {
         match connection.accept_bi().await {
@@ -547,6 +549,7 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, peer: Str
                 let a = app.clone();
                 let from = peer.clone();
                 let settings = settings.clone();
+                let inbounds = inbounds.clone();
                 tokio::spawn(async move {
                     let mut kind = [0u8; 1];
                     if recv.read_exact(&mut kind).await.is_err() {
@@ -577,7 +580,47 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, peer: Str
                             let _ = a.emit("ghost-signal", serde_json::json!({ "from": from, "data": data }));
                         }
                     } else if kind[0] == GKIND_GFILE {
-                        let _ = recv_gfile(&a, &settings, &from, &mut send, &mut recv).await;
+                        let _ = recv_gfile(&a, &settings, &from, &mut send, &mut recv, &inbounds).await;
+                    } else if kind[0] == GKIND_GFDATA {
+                        // Flux de données d'un fichier de groupe : [u64 id][u64 offset][u64 len] puis octets.
+                        let hdr: anyhow::Result<(u64, u64, u64)> = async {
+                            let mut b = [0u8; 8];
+                            AsyncReadExt::read_exact(&mut recv, &mut b).await?;
+                            let id = u64::from_be_bytes(b);
+                            AsyncReadExt::read_exact(&mut recv, &mut b).await?;
+                            let offset = u64::from_be_bytes(b);
+                            AsyncReadExt::read_exact(&mut recv, &mut b).await?;
+                            let len = u64::from_be_bytes(b);
+                            anyhow::Ok((id, offset, len))
+                        }
+                        .await;
+                        let (id, offset, len) = match hdr { Ok(v) => v, Err(_) => return };
+                        let mut inb = None;
+                        for _ in 0..200 {
+                            if let Some(x) = inbounds.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
+                                inb = Some(x.clone());
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        let inb = match inb { Some(x) => x, None => return };
+                        let mut buf = vec![0u8; CHUNK];
+                        let mut pos = offset;
+                        let mut remaining = len;
+                        while remaining > 0 {
+                            if inb.cancelled.load(Ordering::SeqCst) { return; }
+                            let want = std::cmp::min(CHUNK as u64, remaining) as usize;
+                            if AsyncReadExt::read_exact(&mut recv, &mut buf[..want]).await.is_err() { return; }
+                            {
+                                use tokio::io::AsyncSeekExt;
+                                let mut f = inb.file.lock().await;
+                                if f.seek(std::io::SeekFrom::Start(pos)).await.is_err()
+                                    || AsyncWriteExt::write_all(&mut *f, &buf[..want]).await.is_err() { return; }
+                            }
+                            pos += want as u64;
+                            remaining -= want as u64;
+                            inb.received.fetch_add(want as u64, Ordering::SeqCst);
+                        }
                     }
                 });
             }
@@ -797,16 +840,24 @@ async fn recv_gfile<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     from: &str,
     send: &mut W,
     recv: &mut R,
+    inbounds: &Inbounds,
 ) -> anyhow::Result<()> {
+    // En-tête (flux de contrôle) : [u64 id][u16 nom_len][nom][u64 taille][32 hash][u8 nflux]
+    let mut b8 = [0u8; 8];
+    recv.read_exact(&mut b8).await?;
+    let id = u64::from_be_bytes(b8);
     let mut l2 = [0u8; 2];
     recv.read_exact(&mut l2).await?;
     let nlen = u16::from_be_bytes(l2) as usize;
     let mut nbuf = vec![0u8; nlen];
     recv.read_exact(&mut nbuf).await?;
     let name = sanitize(&String::from_utf8_lossy(&nbuf));
-    let mut s8 = [0u8; 8];
-    recv.read_exact(&mut s8).await?;
-    let size = u64::from_be_bytes(s8);
+    recv.read_exact(&mut b8).await?;
+    let size = u64::from_be_bytes(b8);
+    let mut hash = [0u8; 32];
+    recv.read_exact(&mut hash).await?;
+    let mut nflux = [0u8; 1];
+    recv.read_exact(&mut nflux).await?;
 
     // SEC-2 : refuser si l'espace disque libre est insuffisant (marge 64 Mo).
     if let Some(free) = free_space(&settings.recv_dir()) {
@@ -837,20 +888,47 @@ async fn recv_gfile<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     send.write_all(&[1u8]).await?; // accepté
     send.flush().await?;
 
+    // Pré-allouer le fichier + enregistrer le transfert (les flux GKIND_GFDATA le rempliront).
     let dir = settings.recv_dir();
     let dest = unique_path(&dir, &name);
-    let _ = app.emit("ghost-grecv-start", serde_json::json!({ "name": name, "size": size, "from": from }));
-    let mut file = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create(&dest).await?);
-    let mut buf = vec![0u8; CHUNK];
-    let mut got: u64 = 0;
-    while got < size {
-        let want = std::cmp::min(CHUNK as u64, size - got) as usize;
-        recv.read_exact(&mut buf[..want]).await?;
-        AsyncWriteExt::write_all(&mut file, &buf[..want]).await?;
-        got += want as u64;
+    let created = async {
+        let f = tokio::fs::File::create(&dest).await?;
+        f.set_len(size).await?;
+        anyhow::Ok(f)
     }
-    AsyncWriteExt::flush(&mut file).await?;
-    let _ = app.emit("ghost-grecv-done", serde_json::json!({ "name": name, "from": from, "path": dest.to_string_lossy() }));
+    .await;
+    let file = match created { Ok(f) => f, Err(_) => return Ok(()) };
+    let inb = Arc::new(Inbound {
+        file: tokio::sync::Mutex::new(file),
+        received: AtomicU64::new(0),
+        cancelled: AtomicBool::new(false),
+    });
+    inbounds.lock().unwrap_or_else(|e| e.into_inner()).insert(id, inb.clone());
+    let _ = app.emit("ghost-grecv-start", serde_json::json!({ "name": name, "size": size, "from": from }));
+
+    // Attendre le réassemblage complet (timeout d'inactivité 60 s).
+    let mut last_got = 0u64;
+    let mut stall = 0u64;
+    let mut done = false;
+    loop {
+        let got = inb.received.load(Ordering::SeqCst);
+        if got >= size { done = true; break; }
+        if got != last_got { last_got = got; stall = 0; } else { stall += 100; }
+        if stall >= 60_000 { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    inbounds.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    {
+        let mut f = inb.file.lock().await;
+        let _ = AsyncWriteExt::flush(&mut *f).await;
+    }
+    let ok_hash = done && sha256_file(&dest).await.map(|h| h == hash).unwrap_or(false);
+    if ok_hash {
+        let _ = app.emit("ghost-grecv-done", serde_json::json!({ "name": name, "from": from, "path": dest.to_string_lossy() }));
+    } else {
+        let _ = tokio::fs::remove_file(&dest).await;
+        let _ = app.emit("ghost-grecv-corrupt", serde_json::json!({ "name": name, "from": from }));
+    }
     Ok(())
 }
 
@@ -885,15 +963,23 @@ pub async fn send_gfile(net: &Net, members: Vec<String>, path: &str) -> anyhow::
 }
 
 async fn send_one_gfile(conn: &Connection, path: &str, name: &str, size: u64) -> anyhow::Result<()> {
+    // Flux de CONTRÔLE : entête + accord. Les octets passent par N flux GKIND_GFDATA parallèles.
+    let hash = sha256_file(Path::new(path)).await.map_err(|e| anyhow::anyhow!("hash: {e}"))?;
+    let id = FILE_SEQ.fetch_add(1, Ordering::SeqCst);
     let (mut send, mut recv) = conn
         .open_bi()
         .await
         .map_err(|e| anyhow::anyhow!("flux: {e}"))?;
-    send.write_all(&[GKIND_GFILE]).await?;
+    let mut head = Vec::with_capacity(1 + 8 + 2 + name.len() + 8 + 32 + 1);
+    head.push(GKIND_GFILE);
+    head.extend_from_slice(&id.to_be_bytes());
     let nb = name.as_bytes();
-    send.write_all(&(nb.len() as u16).to_be_bytes()).await?;
-    send.write_all(nb).await?;
-    send.write_all(&size.to_be_bytes()).await?;
+    head.extend_from_slice(&(nb.len() as u16).to_be_bytes());
+    head.extend_from_slice(nb);
+    head.extend_from_slice(&size.to_be_bytes());
+    head.extend_from_slice(&hash);
+    head.push(NSTREAMS as u8);
+    send.write_all(&head).await?;
     // Attendre la décision du destinataire (accepté / refusé) avant d'envoyer les octets.
     let mut decision = [0u8; 1];
     AsyncReadExt::read_exact(&mut recv, &mut decision)
@@ -902,14 +988,64 @@ async fn send_one_gfile(conn: &Connection, path: &str, name: &str, size: u64) ->
     if decision[0] != 1 {
         anyhow::bail!("refusé par le pair");
     }
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut buf = vec![0u8; CHUNK];
-    loop {
-        let n = AsyncReadExt::read(&mut file, &mut buf).await?;
-        if n == 0 {
+    // Découper en NSTREAMS tranches contiguës, une par flux parallèle.
+    let part = if size == 0 { 0 } else { (size + NSTREAMS - 1) / NSTREAMS };
+    let mut tasks = Vec::new();
+    for i in 0..NSTREAMS {
+        let offset = i * part;
+        if offset >= size {
             break;
         }
-        send.write_all(&buf[..n]).await?;
+        let len = std::cmp::min(part, size - offset);
+        tasks.push(tokio::spawn(send_one_gpart(conn.clone(), id, offset, len, path.to_string())));
+    }
+    let mut first_err: Option<anyhow::Error> = None;
+    for t in tasks {
+        match t.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("tâche d'envoi: {e}"));
+                }
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        let _ = send.reset(0u32.into());
+        return Err(e);
+    }
+    let _ = send.finish();
+    Ok(())
+}
+
+/// Envoie une tranche [offset, offset+len) d'un fichier de groupe sur son propre flux.
+/// En-tête : [GKIND_GFDATA][u64 id][u64 offset][u64 len] puis les octets.
+async fn send_one_gpart(conn: Connection, id: u64, offset: u64, len: u64, path: String) -> anyhow::Result<()> {
+    use tokio::io::AsyncSeekExt;
+    let (mut send, _recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("flux: {e}"))?;
+    let mut hdr = Vec::with_capacity(25);
+    hdr.push(GKIND_GFDATA);
+    hdr.extend_from_slice(&id.to_be_bytes());
+    hdr.extend_from_slice(&offset.to_be_bytes());
+    hdr.extend_from_slice(&len.to_be_bytes());
+    send.write_all(&hdr).await?;
+    let mut file = tokio::fs::File::open(&path).await?;
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let mut buf = vec![0u8; CHUNK];
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = std::cmp::min(CHUNK as u64, remaining) as usize;
+        AsyncReadExt::read_exact(&mut file, &mut buf[..want]).await?;
+        send.write_all(&buf[..want]).await?;
+        remaining -= want as u64;
     }
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
     Ok(())

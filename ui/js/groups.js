@@ -1,7 +1,7 @@
 // Groupes : channel multi-pairs (chat), appel de groupe (audio), vidéo (WebRTC), fichiers.
 import { invoke, listen } from "./tauri.js";
 import { $, log, fmt } from "./dom.js";
-import { S, PINV, GDECL, RTC_CFG, loadGroups, saveGroups, loadFriends, friendsOnly, memberName, myName, } from "./state.js";
+import { S, PINV, GDECL, iceConfig, loadGroups, saveGroups, loadFriends, friendsOnly, memberName, myName, } from "./state.js";
 // ----- Invitations en attente (BUG-1 : fiables, ré-envoyées à la reconnexion) -----
 function loadPInv() {
     try {
@@ -335,7 +335,7 @@ function localStreams() {
 function getPc(peer) {
     if (S.pcs[peer])
         return S.pcs[peer];
-    const pc = new RTCPeerConnection(RTC_CFG);
+    const pc = new RTCPeerConnection(iceConfig());
     const st = { pc, makingOffer: false, polite: (S.myCode || "") < peer };
     S.pcs[peer] = st;
     localStreams().forEach((s) => s.getTracks().forEach((t) => {
@@ -741,5 +741,9 @@ export function initGroups() {
     listen("ghost-grecv-rejected", (e) => {
         const p = e.payload || {};
         log("Fichier de groupe refusé : " + (p.name || ""));
+    });
+    listen("ghost-grecv-corrupt", (e) => {
+        const p = e.payload || {};
+        log("⚠️ Fichier de groupe corrompu (intégrité invalide) — rejeté : " + (p.name || ""));
     });
 }

@@ -108,6 +108,7 @@ export interface Events {
   "ghost-grecv-done": { name?: string };
   "ghost-grecv-offer": { id: number; name?: string; size?: number; from?: string };
   "ghost-grecv-rejected": { name?: string };
+  "ghost-grecv-corrupt": { name?: string; from?: string };
 
   "tauri://drag-enter": unknown;
   "tauri://drag-over": unknown;
