@@ -2,6 +2,7 @@
 import { invoke, listen } from "./tauri.js";
 import { $, log, fmt } from "./dom.js";
 import { S, PINV, GDECL, iceConfig, loadGroups, saveGroups, loadFriends, friendsOnly, memberName, myName, } from "./state.js";
+import { showTab } from "./session.js";
 // ----- Invitations en attente (BUG-1 : fiables, ré-envoyées à la reconnexion) -----
 function loadPInv() {
     try {
@@ -181,6 +182,7 @@ function openGroup(id, skipDial) {
     updateGroupLine(g);
     renderGroupMembers(g);
     $("#groupChannelCard").classList.remove("hidden");
+    showTab("group");
     if (!skipDial)
         invoke("open_group", { members: friendsOnly(g.members) }).catch(() => { });
     renderGroupMsgs();
@@ -192,6 +194,7 @@ function closeGroup() {
     stopVideo();
     S.openGroupId = null;
     $("#groupChannelCard").classList.add("hidden");
+    showTab("connect");
 }
 // ----- Chat de groupe -----
 function addGroupMsgDom(author, text, who) {

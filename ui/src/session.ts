@@ -7,11 +7,13 @@ import { setCallUI, hideCallOffer } from "./call.js";
 
 export function showTab(name: string): void {
   document
-    .querySelectorAll<HTMLElement>("[data-pane]")
-    .forEach((el) => el.classList.toggle("pane-hidden", el.getAttribute("data-pane") !== name));
-  document
-    .querySelectorAll<HTMLElement>(".tab")
-    .forEach((b) => b.classList.toggle("active", b.getAttribute("data-tab") === name));
+    .querySelectorAll<HTMLElement>("[data-view]")
+    .forEach((el) => el.classList.toggle("view-hidden", el.getAttribute("data-view") !== name));
+  const grp = name === "group";
+  const members = document.getElementById("membersCol");
+  if (members) members.classList.toggle("view-hidden", !grp);
+  const layout = document.getElementById("layout");
+  if (layout) layout.classList.toggle("no-members", !grp);
 }
 
 export async function connectTo(addr: string): Promise<void> {
@@ -39,10 +41,24 @@ function setConnected(peer: string): void {
   $("#sessionBox").classList.remove("hidden");
   $<HTMLButtonElement>("#btnConnect").disabled = false;
   $("#chatCard").classList.remove("hidden");
-  showTab("transfert");
+  showTab("session");
+  const convo = document.getElementById("railConvo");
+  if (convo) {
+    const fr = loadFriends().find((x) => x.code === peer);
+    const label = fr ? fr.name : shortId(peer);
+    convo.innerHTML = "";
+    const it = document.createElement("div");
+    it.style.cssText = "display:flex;align-items:center;gap:8px;padding:9px 11px;border-radius:12px;background:var(--glass2);cursor:pointer;font-size:13px;font-weight:600";
+    it.textContent = "🟢 " + label + (fr ? "" : " · TEMP");
+    it.onclick = () => showTab("session");
+    convo.appendChild(it);
+  }
 }
 function setDisconnected(): void {
   S.currentPeer = null;
+  showTab("connect");
+  const convo = document.getElementById("railConvo");
+  if (convo) convo.innerHTML = '<div class="hint" style="padding:2px 9px">Aucune session.</div>';
   $("#connStatus").className = "conn s-idle";
   ($("#connStatus").querySelector(".conn-text") as HTMLElement).textContent = "Déconnecté";
   $("#sessionBox").classList.add("hidden");

@@ -66,6 +66,7 @@ export interface Commands {
   send_signal: { args: { peer: string; data: string }; ret: void };
   send_gfile: { args: { members: string[]; path: string }; ret: void };
   respond_gfile: { args: { id: number; accept: boolean }; ret: void };
+  set_streams: { args: { n: number }; ret: void };
 }
 
 // --- Événements émis par Rust : forme du payload reçu ---

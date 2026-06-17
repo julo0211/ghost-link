@@ -105,8 +105,8 @@ function initUpdates() {
 }
 // ===== Réglages (engrenage ⚙️) =====
 function initSettings() {
-    $("#btnSettings").onclick = () => $("#settingsCard").classList.toggle("hidden");
-    $("#btnCloseSettings").onclick = () => $("#settingsCard").classList.add("hidden");
+    $("#btnSettings").onclick = () => $("#settingsWrap").classList.toggle("hidden");
+    $("#btnCloseSettings").onclick = () => $("#settingsWrap").classList.add("hidden");
     $("#btnSaveName").onclick = () => {
         localStorage.setItem("ghostlink_name", $("#setName").value.trim());
         log("Nom d'affichage enregistré.");
@@ -135,17 +135,26 @@ function initSettings() {
         localStorage.setItem("ghostlink_ice", $("#setIce").value.trim());
         log("Serveur vidéo enregistré (appliqué au prochain appel vidéo).");
     };
+    $("#setStreams").value = localStorage.getItem("ghostlink_streams") ?? "4";
+    $("#setStreams").onchange = () => {
+        const v = $("#setStreams").value;
+        localStorage.setItem("ghostlink_streams", v);
+        invoke("set_streams", { n: Number(v) }).catch(() => { });
+        log("Vitesse de transfert : " + v + " flux parallèles.");
+    };
 }
 // ===== Onglets =====
 function initTabs() {
-    document.querySelectorAll(".tab").forEach((b) => (b.onclick = () => {
-        const t = b.getAttribute("data-tab") || "";
-        showTab(t);
-        if (t === "groupes") {
+    const nc = document.getElementById("btnNewConn");
+    if (nc)
+        nc.onclick = () => showTab("connect");
+    const ng = document.getElementById("btnNewGroup");
+    if (ng)
+        ng.onclick = () => {
             renderGroupFriends();
             renderGroups();
-        }
-    }));
+            showTab("newgroup");
+        };
 }
 // ===== Thème jour / nuit =====
 function initTheme() {
@@ -186,8 +195,9 @@ initCall();
 initFriends();
 initTransfer();
 initGroups();
-showTab("transfert");
+showTab("connect");
 renderFriends();
+renderGroups();
 loadFingerprints();
 invoke("perm_code")
     .then((code) => {

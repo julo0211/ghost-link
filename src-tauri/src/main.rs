@@ -103,6 +103,11 @@ fn set_friends(state: State<'_, Net>, codes: Vec<String>) {
 }
 
 #[tauri::command]
+fn set_streams(n: u64) {
+    net::set_streams(n);
+}
+
+#[tauri::command]
 async fn voice_test_start(
     voice: State<'_, audio::Voice>,
     cfg: State<'_, audio::AudioCfg>,
@@ -335,7 +340,7 @@ fn main() {
             fingerprint, app_version, check_update, install_update, set_download_dir,
             get_download_dir, set_only_friends, set_friends, voice_test_start, voice_test_stop,
             call_start, call_stop, call_set_mute, list_audio_devices, set_audio_input,
-            set_audio_output, respond_incoming, respond_file, respond_gfile, disconnect, cancel_send, cancel_recv
+            set_audio_output, respond_incoming, respond_file, respond_gfile, disconnect, cancel_send, cancel_recv, set_streams
         ])
         .build(tauri::generate_context!())
         .expect("erreur au lancement de ghost link")

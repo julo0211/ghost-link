@@ -31,6 +31,12 @@ const KIND_HELLO: u8 = 7; // poignée de main applicative : l'initiateur n'est �
 const KIND_FDATA: u8 = 8; // flux de données d'un transfert (multi-flux parallèles)
 const NSTREAMS: u64 = 4; // nombre de flux parallèles par fichier
 static FILE_SEQ: AtomicU64 = AtomicU64::new(1); // identifiants de transfert
+static STREAMS: AtomicU64 = AtomicU64::new(NSTREAMS); // nb de flux parallèles, réglable à chaud (1..=8)
+
+/// Règle le nombre de flux parallèles par transfert (borné 1..=8).
+pub fn set_streams(n: u64) {
+    STREAMS.store(n.clamp(1, 8), Ordering::SeqCst);
+}
 
 // --- Groupes (maillage, ALPN séparé du 1-à-1) ---
 pub const GROUP_ALPN: &[u8] = b"ghost-link/group/0";
@@ -966,6 +972,7 @@ async fn send_one_gfile(conn: &Connection, path: &str, name: &str, size: u64) ->
     // Flux de CONTRÔLE : entête + accord. Les octets passent par N flux GKIND_GFDATA parallèles.
     let hash = sha256_file(Path::new(path)).await.map_err(|e| anyhow::anyhow!("hash: {e}"))?;
     let id = FILE_SEQ.fetch_add(1, Ordering::SeqCst);
+    let nstreams = STREAMS.load(Ordering::SeqCst).clamp(1, 8);
     let (mut send, mut recv) = conn
         .open_bi()
         .await
@@ -978,7 +985,7 @@ async fn send_one_gfile(conn: &Connection, path: &str, name: &str, size: u64) ->
     head.extend_from_slice(nb);
     head.extend_from_slice(&size.to_be_bytes());
     head.extend_from_slice(&hash);
-    head.push(NSTREAMS as u8);
+    head.push(nstreams as u8);
     send.write_all(&head).await?;
     // Attendre la décision du destinataire (accepté / refusé) avant d'envoyer les octets.
     let mut decision = [0u8; 1];
@@ -989,9 +996,9 @@ async fn send_one_gfile(conn: &Connection, path: &str, name: &str, size: u64) ->
         anyhow::bail!("refusé par le pair");
     }
     // Découper en NSTREAMS tranches contiguës, une par flux parallèle.
-    let part = if size == 0 { 0 } else { (size + NSTREAMS - 1) / NSTREAMS };
+    let part = if size == 0 { 0 } else { (size + nstreams - 1) / nstreams };
     let mut tasks = Vec::new();
-    for i in 0..NSTREAMS {
+    for i in 0..nstreams {
         let offset = i * part;
         if offset >= size {
             break;
@@ -1560,6 +1567,7 @@ pub async fn send_file(
         .await
         .map_err(|e| anyhow::anyhow!("lecture (hash): {e}"))?;
     let id = FILE_SEQ.fetch_add(1, Ordering::SeqCst);
+    let nstreams = STREAMS.load(Ordering::SeqCst).clamp(1, 8);
 
     // Flux de CONTRÔLE : entête + accord du pair. Les octets passent par les flux de données.
     let (mut send, mut recv) = conn
@@ -1575,7 +1583,7 @@ pub async fn send_file(
     head.extend_from_slice(nb);
     head.extend_from_slice(&size.to_be_bytes());
     head.extend_from_slice(&hash);
-    head.push(NSTREAMS as u8);
+    head.push(nstreams as u8);
     AsyncWriteExt::write_all(&mut send, &head)
         .await
         .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
@@ -1593,10 +1601,10 @@ pub async fn send_file(
     let _ = app.emit("ghost-send-progress", serde_json::json!({ "name": name, "sent": 0u64, "size": size }));
 
     // Découper le fichier en NSTREAMS tranches contiguës, une par flux parallèle.
-    let part = if size == 0 { 0 } else { (size + NSTREAMS - 1) / NSTREAMS };
+    let part = if size == 0 { 0 } else { (size + nstreams - 1) / nstreams };
     let sent = Arc::new(AtomicU64::new(0));
     let mut tasks = Vec::new();
-    for i in 0..NSTREAMS {
+    for i in 0..nstreams {
         let offset = i * part;
         if offset >= size {
             break; // fichier plus petit que NSTREAMS tranches

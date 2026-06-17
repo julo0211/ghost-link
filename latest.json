@@ -1,11 +1,11 @@
 {
-  "version": "0.23.0",
-  "notes": "Multi-flux + integrite SHA-256 pour les fichiers de groupe ; choix du serveur STUN (vie privee video).",
-  "pub_date": "2026-06-15T21:23:47.426Z",
+  "version": "0.24.0",
+  "notes": "Ameliorations et corrections.",
+  "pub_date": "2026-06-17T14:31:49.617Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRWFycHBKaEt5Z3NCVzRFYk9vQk1DUm04RXVzQks1QXZzNEVJWHhkakxlUmx1UFMvZnZhSmlFQ1dWUjRJMzVLQTRsbUpZR3ZLNnd4bXF1ZW5LZFVJNEFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNTU4NjI2CWZpbGU6Z2hvc3QtbGlua18wLjIzLjBfeDY0LXNldHVwLmV4ZQora0RQblB4QnhLREJ4WFJoejNteEpndEh1d0k2TWV3bjAzWWM4Y0tmcGZzS3VTWmFRN1VVVVZFZlhTU0V6M1dHMVZqOWxqRTdPR1B6LzA3a3FhZGFBdz09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.23.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVV2aHNlaHZlVUcyNGZOZVJDQ0RuV0kxZUgzTXgvZVFCeXBkTDRNZWRTMlROZXFTc1JjbklLbVRkWlNKZEQzR01ncWxCZ3ZISFNZUDlxR0ZDaUEvYWc4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNzA2NzA4CWZpbGU6Z2hvc3QtbGlua18wLjI0LjBfeDY0LXNldHVwLmV4ZQpCbTE3UUxnS2hyQVorT3NENEpvWjNiS3RoYmZza3JMOC9XcXliOTZQNDJKenVTMy9ESG52WEkxaTNESnQyU0U1S3FqcFAxTFJ6Snp0MVllaU9haVJCUT09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.24.0_x64-setup.exe"
     }
   }
 }

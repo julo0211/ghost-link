@@ -99,8 +99,8 @@ function initUpdates(): void {
 
 // ===== Réglages (engrenage ⚙️) =====
 function initSettings(): void {
-  $("#btnSettings").onclick = () => $("#settingsCard").classList.toggle("hidden");
-  $("#btnCloseSettings").onclick = () => $("#settingsCard").classList.add("hidden");
+  $("#btnSettings").onclick = () => $("#settingsWrap").classList.toggle("hidden");
+  $("#btnCloseSettings").onclick = () => $("#settingsWrap").classList.add("hidden");
   $("#btnSaveName").onclick = () => {
     localStorage.setItem("ghostlink_name", $<HTMLInputElement>("#setName").value.trim());
     log("Nom d'affichage enregistré.");
@@ -128,21 +128,26 @@ function initSettings(): void {
     localStorage.setItem("ghostlink_ice", $<HTMLInputElement>("#setIce").value.trim());
     log("Serveur vidéo enregistré (appliqué au prochain appel vidéo).");
   };
+  $<HTMLSelectElement>("#setStreams").value = localStorage.getItem("ghostlink_streams") ?? "4";
+  $<HTMLSelectElement>("#setStreams").onchange = () => {
+    const v = $<HTMLSelectElement>("#setStreams").value;
+    localStorage.setItem("ghostlink_streams", v);
+    invoke("set_streams", { n: Number(v) }).catch(() => {});
+    log("Vitesse de transfert : " + v + " flux parallèles.");
+  };
 }
 
 // ===== Onglets =====
 function initTabs(): void {
-  document.querySelectorAll<HTMLElement>(".tab").forEach(
-    (b) =>
-      (b.onclick = () => {
-        const t = b.getAttribute("data-tab") || "";
-        showTab(t);
-        if (t === "groupes") {
-          renderGroupFriends();
-          renderGroups();
-        }
-      }),
-  );
+  const nc = document.getElementById("btnNewConn");
+  if (nc) nc.onclick = () => showTab("connect");
+  const ng = document.getElementById("btnNewGroup");
+  if (ng)
+    ng.onclick = () => {
+      renderGroupFriends();
+      renderGroups();
+      showTab("newgroup");
+    };
 }
 
 // ===== Thème jour / nuit =====
@@ -184,8 +189,9 @@ initFriends();
 initTransfer();
 initGroups();
 
-showTab("transfert");
+showTab("connect");
 renderFriends();
+renderGroups();
 loadFingerprints();
 invoke("perm_code")
   .then((code) => {

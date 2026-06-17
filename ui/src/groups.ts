@@ -16,6 +16,7 @@ import {
   type Group,
   type PInvItem,
 } from "./state.js";
+import { showTab } from "./session.js";
 
 // ----- Invitations en attente (BUG-1 : fiables, ré-envoyées à la reconnexion) -----
 function loadPInv(): PInvItem[] {
@@ -190,6 +191,7 @@ function openGroup(id: string, skipDial?: boolean): void {
   updateGroupLine(g);
   renderGroupMembers(g);
   $("#groupChannelCard").classList.remove("hidden");
+  showTab("group");
   if (!skipDial) invoke("open_group", { members: friendsOnly(g.members) }).catch(() => {});
   renderGroupMsgs();
   refreshGroupCallUI();
@@ -199,6 +201,7 @@ function closeGroup(): void {
   stopVideo();
   S.openGroupId = null;
   $("#groupChannelCard").classList.add("hidden");
+  showTab("connect");
 }
 
 // ----- Chat de groupe -----
