@@ -74,7 +74,7 @@ export function initTransfer(): void {
     }
   };
   $("#btnCancelSend").onclick = () => {
-    invoke("cancel_send");
+    invoke("cancel_send").catch((e) => log("Annulation : " + e));
     log("Annulation de l'envoi…");
   };
   // BUG-9 : tant que le pair n'a pas accepté le fichier, la barre reste à 0 % — on l'indique.
@@ -106,7 +106,7 @@ export function initTransfer(): void {
 
   // Réception (avec débit + annulation)
   $("#btnCancelRecv").onclick = () => {
-    invoke("cancel_recv");
+    invoke("cancel_recv").catch((e) => log("Annulation : " + e));
     log("Annulation de la réception…");
   };
   listen("ghost-recv-start", (e) => {

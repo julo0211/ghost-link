@@ -74,13 +74,12 @@ function renderGroupMembers(g: Group): void {
   box.innerHTML = "";
   const callActive = S.inGroupCall && S.groupCallId === g.id;
   const chip = (code: string, label: string, online: boolean, self: boolean): HTMLElement => {
-    const c = document.createElement("span");
-    c.style.cssText =
-      "display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 9px;border-radius:11px;background:var(--field);border:1px solid var(--gborder)";
+    const c = document.createElement("div");
+    c.className = "mem";
     const d = document.createElement("span");
-    d.style.cssText =
-      "width:7px;height:7px;border-radius:50%;flex:0 0 auto;background:" + (online ? "var(--good)" : "var(--muted)");
+    d.className = online ? "dot on" : "dot";
     const t = document.createElement("span");
+    t.className = "grow";
     t.textContent = label;
     c.appendChild(d);
     c.appendChild(t);
@@ -143,32 +142,27 @@ export function renderGroups(): void {
   box.innerHTML = "";
   const gs = loadGroups();
   if (!gs.length) {
-    box.innerHTML = '<span class="hint">Aucun groupe.</span>';
+    box.innerHTML = '<div class="empty">Aucun groupe.</div>';
     return;
   }
   gs.forEach((g, i) => {
+    // Item compact façon Discord : avatar (initiale) + nom, clic = ouvrir, ✕ au survol = supprimer/quitter.
     const d = document.createElement("div");
-    d.className = "xfer";
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    const nm = document.createElement("div");
-    nm.className = "nm";
-    nm.textContent = g.name;
-    const pth = document.createElement("div");
-    pth.className = "pth";
+    d.className = "item" + (g.id === S.openGroupId ? " active" : "");
+    const av = document.createElement("span");
+    av.className = "av";
+    av.textContent = (g.name.trim()[0] || "#").toUpperCase();
     const onl = 1 + g.members.filter((c) => S.meshOnline.has(c)).length;
-    pth.textContent = g.members.length + 1 + " membres · " + onl + " en ligne";
-    meta.appendChild(nm);
-    meta.appendChild(pth);
-    const open = document.createElement("button");
-    open.className = "btn sm";
-    open.textContent = "Ouvrir";
-    open.onclick = () => openGroup(g.id);
+    const nm = document.createElement("span");
+    nm.className = "grow";
+    nm.textContent = g.name;
+    nm.title = g.members.length + 1 + " membres · " + onl + " en ligne";
     const del = document.createElement("button");
-    del.className = "btn sm ghost-btn";
+    del.className = "iconx";
     del.textContent = "✕";
     del.title = "Supprimer / quitter";
-    del.onclick = () => {
+    del.onclick = (e: MouseEvent) => {
+      e.stopPropagation();
       if (!confirm('Supprimer / quitter le groupe « ' + g.name + " » ?")) return;
       const a = loadGroups();
       a.splice(i, 1);
@@ -177,8 +171,9 @@ export function renderGroups(): void {
       renderGroups();
       if (S.openGroupId === g.id) closeGroup();
     };
-    d.appendChild(meta);
-    d.appendChild(open);
+    d.onclick = () => openGroup(g.id);
+    d.appendChild(av);
+    d.appendChild(nm);
     d.appendChild(del);
     box.appendChild(d);
   });

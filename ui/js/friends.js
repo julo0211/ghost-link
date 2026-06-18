@@ -8,12 +8,13 @@ export function renderFriends() {
     const box = $("#friendsList");
     box.innerHTML = "";
     if (!a.length) {
-        box.innerHTML = '<div class="hint" style="margin:6px 0">Aucun ami enregistré pour l\'instant.</div>';
+        box.innerHTML = '<div class="empty">Aucun ami enregistré.</div>';
         return;
     }
     a.forEach((f, i) => {
+        // Item compact façon Discord : pastille de présence + nom, clic = connexion, ✕ au survol = retirer.
         const d = document.createElement("div");
-        d.className = "xfer";
+        d.className = "item";
         const st = S.presence[f.code];
         const pcls = st ? "pdot " + st : "pdot";
         const ptitle = st === "online" ? "en ligne" : st === "checking" ? "vérification…" : "hors ligne";
@@ -22,18 +23,22 @@ export function renderFriends() {
                 pcls +
                 '" title="' +
                 ptitle +
-                '"></span><div class="meta"><div class="nm"></div><div class="pth"></div></div><button class="btn sm" data-c>🔌 Connecter</button><button class="btn sm ghost-btn" data-x title="Retirer">✕</button>';
-        const nm = d.querySelector(".nm");
+                '"></span><span class="grow"></span><button class="iconx" title="Retirer">✕</button>';
+        const nm = d.querySelector(".grow");
         nm.textContent = f.name;
+        nm.title = S.fpCache[f.code] || shortId(f.code);
         if (f.mutual) {
             const bg = document.createElement("span");
             bg.className = "badge";
-            bg.textContent = "✓ mutuel";
+            bg.textContent = "✓";
+            bg.title = "ami mutuel";
             nm.appendChild(bg);
         }
-        d.querySelector(".pth").textContent = S.fpCache[f.code] || shortId(f.code);
-        d.querySelector("[data-c]").onclick = () => connectTo(f.code);
-        d.querySelector("[data-x]").onclick = () => removeFriend(i);
+        d.onclick = () => connectTo(f.code);
+        d.querySelector("button").onclick = (e) => {
+            e.stopPropagation();
+            removeFriend(i);
+        };
         box.appendChild(d);
     });
 }

@@ -48,8 +48,15 @@ function setConnected(peer: string): void {
     const label = fr ? fr.name : shortId(peer);
     convo.innerHTML = "";
     const it = document.createElement("div");
-    it.style.cssText = "display:flex;align-items:center;gap:8px;padding:9px 11px;border-radius:12px;background:var(--glass2);cursor:pointer;font-size:13px;font-weight:600";
-    it.textContent = "🟢 " + label + (fr ? "" : " · TEMP");
+    it.className = "item active";
+    it.innerHTML = '<span class="dot on"></span><span class="grow"></span>';
+    (it.querySelector(".grow") as HTMLElement).textContent = label;
+    if (!fr) {
+      const tag = document.createElement("span");
+      tag.className = "tag tmp";
+      tag.textContent = "TEMP";
+      it.appendChild(tag);
+    }
     it.onclick = () => showTab("session");
     convo.appendChild(it);
   }
@@ -58,7 +65,7 @@ function setDisconnected(): void {
   S.currentPeer = null;
   showTab("connect");
   const convo = document.getElementById("railConvo");
-  if (convo) convo.innerHTML = '<div class="hint" style="padding:2px 9px">Aucune session.</div>';
+  if (convo) convo.innerHTML = '<div class="empty">Aucune session.</div>';
   $("#connStatus").className = "conn s-idle";
   ($("#connStatus").querySelector(".conn-text") as HTMLElement).textContent = "Déconnecté";
   $("#sessionBox").classList.add("hidden");
@@ -81,7 +88,7 @@ function setDisconnected(): void {
 
 export function initSession(): void {
   $<HTMLButtonElement>("#btnConnect").onclick = () => connectTo($<HTMLTextAreaElement>("#peerAddr").value);
-  $("#btnDisconnect").onclick = () => invoke("disconnect");
+  $("#btnDisconnect").onclick = () => invoke("disconnect").catch((e) => log("Déconnexion : " + e));
 
   // Demande de connexion entrante (accepter / refuser)
   listen("ghost-incoming", async (e) => {

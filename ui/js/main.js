@@ -162,8 +162,8 @@ function initTheme() {
     const mq = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
     const stored = () => localStorage.getItem(KEY);
     const eff = () => {
-        const s = stored();
-        return s ? s : mq && mq.matches ? "dark" : "light";
+        // Défaut = sombre (= maquettes « liquid glass »). Un choix utilisateur enregistré prime.
+        return stored() || "dark";
     };
     const apply = () => {
         const e = eff();

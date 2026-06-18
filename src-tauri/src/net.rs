@@ -610,6 +610,11 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, peer: Str
                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         }
                         let inb = match inb { Some(x) => x, None => return };
+                        // GL-1 : borne le flux contre la taille acceptée (cf. chemin 1-à-1).
+                        match offset.checked_add(len) {
+                            Some(end) if end <= inb.size => {}
+                            _ => return,
+                        }
                         let mut buf = vec![0u8; CHUNK];
                         let mut pos = offset;
                         let mut remaining = len;
@@ -908,6 +913,7 @@ async fn recv_gfile<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
         file: tokio::sync::Mutex::new(file),
         received: AtomicU64::new(0),
         cancelled: AtomicBool::new(false),
+        size,
     });
     inbounds.lock().unwrap_or_else(|e| e.into_inner()).insert(id, inb.clone());
     let _ = app.emit("ghost-grecv-start", serde_json::json!({ "name": name, "size": size, "from": from }));
@@ -1232,6 +1238,7 @@ struct Inbound {
     file: tokio::sync::Mutex<tokio::fs::File>,
     received: AtomicU64,
     cancelled: AtomicBool,
+    size: u64, // GL-1 : taille déclarée/acceptée — borne les écritures des flux de données.
 }
 type Inbounds = Arc<StdMutex<HashMap<u64, Arc<Inbound>>>>;
 
@@ -1376,6 +1383,12 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                             Some(x) => x,
                             None => return,
                         };
+                        // GL-1 : refuser tout flux dont la plage [offset, offset+len) sort de la
+                        // taille acceptée — évite l'écriture non bornée (DoS disque) et l'offset arbitraire.
+                        match offset.checked_add(len) {
+                            Some(end) if end <= inb.size => {}
+                            _ => return,
+                        }
                         let mut buf = vec![0u8; CHUNK];
                         let mut pos = offset;
                         let mut remaining = len;
@@ -1476,6 +1489,7 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                         file: tokio::sync::Mutex::new(file),
                         received: AtomicU64::new(0),
                         cancelled: AtomicBool::new(false),
+                        size,
                     });
                     inbounds.lock().unwrap_or_else(|e| e.into_inner()).insert(id, inb.clone());
                     let _ = a.emit("ghost-recv-start", serde_json::json!({ "name": name, "size": size }));
