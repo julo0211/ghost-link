@@ -53,7 +53,8 @@ body{font-family:'gg sans','Segoe UI',system-ui,-apple-system,sans-serif;backgro
 .appwrap{display:flex;flex-direction:column;height:100vh;background:var(--chat)}
 
 /* ---------- En-tête (barre mince, fond le plus sombre) ---------- */
-.bar{display:flex;align-items:center;gap:11px;padding:0 16px;height:48px;background:var(--dark);flex:0 0 auto;box-shadow:0 1px 0 rgba(0,0,0,.2);z-index:2}
+/* NB : classe .topbar (PAS .bar) — .bar est réservé aux barres de progression. */
+.topbar{display:flex;align-items:center;gap:11px;padding:0 16px;height:50px;background:var(--dark);flex:0 0 auto;box-shadow:0 1px 0 rgba(0,0,0,.2);z-index:2}
 .ghost{width:26px;height:26px;flex:0 0 auto}
 h1{font-size:17px;margin:0;font-weight:700;color:var(--head);letter-spacing:.2px}
 .tagline{display:none}
@@ -91,7 +92,7 @@ section[data-view]{flex:1 1 auto;min-height:0}
 .dot.on{background:var(--good)}
 .tag{font-size:10px;font-weight:700;border-radius:4px;padding:1px 6px;margin-left:auto;flex:0 0 auto;text-transform:uppercase}
 .tag.tmp{color:#fff;background:var(--warn)}
-.mini{border:none;background:var(--input);color:var(--text);border-radius:4px;padding:6px 9px;font-size:12px;font-weight:600;cursor:pointer;flex:0 0 auto;line-height:1;transition:.12s}
+.mini{border:none;background:var(--input);color:var(--text);border-radius:4px;padding:8px 12px;font-size:12px;font-weight:600;cursor:pointer;flex:0 0 auto;line-height:1;transition:.12s}
 .mini:hover{background:var(--active)}
 .iconx{border:none;background:transparent;color:var(--faint);cursor:pointer;font-size:13px;padding:3px 6px;border-radius:4px;flex:0 0 auto;opacity:0;transition:.13s}
 .item:hover .iconx{opacity:1}
@@ -103,7 +104,7 @@ section[data-view]{flex:1 1 auto;min-height:0}
 .pdot.offline{background:var(--faint);opacity:.55}
 .pdot.checking{background:var(--warn);animation:ppulse 1s ease-in-out infinite}
 @keyframes ppulse{0%,100%{opacity:.4}50%{opacity:1}}
-.addrow{display:flex;gap:6px;align-items:center;padding:6px 10px 2px}
+.addrow{display:flex;gap:8px;align-items:center;padding:8px 10px 2px}
 .addrow input{flex:1 1 60px;min-width:0;width:auto;font-size:13px;padding:8px 10px}
 
 /* ---------- Statut de connexion (puce discrète) ---------- */
@@ -120,9 +121,9 @@ section[data-view]{flex:1 1 auto;min-height:0}
 .chead .av{width:26px;height:26px;border-radius:8px;font-size:13px}
 .chead .nm{font-weight:700;font-size:15px;color:var(--head)}
 .chead .meta{color:var(--muted);font-size:12px}
-.actions{display:flex;gap:6px;padding:10px 16px;flex-wrap:wrap;align-items:center;flex:0 0 auto}
+.actions{display:flex;gap:9px;padding:11px 16px;flex-wrap:wrap;align-items:center;flex:0 0 auto}
 .actions.nb{padding-top:0}
-.pill{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:500;padding:7px 11px;border-radius:4px;border:none;background:var(--input);color:var(--text);cursor:pointer;font-family:inherit;transition:.12s}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:500;padding:8px 13px;border-radius:4px;border:none;background:var(--input);color:var(--text);cursor:pointer;font-family:inherit;transition:.12s}
 .pill:hover{background:var(--active)}
 .pill:disabled{opacity:.5;cursor:default}
 .pill.go{background:var(--accent);color:#fff}
@@ -184,7 +185,7 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 .chip.eph{color:#fff;background:var(--good)}
 .chip.perm{color:#fff;background:var(--accent)}
 .exp{font-size:12px;color:var(--muted);margin:0 0 10px;line-height:1.45}
-.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .fp{font-family:ui-monospace,monospace;font-size:15px;font-weight:700;letter-spacing:1px;color:var(--accent)}
 .hint{color:var(--muted);font-size:13px;margin:2px 0}
 
@@ -226,7 +227,7 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 <body>
 <div class="appwrap">
   <!-- ===== En-tête compact ===== -->
-  <div class="bar">
+  <div class="topbar">
     <svg class="ghost" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a99bff"/><stop offset="1" stop-color="#4be1e1"/></linearGradient></defs><path d="M32 6C20 6 12 15 12 27v25c0 2.6 3 4 4.8 2.1L21 50l4.4 4.4a3 3 0 0 0 4.3 0L34 50l4.4 4.4a3 3 0 0 0 4.3 0L47 50l4.2 4.1c1.8 1.9 4.8.5 4.8-2.1V27C56 15 44 6 32 6Z" fill="url(#g)"/><circle cx="25" cy="28" r="3.4" fill="#0a0a14"/><circle cx="39" cy="28" r="3.4" fill="#0a0a14"/></svg>
     <h1>ghost link</h1>
     <div class="tagline">de toi à lui, directement</div>
