@@ -1,11 +1,11 @@
 {
-  "version": "0.25.1",
-  "notes": "Plein ecran partage d'ecran + fiabilite gros transferts + habillage Discord",
-  "pub_date": "2026-06-18T19:47:12.365Z",
+  "version": "0.25.2",
+  "notes": "Correctif en-tete + espacement des boutons",
+  "pub_date": "2026-06-18T20:01:01.816Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVVyV2UrTDJERmlnc1F4Z01WMHdLOEwwdHl2NjQwR3pkZVVGTDRjV3N3MWZhR1hjWTFRNU1lQlVLMzNUWjh5UEFER3NjYXhZd1c1QW9aN2krSUVMa0FvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxODEyMDMxCWZpbGU6Z2hvc3QtbGlua18wLjI1LjFfeDY0LXNldHVwLmV4ZQoyOWRpRVE3ZFk5R2kvM3BMUkVzclFReTl4RU12L0RnK2hiUVRNVVJydmpTRk4yKzhEcEZXanJSWVdwTUI4RGozczNUZWZCcy92aW02WmxDdmI2UGRCdz09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.25.1_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVZSN0UybDRoanlZQzdkUUhwcHROc3l6UUluTDJlMkpMN2tUT3FkWXFtQmV3RWI5eitaZ25LWFBVL3ArSlluL25tUGF3MjBnb2xKSTBKeGZOSEhQVWdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxODEyODYwCWZpbGU6Z2hvc3QtbGlua18wLjI1LjJfeDY0LXNldHVwLmV4ZQoxUUF3WFJPeEtLQmpJQVZXMlRzVGEwWDliTWdLYmtsNzNpSkhJU0EyN29WUWlENldhbHI4OHhxazl0SllrUEFGdXhTSi9zQ0hpNUFodVlxUjg4UTdCQT09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.25.2_x64-setup.exe"
     }
   }
 }
