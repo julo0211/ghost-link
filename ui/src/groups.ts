@@ -290,12 +290,25 @@ function maybeHideGrid(): void {
   const g = vgrid();
   if (g && !g.children.length) g.classList.add("hidden");
 }
+// Agrandir une vignette (cam / partage d'écran) en plein écran. En plein écran,
+// le CSS bascule en object-fit:contain pour voir TOUT l'écran partagé sans rognage.
+function toggleTileFullscreen(el: HTMLElement): void {
+  if (document.fullscreenElement) {
+    document.exitFullscreen().catch(() => {});
+    if (document.fullscreenElement === el) return; // c'était cette vignette : on l'a juste refermée
+  }
+  if (document.fullscreenElement !== el && el.requestFullscreen) {
+    el.requestFullscreen().catch(() => log("Plein écran indisponible sur cette vue."));
+  }
+}
 function showTile(key: string, label: string, stream: MediaStream, self: boolean): void {
   let w = document.getElementById("vidw_" + key);
   if (!w) {
     w = document.createElement("div");
     w.id = "vidw_" + key;
-    w.style.cssText = "position:relative;border-radius:12px;overflow:hidden;background:#000";
+    w.className = "vidtile";
+    w.style.cssText = "position:relative;border-radius:12px;overflow:hidden;background:#000;cursor:pointer";
+    w.title = "Cliquer pour agrandir (plein écran)";
     const v = document.createElement("video");
     v.id = "vid_" + key;
     v.autoplay = true;
@@ -305,8 +318,20 @@ function showTile(key: string, label: string, stream: MediaStream, self: boolean
     const tag = document.createElement("div");
     tag.style.cssText = "position:absolute;bottom:4px;left:6px;font-size:11px;font-weight:700;color:#fff;text-shadow:0 1px 3px #000";
     tag.textContent = label;
+    const max = document.createElement("button");
+    max.className = "vidmax";
+    max.type = "button";
+    max.textContent = "⛶";
+    max.title = "Plein écran";
+    const wrap = w;
+    max.onclick = (e: MouseEvent) => {
+      e.stopPropagation();
+      toggleTileFullscreen(wrap);
+    };
+    w.onclick = () => toggleTileFullscreen(wrap);
     w.appendChild(v);
     w.appendChild(tag);
+    w.appendChild(max);
     vgrid().appendChild(w);
   }
   (document.getElementById("vid_" + key) as HTMLVideoElement).srcObject = stream;
@@ -361,14 +386,17 @@ function getPc(peer: string) {
     const key = peer + "_" + stream.id; // une vignette par flux (cam ET écran)
     showTile(key, memberName(peer), stream, false);
     const drop = () => dropTile(key);
+    // VID-2 : NE PAS retirer sur `onmute` — un mute survient sur une perte de paquets
+    // transitoire (puis unmute) ; retirer ferait clignoter/disparaître la vignette à tort.
     ev.track.onended = drop;
-    ev.track.onmute = drop;
     stream.onremovetrack = () => {
       if (!stream.getTracks().length) drop();
     };
   };
   pc.onconnectionstatechange = () => {
-    if (["failed", "closed", "disconnected"].includes(pc.connectionState)) dropPeerTiles(peer);
+    // VID-2 : `disconnected` est souvent transitoire (il peut repasser `connected`).
+    // On ne nettoie que sur un état réellement terminal.
+    if (["failed", "closed"].includes(pc.connectionState)) dropPeerTiles(peer);
   };
   return st;
 }
@@ -608,6 +636,12 @@ export function initGroups(): void {
     if (e.payload) {
       S.meshOnline.add(e.payload);
       flushPInv(e.payload);
+      // VID-1 : si je partage déjà ma cam/écran, pousser la vidéo vers un arrivant
+      // tardif (membre du groupe ouvert) en créant sa connexion → offre + mes pistes.
+      if ((S.localCam || S.localScreen) && !S.pcs[e.payload]) {
+        const g = loadGroups().find((x) => x.id === S.openGroupId);
+        if (g && g.members.includes(e.payload)) getPc(e.payload);
+      }
     }
     refreshGroupCounts();
   });

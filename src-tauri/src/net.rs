@@ -918,15 +918,16 @@ async fn recv_gfile<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     inbounds.lock().unwrap_or_else(|e| e.into_inner()).insert(id, inb.clone());
     let _ = app.emit("ghost-grecv-start", serde_json::json!({ "name": name, "size": size, "from": from }));
 
-    // Attendre le réassemblage complet (timeout d'inactivité 60 s).
+    // Attendre le réassemblage complet (GL-LF-1 : inactivité 5 min mesurée en temps réel,
+    // pour ne pas abandonner un gros fichier de groupe sur une pause réseau passagère).
     let mut last_got = 0u64;
-    let mut stall = 0u64;
+    let mut last_progress = std::time::Instant::now();
     let mut done = false;
     loop {
         let got = inb.received.load(Ordering::SeqCst);
         if got >= size { done = true; break; }
-        if got != last_got { last_got = got; stall = 0; } else { stall += 100; }
-        if stall >= 60_000 { break; }
+        if got != last_got { last_got = got; last_progress = std::time::Instant::now(); }
+        if last_progress.elapsed().as_secs() >= 300 { break; }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     inbounds.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
@@ -1498,7 +1499,7 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                     // Attendre le réassemblage complet (les flux KIND_FDATA remplissent `received`).
                     let mut last_emit = std::time::Instant::now();
                     let mut last_got = 0u64;
-                    let mut stall = 0u64;
+                    let mut last_progress = std::time::Instant::now();
                     let mut done = false;
                     loop {
                         if cancel.load(Ordering::SeqCst) {
@@ -1512,12 +1513,12 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                         }
                         if got != last_got {
                             last_got = got;
-                            stall = 0;
-                        } else {
-                            stall += 60;
+                            last_progress = std::time::Instant::now();
                         }
-                        if stall >= 60_000 {
-                            break; // 60 s sans progrès → abandon
+                        // GL-LF-1 : seuil large (5 min) mesuré en temps réel (Instant), pour ne pas
+                        // abandonner un gros transfert (100 Go+) sur une pause réseau passagère.
+                        if last_progress.elapsed().as_secs() >= 300 {
+                            break; // 5 min sans le moindre octet → abandon
                         }
                         if last_emit.elapsed().as_millis() >= 100 {
                             let _ = a.emit("ghost-recv-progress", serde_json::json!({ "name": name, "received": got, "size": size }));
