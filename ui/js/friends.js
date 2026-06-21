@@ -11,7 +11,7 @@ export function renderFriends() {
         box.innerHTML = '<div class="empty">Aucun ami enregistré.</div>';
         return;
     }
-    a.forEach((f, i) => {
+    a.forEach((f) => {
         // Item compact façon Discord : pastille de présence + nom, clic = connexion, ✕ au survol = retirer.
         const d = document.createElement("div");
         d.className = "item";
@@ -45,7 +45,7 @@ export function renderFriends() {
         };
         d.querySelector("button").onclick = (e) => {
             e.stopPropagation();
-            removeFriend(i);
+            removeFriend(f.code);
         };
         box.appendChild(d);
     });
@@ -68,10 +68,10 @@ function addFriend(name, code) {
     pushFriendsToBackend();
     return true;
 }
-function removeFriend(i) {
-    const a = loadFriends();
-    a.splice(i, 1);
-    saveFriends(a);
+function removeFriend(code) {
+    // Par CODE (pas par index) : un index capté au rendu peut être périmé si la liste
+    // a été re-rendue entre-temps → on supprimait le mauvais ami et la cible restait.
+    saveFriends(loadFriends().filter((f) => f.code !== code));
     renderFriends();
     pushFriendsToBackend();
 }

@@ -113,11 +113,21 @@ export function initSession() {
         $("#incomingBanner").classList.remove("hidden");
     });
     $("#btnAccept").onclick = () => {
+        // Si on est déjà connecté, accepter FERME la session en cours : on prévient au lieu
+        // de basculer en silence. Refus → on garde la connexion actuelle.
+        if (S.currentPeer && !confirm("Tu es déjà connecté à un pair.\nAccepter cette nouvelle connexion FERMERA la session actuelle.\n\nContinuer ?")) {
+            if (S.incomingId != null)
+                invoke("respond_incoming", { id: S.incomingId, accept: false }).catch(() => { });
+            $("#incomingBanner").classList.add("hidden");
+            S.incomingId = null;
+            log("Nouvelle connexion refusée — session actuelle conservée.");
+            return;
+        }
         if (S.incomingId != null)
             invoke("respond_incoming", { id: S.incomingId, accept: true }).catch(() => { });
         $("#incomingBanner").classList.add("hidden");
         S.incomingId = null;
-        log("Connexion acceptée.");
+        log(S.currentPeer ? "Session précédente fermée — nouvelle connexion acceptée." : "Connexion acceptée.");
     };
     $("#btnRefuse").onclick = () => {
         if (S.incomingId != null)

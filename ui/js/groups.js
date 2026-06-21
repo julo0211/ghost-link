@@ -78,11 +78,16 @@ function renderGroupMembers(g) {
             r.value = String(S.groupGains[code] != null ? S.groupGains[code] : 100);
             r.title = "Volume";
             r.style.cssText = "width:64px;flex:0 0 auto";
+            const pct = document.createElement("span");
+            pct.style.cssText = "font-size:11px;color:var(--muted);min-width:34px;text-align:right;flex:0 0 auto;font-variant-numeric:tabular-nums";
+            pct.textContent = r.value + "%";
             r.oninput = () => {
                 S.groupGains[code] = +r.value;
+                pct.textContent = r.value + "%";
                 invoke("group_call_volume", { peer: code, vol: +r.value / 100 }).catch(() => { });
             };
             c.appendChild(r);
+            c.appendChild(pct);
         }
         return c;
     };
@@ -176,6 +181,7 @@ function openGroup(id, skipDial) {
     $("#groupChannelName").textContent = "👪 " + g.name;
     updateGroupLine(g);
     renderGroupMembers(g);
+    renderGroups(); // BUG : déplacer le surlignage « actif » vers le groupe ouvert (sinon il reste collé au 1er).
     $("#groupChannelCard").classList.remove("hidden");
     showTab("group");
     if (!skipDial)
@@ -356,6 +362,35 @@ function sigSend(peer, payload) {
 function localStreams() {
     return [S.localCam, S.localScreen].filter(Boolean);
 }
+// BUG (1 fps) : par défaut WebRTC privilégie la RÉSOLUTION et chute à 1-5 fps sous
+// la moindre contrainte (CPU/débit). On force le MAINTIEN du framerate + un plafond
+// fps/bitrate, et contentHint=motion (fluidité plutôt que netteté). Indispensable
+// pour un partage d'écran/caméra fluide.
+function tuneVideoSender(pc, track) {
+    if (track.kind !== "video")
+        return;
+    try {
+        track.contentHint = "motion";
+    }
+    catch {
+        /* ignore */
+    }
+    const sender = pc.getSenders().find((se) => se.track === track);
+    if (!sender)
+        return;
+    try {
+        const p = sender.getParameters();
+        if (!p.encodings || !p.encodings.length)
+            p.encodings = [{}];
+        p.encodings[0].maxFramerate = 30;
+        p.encodings[0].maxBitrate = 8000000;
+        p.degradationPreference = "maintain-framerate";
+        void sender.setParameters(p).catch(() => { });
+    }
+    catch {
+        /* ignore */
+    }
+}
 function getPc(peer) {
     if (S.pcs[peer])
         return S.pcs[peer];
@@ -365,6 +400,7 @@ function getPc(peer) {
     localStreams().forEach((s) => s.getTracks().forEach((t) => {
         try {
             pc.addTrack(t, s);
+            tuneVideoSender(pc, t);
         }
         catch {
             /* ignore */
@@ -420,6 +456,7 @@ function addStreamToPcs(stream) {
         if (!st.pc.getSenders().some((se) => se.track === t)) {
             try {
                 st.pc.addTrack(t, stream);
+                tuneVideoSender(st.pc, t);
             }
             catch {
                 /* ignore */
@@ -466,7 +503,7 @@ async function startCam() {
         return;
     let s;
     try {
-        s = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        s = await navigator.mediaDevices.getUserMedia({ video: { frameRate: { ideal: 30 } }, audio: false });
     }
     catch (e) {
         log("Caméra : accès refusé ou indisponible (" + e + ")");
@@ -497,7 +534,10 @@ async function startScreen() {
     const withAudio = confirm("Partager aussi le SON de l'écran ?\n\nOK = avec le son système · Annuler = vidéo seulement");
     let s;
     try {
-        s = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: withAudio });
+        s = await navigator.mediaDevices.getDisplayMedia({
+            video: { frameRate: { ideal: 30, max: 60 } },
+            audio: withAudio,
+        });
     }
     catch (e) {
         log("Écran : accès refusé ou annulé (" + e + ")");

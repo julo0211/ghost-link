@@ -435,6 +435,12 @@ async fn build_endpoint(secret: SecretKey) -> anyhow::Result<Endpoint> {
         .stream_receive_window(iroh::endpoint::VarInt::from_u32(16 * 1024 * 1024))
         .receive_window(iroh::endpoint::VarInt::from_u32(64 * 1024 * 1024))
         .send_window(64 * 1024 * 1024)
+        // Gros transferts : un fichier de 30 Go+ est haché (SHA-256) en entier AVANT
+        // d'ouvrir le moindre flux ; sans keep-alive, la connexion reste inactive
+        // pendant ce calcul et l'idle-timeout par défaut la coupe → l'envoi échoue.
+        // Keep-alive 10 s + idle-timeout généreux (3 min) gardent la connexion vivante.
+        .keep_alive_interval(std::time::Duration::from_secs(10))
+        .max_idle_timeout(Some(std::time::Duration::from_secs(180).try_into().unwrap()))
         .build();
     Endpoint::builder(presets::N0)
         .secret_key(secret)
