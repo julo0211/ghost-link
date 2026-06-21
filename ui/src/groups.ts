@@ -439,9 +439,18 @@ function videoPrivacyOk(): boolean {
   if (ok) localStorage.setItem("ghostlink_video_ok", "1");
   return ok;
 }
+// Comme Discord : on ne partage cam/écran QUE pendant l'appel de groupe
+// (sinon le maillage des autres n'est pas prêt et personne ne voit le flux).
+function inThisCall(): boolean {
+  return S.inGroupCall && S.groupCallId === S.openGroupId;
+}
 async function startCam(): Promise<void> {
   if (!loadGroups().some((x) => x.id === S.openGroupId)) {
     log("Ouvre un groupe d'abord.");
+    return;
+  }
+  if (!inThisCall()) {
+    log("📞 Rejoins d'abord l'appel de groupe — comme sur Discord, la caméra se partage dans l'appel.");
     return;
   }
   if (!videoPrivacyOk()) return;
@@ -466,10 +475,18 @@ async function startScreen(): Promise<void> {
     log("Ouvre un groupe d'abord.");
     return;
   }
+  if (!inThisCall()) {
+    log("📞 Rejoins d'abord l'appel de groupe — comme sur Discord, l'écran se partage dans l'appel.");
+    return;
+  }
   if (!videoPrivacyOk()) return;
+  // Option « son » : capter aussi l'audio système de l'écran partagé.
+  const withAudio = confirm(
+    "Partager aussi le SON de l'écran ?\n\nOK = avec le son système · Annuler = vidéo seulement",
+  );
   let s: MediaStream;
   try {
-    s = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    s = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: withAudio });
   } catch (e) {
     log("Écran : accès refusé ou annulé (" + e + ")");
     return;

@@ -1447,9 +1447,12 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                     };
 
                     // SEC-2 : refuser d'emblee si l'espace disque libre est insuffisant (marge 64 Mo).
+                    // On répond [2] (et non [0]) pour que l'émetteur affiche la VRAIE raison
+                    // (« espace disque insuffisant ») au lieu d'un « refusé » générique. Rétro-compatible :
+                    // un ancien émetteur traite [2] comme « != 1 » = refus.
                     if let Some(free) = free_space(&settings.recv_dir()) {
                         if size > free.saturating_sub(64 * 1024 * 1024) {
-                            let _ = AsyncWriteExt::write_all(&mut send, &[0u8]).await;
+                            let _ = AsyncWriteExt::write_all(&mut send, &[2u8]).await;
                             let _ = send.finish();
                             let _ = a.emit("ghost-recv-nospace", serde_json::json!({ "name": name, "size": size, "free": free }));
                             return;
@@ -1610,7 +1613,12 @@ pub async fn send_file(
         .await
         .map_err(|e| anyhow::anyhow!("le pair n'a pas répondu: {e}"))?;
     if decision[0] != 1 {
-        return Err(anyhow::anyhow!("refusé par le pair"));
+        // [2] = SEC-2 espace disque insuffisant chez le pair ; sinon refus simple.
+        return Err(if decision[0] == 2 {
+            anyhow::anyhow!("espace disque insuffisant chez le pair pour ce fichier")
+        } else {
+            anyhow::anyhow!("refusé par le pair")
+        });
     }
 
     let _ = app.emit("ghost-send-progress", serde_json::json!({ "name": name, "sent": 0u64, "size": size }));

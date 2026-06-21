@@ -92,7 +92,7 @@ section[data-view]{flex:1 1 auto;min-height:0}
 .dot.on{background:var(--good)}
 .tag{font-size:10px;font-weight:700;border-radius:4px;padding:1px 6px;margin-left:auto;flex:0 0 auto;text-transform:uppercase}
 .tag.tmp{color:#fff;background:var(--warn)}
-.mini{border:none;background:var(--input);color:var(--text);border-radius:4px;padding:8px 12px;font-size:12px;font-weight:600;cursor:pointer;flex:0 0 auto;line-height:1;transition:.12s}
+.mini{border:none;background:var(--input);color:var(--text);border-radius:4px;padding:9px 14px;font-size:12px;font-weight:600;cursor:pointer;flex:0 0 auto;line-height:1;transition:.12s}
 .mini:hover{background:var(--active)}
 .iconx{border:none;background:transparent;color:var(--faint);cursor:pointer;font-size:13px;padding:3px 6px;border-radius:4px;flex:0 0 auto;opacity:0;transition:.13s}
 .item:hover .iconx{opacity:1}
@@ -185,7 +185,7 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 .chip.eph{color:#fff;background:var(--good)}
 .chip.perm{color:#fff;background:var(--accent)}
 .exp{font-size:12px;color:var(--muted);margin:0 0 10px;line-height:1.45}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.row{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
 .fp{font-family:ui-monospace,monospace;font-size:15px;font-weight:700;letter-spacing:1px;color:var(--accent)}
 .hint{color:var(--muted);font-size:13px;margin:2px 0}
 
@@ -203,11 +203,14 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 .log div{padding:3px 0;color:var(--muted)}
 
 /* ---------- Vignettes vidéo (cam / écran) + plein écran ---------- */
+/* Vignettes plafonnées : un flux ne doit jamais « manger » le chat. Vue large = ⛶ plein écran. */
+.vidtile{max-width:240px}
+.vidtile video{max-height:180px}
 .vidmax{position:absolute;top:5px;right:5px;border:none;background:rgba(0,0,0,.5);color:#fff;border-radius:6px;width:26px;height:26px;font-size:13px;cursor:pointer;display:grid;place-items:center;opacity:0;transition:.12s;line-height:1}
 .vidtile:hover .vidmax{opacity:1}
 .vidmax:hover{background:rgba(0,0,0,.8)}
-.vidtile:fullscreen{display:flex;align-items:center;justify-content:center;background:#000;border-radius:0;cursor:default}
-.vidtile:fullscreen video{width:100%!important;height:100%!important;aspect-ratio:auto!important;object-fit:contain!important}
+.vidtile:fullscreen{display:flex;align-items:center;justify-content:center;background:#000;border-radius:0;cursor:default;max-width:none}
+.vidtile:fullscreen video{width:100%!important;height:100%!important;max-height:none!important;aspect-ratio:auto!important;object-fit:contain!important}
 .vidtile:fullscreen .vidmax{opacity:1}
 
 /* ---------- Utilitaires d'état (toggle par le JS — NE PAS renommer) ---------- */
@@ -375,7 +378,7 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
             <input type="text" id="groupFilePath" class="mono" placeholder="…chemin d'un fichier pour le groupe" style="flex:1 1 200px;width:auto;min-width:0;font-size:12px">
             <button class="pill go" id="btnGroupFile">📎 Envoyer</button>
           </div>
-          <div id="groupVideos" class="hidden" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;padding:10px 14px"></div>
+          <div id="groupVideos" class="hidden" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;padding:10px 14px;max-height:46vh;overflow:auto;flex:0 0 auto"></div>
           <div class="chat" id="groupChatLog"></div>
           <div class="composer"><input type="text" id="groupChatInput" placeholder="Message au groupe…"><button class="send" id="btnGroupSend">Envoyer</button></div>
         </div>

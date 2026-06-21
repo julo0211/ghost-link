@@ -3,7 +3,7 @@
 import { invoke, listen } from "./tauri.js";
 import { $, log, shortId } from "./dom.js";
 import { S, loadFriends, saveFriends, pushFriendsToBackend, myName } from "./state.js";
-import { connectTo } from "./session.js";
+import { showTab } from "./session.js";
 
 export function renderFriends(): void {
   const a = loadFriends();
@@ -36,7 +36,15 @@ export function renderFriends(): void {
       bg.title = "ami mutuel";
       nm.appendChild(bg);
     }
-    d.onclick = () => connectTo(f.code);
+    // Clic = ouvrir l'écran de connexion AVEC le code pré-rempli (pas de connexion
+    // instantanée) : l'utilisateur lance ensuite la connexion explicitement.
+    d.onclick = () => {
+      showTab("connect");
+      const inp = $<HTMLInputElement>("#peerAddr");
+      inp.value = f.code;
+      inp.focus();
+      log("Prêt à te connecter à « " + f.name + " » — clique sur « 🔌 Se connecter ».");
+    };
     (d.querySelector("button") as HTMLElement).onclick = (e: MouseEvent) => {
       e.stopPropagation();
       removeFriend(i);
