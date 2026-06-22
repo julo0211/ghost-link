@@ -516,15 +516,25 @@ async function startScreen(): Promise<void> {
   const withAudio = confirm(
     "Partager aussi le SON de l'écran ?\n\nOK = avec le son système · Annuler = vidéo seulement",
   );
+  const vconf = { frameRate: { ideal: 30, max: 60 } };
   let s: MediaStream;
   try {
-    s = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: { ideal: 30, max: 60 } },
-      audio: withAudio,
-    });
+    s = await navigator.mediaDevices.getDisplayMedia({ video: vconf, audio: withAudio });
   } catch (e) {
-    log("Écran : accès refusé ou annulé (" + e + ")");
-    return;
+    // Le son d'écran n'est pas capturable partout (OS / type de source). Plutôt que
+    // d'ANNULER tout le partage, on réessaie en vidéo seule.
+    if (withAudio) {
+      log("Partage d'écran : le son n'est pas disponible ici — partage de la vidéo seule.");
+      try {
+        s = await navigator.mediaDevices.getDisplayMedia({ video: vconf, audio: false });
+      } catch (e2) {
+        log("Écran : accès refusé ou annulé (" + e2 + ")");
+        return;
+      }
+    } else {
+      log("Écran : accès refusé ou annulé (" + e + ")");
+      return;
+    }
   }
   S.localScreen = s;
   showTile("moi_screen", "Moi (écran)", s, true);
