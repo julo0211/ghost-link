@@ -213,11 +213,16 @@ $("#setName").value = (localStorage.getItem("ghostlink_name") || "").trim();
 // Au démarrage : reconnecter le maillage des groupes enregistrés, mais ÉTALÉ dans le temps
 // (BUG-4 : éviter la tempête de connexions simultanées qui ralentissait tout au lancement).
 setTimeout(() => loadGroups().forEach((g, i) => setTimeout(() => invoke("open_group", { members: friendsOnly(g.members) }).catch(() => { }), i * 500)), 800);
+// Tampon de build du FRONTEND. Si « UI » diverge de la version Rust (app_version),
+// c'est que la WebView sert un ancien frontend en cache (et non le code compilé).
+const UI_BUILD = "0.25.6";
 invoke("app_version")
     .then((v) => {
-    $("#appVer").textContent = v;
+    $("#appVer").textContent = v + " · UI " + UI_BUILD;
 })
-    .catch(() => { });
+    .catch(() => {
+    $("#appVer").textContent = "? · UI " + UI_BUILD;
+});
 invoke("get_download_dir")
     .then((d) => {
     $("#setDir").value = d;

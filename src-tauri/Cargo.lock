@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-link"
-version = "0.25.5"
+version = "0.25.6"
 dependencies = [
  "anyhow",
  "audiopus",
