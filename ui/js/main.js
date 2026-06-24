@@ -142,6 +142,16 @@ function initSettings() {
         invoke("set_streams", { n: Number(v) }).catch(() => { });
         log("Vitesse de transfert : " + v + " flux parallèles.");
     };
+    // Thème visuel (data-skin) : 4 identités, défaut « spectral ». Appliqué sur <html>
+    // dès le chargement par un script inline (anti-flash) ; ici on synchronise le select.
+    const skinSel = $("#setSkin");
+    skinSel.value = localStorage.getItem("ghostlink_skin") ?? "spectral";
+    skinSel.onchange = () => {
+        const v = skinSel.value;
+        localStorage.setItem("ghostlink_skin", v);
+        document.documentElement.setAttribute("data-skin", v);
+        log("Thème visuel : " + v + ".");
+    };
 }
 // ===== Onglets =====
 function initTabs() {
