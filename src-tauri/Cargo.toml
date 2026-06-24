@@ -4,7 +4,7 @@
 
 [package]
 name = "ghost-link"
-version = "0.25.6"
+version = "0.26.0"
 edition = "2021"
 
 [build-dependencies]
