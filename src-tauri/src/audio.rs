@@ -4,7 +4,7 @@
 // pour que l'appel fonctionne quelle que soit la carte son (ex. micro en 44,1 kHz).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -14,6 +14,22 @@ use iroh::endpoint::Connection;
 /// Opus fonctionne à 48 kHz mono, trame de 20 ms = 960 échantillons.
 const OPUS_FRAME: usize = 960;
 const VOICE_TAG: u8 = 1; // premier octet d'un datagramme = type « voix »
+const SCREEN_TAG: u8 = 2; // premier octet d'un datagramme = « son d'écran » (loopback système)
+
+// Anti-écho du partage d'écran : la sortie de l'appel de groupe publie ici le niveau
+// crête (bits f32) du dernier bloc qu'elle a joué. Le loopback système capte AUSSI ces
+// voix distantes — sans précaution, chaque pair réentendrait sa propre voix. On ATTÉNUE
+// donc la capture quand ce niveau dépasse un seuil (duck) ; ce n'est pas une annulation.
+static GROUP_PLAY_LEVEL: AtomicU32 = AtomicU32::new(0);
+const DUCK_THRESHOLD: f32 = 0.02; // ≈ -34 dBFS : en dessous, la sortie est jugée silencieuse
+const DUCK_GAIN: f32 = 0.15; // ≈ -16 dB appliqués au loopback pendant que la voix joue
+const DUCK_HOLD_FRAMES: u32 = 8; // maintien de l'atténuation 8 × 20 ms après la dernière voix
+
+/// Clé du tampon de mixage pour le SON D'ÉCRAN d'un pair — distincte de sa voix pour
+/// que chaque flux garde SON décodeur Opus (les codes de pair ne contiennent pas `#`).
+fn screen_mix_key(peer: &str) -> String {
+    format!("{peer}#écran")
+}
 
 // ---- Conversions de format d'échantillon ----
 fn f32_in(s: f32) -> f32 { s }
@@ -276,6 +292,16 @@ fn new_encoder() -> anyhow::Result<audiopus::coder::Encoder> {
 fn new_decoder() -> anyhow::Result<audiopus::coder::Decoder> {
     audiopus::coder::Decoder::new(audiopus::SampleRate::Hz48000, audiopus::Channels::Mono)
         .map_err(|e| anyhow::anyhow!("init décodeur Opus: {e:?}"))
+}
+
+/// Encodeur pour le SON D'ÉCRAN : profil « Audio » (musique/vidéo), pas « Voip ».
+fn new_screen_encoder() -> anyhow::Result<audiopus::coder::Encoder> {
+    audiopus::coder::Encoder::new(
+        audiopus::SampleRate::Hz48000,
+        audiopus::Channels::Mono,
+        audiopus::Application::Audio,
+    )
+    .map_err(|e| anyhow::anyhow!("init encodeur Opus (écran): {e:?}"))
 }
 
 /// État partagé du test vocal : contient le drapeau d'arrêt de la boucle en cours (s'il y en a une).
@@ -634,9 +660,11 @@ impl GroupCall {
         Ok(())
     }
     /// Règle le volume (gain) d'un pair dans le mixage. 1.0 = normal, 0 = muet, 2.0 = ×2.
+    /// S'applique à sa voix ET à son son d'écran (deux tampons distincts).
     pub fn set_gain(&self, code: &str, gain: f32) {
         if let Ok(mut p) = self.peers.lock() {
             p.entry(code.to_string()).or_insert((1.0, VecDeque::new())).0 = gain;
+            p.entry(screen_mix_key(code)).or_insert((1.0, VecDeque::new())).0 = gain;
         }
     }
     pub fn set_mute(&self, on: bool) {
@@ -646,6 +674,9 @@ impl GroupCall {
         if let Some(f) = self.flag.lock().unwrap_or_else(|e| e.into_inner()).take() {
             f.store(true, Ordering::SeqCst);
         }
+        // La sortie de groupe ne publie plus rien : repartir de « silence » pour que
+        // le loopback d'écran (s'il continue) n'atténue pas sur une valeur périmée.
+        GROUP_PLAY_LEVEL.store(0, Ordering::Relaxed);
     }
 }
 
@@ -663,16 +694,23 @@ fn build_group_output(
                 config,
                 move |data: &mut [$t], _: &cpal::OutputCallbackInfo| {
                     if let Ok(mut m) = peers.lock() {
+                        let mut peak = 0.0f32;
                         for chunk in data.chunks_mut(ch) {
                             let mut s = 0.0f32;
                             for (gain, buf) in m.values_mut() {
                                 s += *gain * buf.pop_front().unwrap_or(0.0);
                             }
-                            let v = $conv(s.clamp(-1.0, 1.0));
+                            let s = s.clamp(-1.0, 1.0);
+                            if s.abs() > peak {
+                                peak = s.abs();
+                            }
+                            let v = $conv(s);
                             for x in chunk.iter_mut() {
                                 *x = v;
                             }
                         }
+                        // Publie le niveau joué : anti-écho du partage d'écran (loopback).
+                        GROUP_PLAY_LEVEL.store(peak.to_bits(), Ordering::Relaxed);
                     } else {
                         let z = $conv(0.0);
                         for x in data.iter_mut() {
@@ -805,7 +843,10 @@ fn start_group_capture_mix(
     }
 }
 
-/// Reçoit les datagrammes voix d'UN pair, décode, ré-échantillonne, remplit son tampon de mixage.
+/// Reçoit les datagrammes voix ET son d'écran d'UN pair, décode, ré-échantillonne,
+/// remplit son tampon de mixage. Deux flux Opus indépendants arrivent sur la même
+/// connexion (micro = VOICE_TAG, écran = SCREEN_TAG) : chacun a SON décodeur — les
+/// mélanger dans un seul corromprait l'état interne d'Opus.
 async fn receive_group_voice(
     conn: Connection,
     stop: Arc<AtomicBool>,
@@ -813,10 +854,15 @@ async fn receive_group_voice(
     peer: String,
     out_rate: u32,
 ) {
-    let mut decoder = match new_decoder() {
+    let mut voice_dec = match new_decoder() {
         Ok(d) => d,
         Err(_) => return,
     };
+    let mut screen_dec = match new_decoder() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let skey = screen_mix_key(&peer);
     let out_frame = (out_rate as usize) / 50;
     let out_cap = out_frame * 50;
     let mut decoded = vec![0f32; OPUS_FRAME];
@@ -825,11 +871,13 @@ async fn receive_group_voice(
             res = conn.read_datagram() => {
                 match res {
                     Ok(dg) => {
-                        if dg.len() > 1 && dg[0] == VOICE_TAG {
-                            if let Ok(samples) = decoder.decode_float(Some(&dg[1..]), &mut decoded[..], false) {
+                        if dg.len() > 1 && (dg[0] == VOICE_TAG || dg[0] == SCREEN_TAG) {
+                            let dec = if dg[0] == SCREEN_TAG { &mut screen_dec } else { &mut voice_dec };
+                            if let Ok(samples) = dec.decode_float(Some(&dg[1..]), &mut decoded[..], false) {
                                 let play = resample_block(&decoded[..samples], out_frame);
+                                let key = if dg[0] == SCREEN_TAG { &skey } else { &peer };
                                 if let Ok(mut m) = peers.lock() {
-                                    let e = m.entry(peer.clone()).or_insert((1.0, VecDeque::new()));
+                                    let e = m.entry(key.clone()).or_insert((1.0, VecDeque::new()));
                                     for &s in play.iter() {
                                         e.1.push_back(s);
                                     }
@@ -848,5 +896,6 @@ async fn receive_group_voice(
     }
     if let Ok(mut m) = peers.lock() {
         m.remove(&peer);
+        m.remove(&skey);
     }
 }

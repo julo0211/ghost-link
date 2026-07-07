@@ -1,11 +1,11 @@
 {
-  "version": "0.26.0",
-  "notes": "4 themes visuels",
-  "pub_date": "2026-06-24T16:40:59.159Z",
+  "version": "0.26.1",
+  "notes": "stream 30fps + son d'écran + boutons son",
+  "pub_date": "2026-07-07T21:17:34.806Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVdGRVFXQnQ3emRZZmxjN2pIRXNBMGVtYzNnaTBBVUViZzRtcVg2cFpYanE1MlBKcC8vcFFOQ0JFREpLZEVESFBSa2Z4b2RCMGtKUGZEU09jRTZ6a0FNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyMzE5MTY4CWZpbGU6Z2hvc3QtbGlua18wLjI2LjBfeDY0LXNldHVwLmV4ZQpzbHB6U29pTTRzc0hFNTVMWFdjT2RFeWt6UTA3VHN6WFFMV0I2bTdJaXhUcnF1RmJIc3NUczNTaWI4WUdnZlNrMWRYTXBqdW1icVAxQTZOOGlETk5EUT09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.26.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRWROa2VXM3BySkYzVUYwRzlqcWJsRHpQUVVyajJTOVFOYzJXZzBITUtVZFcyTzBmVFJNck05NkZ6S1hPL3RQOWsrTWxUR2l3dXFacG5pWUlEZys4SFFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNDU5MDUzCWZpbGU6Z2hvc3QtbGlua18wLjI2LjFfeDY0LXNldHVwLmV4ZQp3aCtsdDNObDhVMHJKTExCOVQ1VVJSTzVvZGx6cHUyY24xSmJDbG5rbFZFOGpRKzFiSko0cHZ5Njd5OWtqOGdLaE1takkwMHJONkJ2Ty9LTWRNUFlDdz09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.26.1_x64-setup.exe"
     }
   }
 }
