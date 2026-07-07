@@ -237,9 +237,13 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 .vidmax{position:absolute;top:5px;right:5px;border:none;background:rgba(0,0,0,.5);color:#fff;border-radius:6px;width:26px;height:26px;font-size:13px;cursor:pointer;display:grid;place-items:center;opacity:0;transition:.12s;line-height:1}
 .vidtile:hover .vidmax{opacity:1}
 .vidmax:hover{background:rgba(0,0,0,.8)}
+/* Bouton son d'un flux reçu (créé par groups.ts) — même style que .vidmax, décalé à gauche. */
+.vidsnd{position:absolute;top:5px;right:36px;border:none;background:rgba(0,0,0,.5);color:#fff;border-radius:6px;width:26px;height:26px;font-size:13px;cursor:pointer;display:grid;place-items:center;opacity:0;transition:.12s;line-height:1}
+.vidtile:hover .vidsnd{opacity:1}
+.vidsnd:hover{background:rgba(0,0,0,.8)}
 .vidtile:fullscreen{display:flex;align-items:center;justify-content:center;background:#000;border-radius:0;cursor:default;max-width:none}
 .vidtile:fullscreen video{width:100%!important;height:100%!important;max-height:none!important;aspect-ratio:auto!important;object-fit:contain!important}
-.vidtile:fullscreen .vidmax{opacity:1}
+.vidtile:fullscreen .vidmax,.vidtile:fullscreen .vidsnd{opacity:1}
 
 /* ---------- Utilitaires d'état (toggle par le JS — NE PAS renommer) ---------- */
 .hidden{display:none!important}

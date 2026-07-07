@@ -338,6 +338,21 @@ function showTile(key: string, label: string, stream: MediaStream, self: boolean
     w.appendChild(v);
     w.appendChild(tag);
     w.appendChild(max);
+    if (!self) {
+      // Bouton son DU FLUX, sur la vignette (accessible aussi en plein écran) :
+      // coupe localement l'audio reçu de ce stream, sans toucher à l'appel vocal.
+      const snd = document.createElement("button");
+      snd.className = "vidsnd";
+      snd.type = "button";
+      snd.textContent = "🔊";
+      snd.title = "Couper / remettre le son de ce flux";
+      snd.onclick = (e: MouseEvent) => {
+        e.stopPropagation();
+        v.muted = !v.muted;
+        snd.textContent = v.muted ? "🔇" : "🔊";
+      };
+      w.appendChild(snd);
+    }
     vgrid().appendChild(w);
   }
   (document.getElementById("vid_" + key) as HTMLVideoElement).srcObject = stream;
@@ -375,12 +390,22 @@ function tuneVideoSender(pc: RTCPeerConnection, track: MediaStreamTrack): void {
     const p = sender.getParameters();
     if (!p.encodings || !p.encodings.length) p.encodings = [{}];
     p.encodings[0].maxFramerate = 30;
-    p.encodings[0].maxBitrate = 8_000_000;
+    // 5 Mb/s ≈ préréglage 1080p30 « screen share » de LiveKit : assez pour être net,
+    // assez bas pour que l'encodeur logiciel tienne 30 img/s sans saturer le CPU.
+    p.encodings[0].maxBitrate = 5_000_000;
     (p as RTCRtpSendParameters & { degradationPreference?: string }).degradationPreference = "maintain-framerate";
     void sender.setParameters(p).catch(() => {});
   } catch {
     /* ignore */
   }
+}
+// Ré-appliquer le réglage une fois la négociation « stable » : sur d'anciens moteurs,
+// encodings est vide avant la 1re offre et setParameters échoue en silence — après
+// l'answer, il existe toujours et le plafond fps/bitrate prend à coup sûr.
+function retuneSenders(pc: RTCPeerConnection): void {
+  pc.getSenders().forEach((se) => {
+    if (se.track) tuneVideoSender(pc, se.track);
+  });
 }
 function getPc(peer: string) {
   if (S.pcs[peer]) return S.pcs[peer];
@@ -513,27 +538,50 @@ async function startScreen(): Promise<void> {
   }
   if (!videoPrivacyOk()) return;
   // Option « son » : capter aussi l'audio système de l'écran partagé.
+  // WebView2/Windows ne capture le son QUE pour « Écran entier » + case « Partager
+  // l'audio » cochée dans le sélecteur — une fenêtre seule est toujours muette.
   const withAudio = confirm(
-    "Partager aussi le SON de l'écran ?\n\nOK = avec le son système · Annuler = vidéo seulement",
+    "Partager aussi le SON de l'écran ?\n\nOK = avec le son système. Dans la fenêtre suivante, choisis « Écran entier » et coche « Partager l'audio » (une fenêtre seule n'a pas de son sur Windows).\n\nAnnuler = vidéo seulement",
   );
-  const vconf = { frameRate: { ideal: 30, max: 60 } };
+  // VID-3 (1 fps + UI figée) : plafonner la capture à 1080p/30. Encoder un écran 1440p/4K
+  // en logiciel sature un cœur CPU : la vidéo tombe à 1-5 img/s et toute l'interface gèle.
+  // getDisplayMedia n'accepte que des bornes max (min/exact = TypeError) ; Chromium
+  // réduit l'image à la volée en gardant les proportions.
+  const vconf = { width: { max: 1920 }, height: { max: 1080 }, frameRate: { ideal: 30, max: 30 } };
+  const opts: DisplayMediaStreamOptions & {
+    systemAudio?: string;
+    windowAudio?: string;
+    restrictOwnAudio?: boolean;
+  } = { video: vconf, audio: withAudio };
+  if (withAudio) {
+    opts.systemAudio = "include"; // proposer l'audio système dans le sélecteur
+    opts.windowAudio = "system"; // Edge 141+ : du son même en partage de fenêtre
+    opts.restrictOwnAudio = true; // anti-écho : exclut le son émis par l'app elle-même
+  }
   let s: MediaStream;
   try {
-    s = await navigator.mediaDevices.getDisplayMedia({ video: vconf, audio: withAudio });
+    s = await navigator.mediaDevices.getDisplayMedia(opts);
   } catch (e) {
-    // Le son d'écran n'est pas capturable partout (OS / type de source). Plutôt que
-    // d'ANNULER tout le partage, on réessaie en vidéo seule.
-    if (withAudio) {
-      log("Partage d'écran : le son n'est pas disponible ici — partage de la vidéo seule.");
-      try {
-        s = await navigator.mediaDevices.getDisplayMedia({ video: vconf, audio: false });
-      } catch (e2) {
-        log("Écran : accès refusé ou annulé (" + e2 + ")");
-        return;
-      }
-    } else {
-      log("Écran : accès refusé ou annulé (" + e + ")");
-      return;
+    // L'absence de son ne rejette JAMAIS la promesse (spéc. W3C) : une erreur ici est
+    // un refus/annulation du sélecteur — re-proposer sans audio rouvrirait le sélecteur.
+    log("Écran : accès refusé ou annulé (" + e + ")");
+    return;
+  }
+  // Pas de son = flux SANS piste audio, en silence : le détecter et l'expliquer.
+  if (withAudio) {
+    if (s.getAudioTracks().length) log("🔊 Son système partagé avec l'écran.");
+    else
+      log(
+        "🔇 Pas de son capturé — pour streamer avec le son : partage « Écran entier » et coche « Partager l'audio » dans le sélecteur (une fenêtre seule est muette sur Windows).",
+      );
+  }
+  // Fluidité avant netteté, décidé AVANT addTrack pour que l'encodeur parte du bon mode.
+  const svt = s.getVideoTracks()[0];
+  if (svt) {
+    try {
+      (svt as MediaStreamTrack & { contentHint?: string }).contentHint = "motion";
+    } catch {
+      /* ignore */
     }
   }
   S.localScreen = s;
@@ -760,6 +808,7 @@ export function initGroups(): void {
           await pc.setLocalDescription();
           sigSend(peer, { description: pc.localDescription });
         }
+        if (pc.signalingState === "stable") retuneSenders(pc);
       } else if (msg.candidate) {
         try {
           await pc.addIceCandidate(msg.candidate);
