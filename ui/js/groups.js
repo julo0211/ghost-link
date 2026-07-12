@@ -290,6 +290,21 @@ function stopGroupCall() {
     log("Appel de groupe terminé.");
 }
 // ----- Vidéo de groupe : webcam + partage d'écran (WebRTC) -----
+// Repli natif du SON d'écran : WebView2 ne capture jamais l'audio d'une fenêtre
+// partagée (MicrosoftEdge/WebView2Feedback#4327). Quand l'utilisateur veut le son
+// mais que getDisplayMedia ne fournit AUCUNE piste audio, Rust capte le son système
+// (loopback WASAPI) et l'envoie en Opus sur le maillage — audible par les membres
+// DANS l'appel de groupe. Ce drapeau dit si cette capture native est active.
+let screenAudioNative = false;
+// Après un échec du partage AVEC audio (rejet en bloc de getDisplayMedia), le retry
+// vidéo-seule immédiat peut lui-même échouer : l'activation utilisateur (~5 s après
+// le clic, consommée par le 1er appel — Chromium 111+) est morte. Ce drapeau fait
+// que le PROCHAIN clic sur 🖥️ Écran repart directement sans audio navigateur.
+let retryVideoOnly = false;
+// Verrou de réentrance : S.localScreen n'est posé qu'APRÈS l'await getDisplayMedia,
+// donc sans ce drapeau un double-clic sur 🖥️ Écran lancerait deux sélecteurs et le
+// premier flux fuirait (diffusé aux pairs, inarrêtable depuis l'UI).
+let screenBusy = false;
 function vgrid() {
     return $("#groupVideos");
 }
@@ -377,15 +392,22 @@ function sigSend(peer, payload) {
 function localStreams() {
     return [S.localCam, S.localScreen].filter(Boolean);
 }
-// BUG (1 fps) : par défaut WebRTC privilégie la RÉSOLUTION et chute à 1-5 fps sous
-// la moindre contrainte (CPU/débit). On force le MAINTIEN du framerate + un plafond
-// fps/bitrate, et contentHint=motion (fluidité plutôt que netteté). Indispensable
-// pour un partage d'écran/caméra fluide.
+// Deux profils d'adaptation distincts (VID-4, yo-yo 1080p↔144p) :
+// - CAMÉRA : contentHint=motion + maintain-framerate — fluidité d'abord, la
+//   résolution peut descendre, personne ne lit du texte sur une webcam.
+// - ÉCRAN : contentHint=detail + maintain-resolution — désactive le quality scaler
+//   QP de libwebrtc, dont l'UNIQUE axe d'adaptation est la résolution : c'est lui
+//   qui pompait 1080p→144p→1080p en boucle (adaptation.md libwebrtc : « The QP
+//   scaler is only enabled when the degradation_preference is MAINTAIN_FRAMERATE
+//   or BALANCED »). La congestion se paie désormais en fps (texte toujours
+//   lisible), et le plafond écran passe de 5 à 3 Mb/s : 5 dépassait la capacité
+//   réelle des liens et entretenait les cycles overshoot/chute de goog-cc.
 function tuneVideoSender(pc, track) {
     if (track.kind !== "video")
         return;
+    const isScreen = !!(S.localScreen && S.localScreen.getTracks().includes(track));
     try {
-        track.contentHint = "motion";
+        track.contentHint = isScreen ? "detail" : "motion";
     }
     catch {
         /* ignore */
@@ -398,14 +420,15 @@ function tuneVideoSender(pc, track) {
         if (!p.encodings || !p.encodings.length)
             p.encodings = [{}];
         p.encodings[0].maxFramerate = 30;
-        // 5 Mb/s ≈ préréglage 1080p30 « screen share » de LiveKit : assez pour être net,
-        // assez bas pour que l'encodeur logiciel tienne 30 img/s sans saturer le CPU.
-        p.encodings[0].maxBitrate = 5000000;
-        p.degradationPreference = "maintain-framerate";
-        void sender.setParameters(p).catch(() => { });
+        p.encodings[0].maxBitrate = isScreen ? 3000000 : 5000000;
+        p.degradationPreference =
+            isScreen ? "maintain-resolution" : "maintain-framerate";
+        // Échec visible en DevTools : un setParameters avalé en silence peut masquer des
+        // réglages jamais appliqués (encodings encore vides avant la 1re négociation).
+        void sender.setParameters(p).catch((err) => console.warn("setParameters:", err));
     }
-    catch {
-        /* ignore */
+    catch (err) {
+        console.warn("tuneVideoSender:", err);
     }
 }
 // Ré-appliquer le réglage une fois la négociation « stable » : sur d'anciens moteurs,
@@ -525,8 +548,16 @@ async function startCam() {
         log("📞 Rejoins d'abord l'appel de groupe — comme sur Discord, la caméra se partage dans l'appel.");
         return;
     }
+    // Même garde que startScreen : le confirm() du tout premier usage vidéo consomme
+    // l'activation utilisateur — getUserMedia est moins strict que getDisplayMedia,
+    // mais on garde un comportement identique et prévisible.
+    const firstPrivacy = localStorage.getItem("ghostlink_video_ok") !== "1";
     if (!videoPrivacyOk())
         return;
+    if (firstPrivacy) {
+        log("Confidentialité acceptée ✔ — re-clique sur 📹 Caméra pour l'activer.");
+        return;
+    }
     let s;
     try {
         s = await navigator.mediaDevices.getUserMedia({ video: { frameRate: { ideal: 30 } }, audio: false });
@@ -546,6 +577,8 @@ async function startCam() {
     log("📹 Caméra activée.");
 }
 async function startScreen() {
+    if (screenBusy)
+        return; // sélecteur/démarrage déjà en cours (double-clic)
     if (!loadGroups().some((x) => x.id === S.openGroupId)) {
         log("Ouvre un groupe d'abord.");
         return;
@@ -554,59 +587,145 @@ async function startScreen() {
         log("📞 Rejoins d'abord l'appel de groupe — comme sur Discord, l'écran se partage dans l'appel.");
         return;
     }
+    // Au TOUT premier usage vidéo, le confirm() de confidentialité consomme le délai
+    // d'activation utilisateur (~5 s, Chromium 111+) : getDisplayMedia rejetterait
+    // InvalidStateError. On s'arrête proprement et on demande un clic « frais ».
+    const firstPrivacy = localStorage.getItem("ghostlink_video_ok") !== "1";
     if (!videoPrivacyOk())
         return;
-    // Option « son » : capter aussi l'audio système de l'écran partagé.
-    // WebView2/Windows ne capture le son QUE pour « Écran entier » + case « Partager
-    // l'audio » cochée dans le sélecteur — une fenêtre seule est toujours muette.
-    const withAudio = confirm("Partager aussi le SON de l'écran ?\n\nOK = avec le son système. Dans la fenêtre suivante, choisis « Écran entier » et coche « Partager l'audio » (une fenêtre seule n'a pas de son sur Windows).\n\nAnnuler = vidéo seulement");
-    // VID-3 (1 fps + UI figée) : plafonner la capture à 1080p/30. Encoder un écran 1440p/4K
-    // en logiciel sature un cœur CPU : la vidéo tombe à 1-5 img/s et toute l'interface gèle.
-    // getDisplayMedia n'accepte que des bornes max (min/exact = TypeError) ; Chromium
-    // réduit l'image à la volée en gardant les proportions.
-    const vconf = { width: { max: 1920 }, height: { max: 1080 }, frameRate: { ideal: 30, max: 30 } };
-    const opts = { video: vconf, audio: withAudio };
-    if (withAudio) {
-        opts.systemAudio = "include"; // proposer l'audio système dans le sélecteur
-        opts.windowAudio = "system"; // Edge 141+ : du son même en partage de fenêtre
-        opts.restrictOwnAudio = true; // anti-écho : exclut le son émis par l'app elle-même
-    }
-    let s;
-    try {
-        s = await navigator.mediaDevices.getDisplayMedia(opts);
-    }
-    catch (e) {
-        // L'absence de son ne rejette JAMAIS la promesse (spéc. W3C) : une erreur ici est
-        // un refus/annulation du sélecteur — re-proposer sans audio rouvrirait le sélecteur.
-        log("Écran : accès refusé ou annulé (" + e + ")");
+    if (firstPrivacy) {
+        log("Confidentialité acceptée ✔ — re-clique sur 🖥️ Écran pour lancer le partage.");
         return;
     }
-    // Pas de son = flux SANS piste audio, en silence : le détecter et l'expliquer.
-    if (withAudio) {
-        if (s.getAudioTracks().length)
-            log("🔊 Son système partagé avec l'écran.");
-        else
-            log("🔇 Pas de son capturé — pour streamer avec le son : partage « Écran entier » et coche « Partager l'audio » dans le sélecteur (une fenêtre seule est muette sur Windows).");
-    }
-    // Fluidité avant netteté, décidé AVANT addTrack pour que l'encodeur parte du bon mode.
-    const svt = s.getVideoTracks()[0];
-    if (svt) {
+    screenBusy = true;
+    try {
+        // VID-3 (1 fps + UI figée) : plafonner la capture à 1080p/30. Encoder un écran 1440p/4K
+        // en logiciel sature un cœur CPU : la vidéo tombe à 1-5 img/s et toute l'interface gèle.
+        // getDisplayMedia n'accepte que des bornes max (min/exact = TypeError) ; Chromium
+        // réduit l'image à la volée en gardant les proportions.
+        const vconf = { width: { max: 1920 }, height: { max: 1080 }, frameRate: { ideal: 30, max: 30 } };
+        // Son : on demande TOUJOURS l'audio — la case « Partager l'audio » du sélecteur est
+        // la SEULE source de vérité (l'ancien confirm() bloquant ici pouvait faire expirer
+        // l'activation utilisateur et getDisplayMedia rejetait InvalidStateError sans même
+        // ouvrir le sélecteur : « le stream ne se lance pas »). windowAudio est
+        // volontairement ABSENT : le sélecteur WebView2 n'implémente pas l'audio de
+        // fenêtre (WebView2Feedback#4327), ce hint n'avait aucun effet.
+        const wantBrowserAudio = !retryVideoOnly;
+        let audioFailed = retryVideoOnly; // l'audio navigateur a déjà échoué au clic précédent
+        retryVideoOnly = false;
+        const opts = wantBrowserAudio
+            ? {
+                video: vconf,
+                audio: true,
+                systemAudio: "include", // fait apparaître la case (onglet « Écran entier »)
+                restrictOwnAudio: true, // exclut le son émis par la WebView elle-même
+            }
+            : { video: vconf };
+        let s;
         try {
-            svt.contentHint = "motion";
+            s = await navigator.mediaDevices.getDisplayMedia(opts);
         }
-        catch {
-            /* ignore */
+        catch (e) {
+            const name = e instanceof DOMException ? e.name : String(e);
+            if (!wantBrowserAudio || name === "NotAllowedError") {
+                // Vrai refus / annulation du sélecteur.
+                log("Écran : accès refusé ou annulé (" + name + ")");
+                return;
+            }
+            // Contrairement à la spéc idéale, Chromium/Windows PEUT rejeter TOUT le partage
+            // quand la capture du son système échoue (NotReadableError « Could not start
+            // audio source », cf. jitsi/jitsi-meet#15417) ou quand l'activation a expiré
+            // (InvalidStateError). On retente aussitôt en vidéo seule — le son passera par
+            // le repli natif. (C'est le retry que v0.26.1 avait supprimé à tort.)
+            audioFailed = true;
+            log("Écran+son : échec (" + name + ") — nouvelle tentative sans audio…");
+            try {
+                s = await navigator.mediaDevices.getDisplayMedia({ video: vconf });
+            }
+            catch (e2) {
+                const n2 = e2 instanceof DOMException ? e2.name : String(e2);
+                if (n2 === "NotAllowedError") {
+                    // Annulation volontaire du 2e sélecteur : ne rien mémoriser.
+                    log("Écran : partage annulé.");
+                    return;
+                }
+                // L'activation du clic initial est consommée : impossible de réessayer sans
+                // nouveau geste. Le prochain clic partira directement sans audio navigateur.
+                retryVideoOnly = true;
+                log("⚠️ Partage avec son impossible (" + n2 + "). Re-clique sur 🖥️ Écran : la vidéo partira aussitôt et le son système pourra être capté en natif.");
+                return;
+            }
+        }
+        // La VIDÉO d'abord : vignette + envoi aux pairs immédiatement. La décision « son »
+        // vient APRÈS — plus rien ne doit pouvoir bloquer ou annuler le lancement du flux.
+        const svt = s.getVideoTracks()[0];
+        if (svt) {
+            try {
+                // « detail » (pas « motion ») : mode screencast de l'encodeur, cohérent avec
+                // maintain-resolution posé par tuneVideoSender. Décidé AVANT addTrack.
+                svt.contentHint = "detail";
+            }
+            catch {
+                /* ignore */
+            }
+        }
+        S.localScreen = s;
+        showTile("moi_screen", "Moi (écran)", s, true);
+        ensureGroupPcs();
+        addStreamToPcs(s);
+        $("#btnGroupScreen").textContent = "⏹️ Écran";
+        if (svt)
+            svt.onended = () => stopScreen();
+        log("🖥️ Partage d'écran lancé.");
+        // ---- Décision « son », le flux vidéo étant déjà parti ----
+        if (s.getAudioTracks().length) {
+            log("🔊 Son système partagé avec l'écran (navigateur).");
+            return;
+        }
+        const surface = svt
+            ? svt.getSettings().displaySurface
+            : undefined;
+        if (surface === "monitor" && !audioFailed) {
+            // Écran entier : la case « Partager l'audio » était disponible et NON cochée —
+            // choix explicite de l'utilisateur, on ne capte rien.
+            log("🔇 Sans le son (case « Partager l'audio » non cochée). Pour le son : relance avec la case cochée, ou partage une fenêtre (repli natif proposé).");
+            return;
+        }
+        // Fenêtre partagée (le sélecteur WebView2 n'y propose JAMAIS l'audio — #4327) ou
+        // capture audio navigateur en échec : proposer le repli natif. Ce confirm() arrive
+        // APRÈS le lancement du partage — plus d'activation utilisateur à préserver.
+        const wantNative = confirm("Partager aussi le SON ?\n\nLe navigateur ne fournit pas l'audio ici — ghost link peut capter le son système en natif (TOUT le son du PC, pas seulement la fenêtre partagée). Le flux chiffré part vers les membres du groupe en ligne ; seuls ceux qui ont rejoint l'appel l'entendent.\n\nOK = capter le son système · Annuler = vidéo seule (pour ajouter le son ensuite : arrête ⏹️ puis relance le partage)");
+        if (!wantNative)
+            return;
+        // Garde anti-course : le partage a pu être arrêté PENDANT le confirm (bouton stop
+        // de la barre Chromium → onended en file d'attente). Ne rien capter dans ce cas.
+        if (S.localScreen !== s)
+            return;
+        const g = loadGroups().find((x) => x.id === S.openGroupId);
+        try {
+            await invoke("screen_audio_start", { members: g ? g.members : [] });
+            // Le partage a pu être arrêté PENDANT l'await (jusqu'à 5 s côté Rust) : stopScreen
+            // a alors vu screenAudioNative=false et n'a rien arrêté — compenser ici, sinon la
+            // capture du son système continuerait ORPHELINE (fuite de confidentialité).
+            if (S.localScreen !== s) {
+                invoke("screen_audio_stop").catch(() => { });
+                return;
+            }
+            screenAudioNative = true;
+            // Indicateur permanent tant que le son système est capté en natif.
+            $("#btnGroupScreen").textContent = "⏹️ Écran · 🔴 son système";
+            // Limite (anti-écho) : le loopback capte AUSSI les voix de l'appel jouées sur ce
+            // PC ; elles sont atténuées (duck côté Rust), pas soustraites. Un casque, ou une
+            // sortie voix différente de la sortie système, supprime totalement l'écho.
+            log("🔊 Son système capté en natif (loopback). Anti-écho : les voix de l'appel sont atténuées dans le flux, pas retirées.");
+        }
+        catch (e) {
+            log("🔇 Repli natif indisponible (" + e + ").");
         }
     }
-    S.localScreen = s;
-    showTile("moi_screen", "Moi (écran)", s, true);
-    ensureGroupPcs();
-    addStreamToPcs(s);
-    $("#btnGroupScreen").textContent = "⏹️ Écran";
-    const vt = s.getVideoTracks()[0];
-    if (vt)
-        vt.onended = () => stopScreen();
-    log("🖥️ Partage d'écran lancé.");
+    finally {
+        screenBusy = false;
+    }
 }
 function stopCam() {
     if (S.localCam) {
@@ -618,6 +737,10 @@ function stopCam() {
     $("#btnGroupCam").textContent = "📹 Caméra";
 }
 function stopScreen() {
+    if (screenAudioNative) {
+        screenAudioNative = false;
+        invoke("screen_audio_stop").catch(() => { });
+    }
     if (S.localScreen) {
         removeStreamFromPcs(S.localScreen);
         S.localScreen.getTracks().forEach((t) => t.stop());

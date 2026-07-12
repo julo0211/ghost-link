@@ -195,8 +195,12 @@ async fn group_call_start(
 }
 
 #[tauri::command]
-fn group_call_stop(call: State<'_, audio::GroupCall>) {
+fn group_call_stop(call: State<'_, audio::GroupCall>, sa: State<'_, audio::ScreenAudio>) {
     call.stop();
+    // Filet : le partage d'écran ne vit que DANS l'appel — si un chemin d'arrêt côté
+    // front a raté screen_audio_stop (course UI), la capture du son système ne doit
+    // pas survivre au raccrochage. stop() est idempotent.
+    sa.stop();
 }
 
 #[tauri::command]
@@ -207,6 +211,33 @@ fn group_call_mute(call: State<'_, audio::GroupCall>, on: bool) {
 #[tauri::command]
 fn group_call_volume(call: State<'_, audio::GroupCall>, peer: String, vol: f64) {
     call.set_gain(&peer, vol as f32);
+}
+
+// Son système du partage d'écran (repli natif quand WebView2 ne fournit pas de piste
+// audio — partage d'une fenêtre) : loopback WASAPI → Opus → datagrammes du maillage.
+#[tauri::command]
+async fn screen_audio_start(
+    net: State<'_, Net>,
+    sa: State<'_, audio::ScreenAudio>,
+    members: Vec<String>,
+) -> Result<(), String> {
+    let conns: Vec<_> = net::group_conns(net.inner(), &members)
+        .into_iter()
+        .map(|(_, c)| c)
+        .collect();
+    if conns.is_empty() {
+        return Err("aucun membre du groupe en ligne".to_string());
+    }
+    let s = sa.inner().clone();
+    tokio::task::spawn_blocking(move || s.start(conns))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn screen_audio_stop(sa: State<'_, audio::ScreenAudio>) {
+    sa.stop();
 }
 
 #[tauri::command]
@@ -331,12 +362,13 @@ fn main() {
             app.manage(audio::Voice::default());
             app.manage(audio::Call::default());
             app.manage(audio::GroupCall::default());
+            app.manage(audio::ScreenAudio::default());
             app.manage(audio::AudioCfg::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             perm_code, eph_code, rotate_eph_code, probe, connect, send_file, send_chat, send_freq, send_faccept, open_group, send_gchat, send_ginvite,
-            group_call_start, group_call_stop, group_call_mute, group_call_volume, send_signal, send_gfile,
+            group_call_start, group_call_stop, group_call_mute, group_call_volume, screen_audio_start, screen_audio_stop, send_signal, send_gfile,
             fingerprint, app_version, check_update, install_update, set_download_dir,
             get_download_dir, set_only_friends, set_friends, voice_test_start, voice_test_stop,
             call_start, call_stop, call_set_mute, list_audio_devices, set_audio_input,
