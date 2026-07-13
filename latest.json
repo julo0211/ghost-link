@@ -1,11 +1,11 @@
 {
-  "version": "0.27.0",
-  "notes": "Son système natif du partage d'écran + stream stabilisé",
-  "pub_date": "2026-07-12T16:03:34.338Z",
+  "version": "0.28.0",
+  "notes": "v0.28.0 — métadonnées nettoyées automatiquement avant chaque envoi",
+  "pub_date": "2026-07-13T22:37:38.500Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVJvY2ZWQW1DNHdaQzg2em5kNWl6d2Ztci9jYTViOUZhNHU0YW1jN3lnRjhtRGRGMDBwNmtQMDNxN2pGOFdUQy9peTNGY0xqQVk5MzRXVDBJajkvQnc0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzODcyMjEzCWZpbGU6Z2hvc3QtbGlua18wLjI3LjBfeDY0LXNldHVwLmV4ZQpGb2hybC8vYXV0cVoyUXkyUEQzS3p6eVpSbyttQTl0S3F0R2kvQ3hxUFh3WlcwcXd0SXpkbGV5U055UUJCOG5TL3Q2dFdMYmJ5RDJ1ZERNSlpycEhEUT09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.27.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVgxOTRpTERaV052ajRoT05qZ0luWmdFOVFDQWVsSktJaVNaZmRpdUFBUUxDMEpzSzIxVTkreUFoRTFEVlBad242OS9oQTZJazRya25HS1Fpd2c2dHdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzOTgyMjU3CWZpbGU6Z2hvc3QtbGlua18wLjI4LjBfeDY0LXNldHVwLmV4ZQpEa0ZvV2kwbmErWnUwVStaNHg4RU5wUWZ4U0Rmb0pFQ3pISDh5cEgzeEFLZmMyVUtranBmZk5NbmtoMFVsS29LRERSWTYyWEczZDQyM01GTitielVDZz09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.28.0_x64-setup.exe"
     }
   }
 }
