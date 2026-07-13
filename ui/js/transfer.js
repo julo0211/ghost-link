@@ -81,6 +81,17 @@ export function initTransfer() {
     listen("ghost-send-await", () => {
         $("#sendPct").textContent = "⏳ en attente d'acceptation…";
     });
+    // Nettoyage des métadonnées avant envoi (meta.rs) : rendre le résultat VISIBLE —
+    // succès rassurant, et surtout jamais d'échec silencieux (confidentialité).
+    listen("ghost-meta", (e) => {
+        const p = e.payload;
+        if (p.status === "cleaned")
+            log("🧹 Métadonnées retirées avant envoi : " + p.name);
+        else if (p.status === "skipped")
+            log("⚠️ Métadonnées NON retirées (" + (p.info || "format non pris en charge") + ") — fichier envoyé tel quel : " + p.name);
+        else
+            log("⚠️ Nettoyage des métadonnées échoué (" + (p.info || "?") + ") — fichier envoyé tel quel : " + p.name);
+    });
     listen("ghost-send-progress", (e) => {
         const { sent, size } = e.payload;
         const now = performance.now();

@@ -4,7 +4,7 @@
 
 [package]
 name = "ghost-link"
-version = "0.27.0"
+version = "0.28.0"
 edition = "2021"
 
 [build-dependencies]
@@ -26,6 +26,13 @@ tauri-plugin-updater = "2"
 cpal = "0.15"
 audiopus = "0.2"
 bytes = "1"
+# Nettoyage des métadonnées avant envoi (meta.rs) : PDF (Info/XMP) et documents
+# ZIP (docx/xlsx/pptx/odt — docProps, meta.xml). lopdf ≤ 0.34 : les versions
+# récentes exigent sha2 0.11, en conflit avec le sha2 0.11.0-rc.5 épinglé par iroh.
+lopdf = "0.34"
+# deflate-flate2-zlib-rs et non la méta-feature "deflate" : celle-ci embarque aussi
+# zopfli (+bumpalo), inutile pour écrire quelques petites entrées XML de remplacement.
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # Chiffrement de la clé d'identité au repos (DPAPI) — Windows uniquement.
 [target.'cfg(windows)'.dependencies]

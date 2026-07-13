@@ -958,12 +958,15 @@ pub async fn send_gfile(net: &Net, members: Vec<String>, path: &str) -> anyhow::
         anyhow::bail!("aucun membre du groupe en ligne");
     }
     let p = Path::new(path);
+    // Le NOM affiché vient toujours du fichier original ; les octets lus viennent de
+    // la copie NETTOYÉE de ses métadonnées (voir meta.rs) quand il y en a une.
     let name = p
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("fichier")
         .to_string();
-    let size = tokio::fs::metadata(p)
+    let read_path = prepare_meta(&net.app, path, &name).await;
+    let size = tokio::fs::metadata(Path::new(&read_path))
         .await
         .map_err(|e| anyhow::anyhow!("fichier introuvable: {e}"))?
         .len();
@@ -971,7 +974,7 @@ pub async fn send_gfile(net: &Net, members: Vec<String>, path: &str) -> anyhow::
     for (peer, conn) in conns {
         let app = app.clone();
         let name = name.clone();
-        let path = path.to_string();
+        let path = read_path.clone();
         tokio::spawn(async move {
             if send_one_gfile(&conn, &path, &name, size).await.is_ok() {
                 let _ = app.emit("ghost-gsent", serde_json::json!({ "name": name, "to": peer }));
@@ -979,6 +982,33 @@ pub async fn send_gfile(net: &Net, members: Vec<String>, path: &str) -> anyhow::
         });
     }
     Ok(())
+}
+
+/// Nettoie les métadonnées du fichier avant envoi (meta.rs) et prévient l'UI du
+/// résultat. Renvoie le chemin à LIRE : la copie nettoyée, ou l'original si rien à
+/// changer / nettoyage impossible (dans ce dernier cas l'UI est avertie — on n'échoue
+/// jamais l'envoi pour ça, mais on ne se tait jamais non plus).
+async fn prepare_meta(app: &AppHandle, path: &str, name: &str) -> String {
+    let owned = path.to_string();
+    let prep = tokio::task::spawn_blocking(move || crate::meta::prepare(Path::new(&owned)))
+        .await
+        .unwrap_or_else(|e| crate::meta::Prep::Failed(format!("préparation interrompue: {e}")));
+    match &prep {
+        crate::meta::Prep::Cleaned(_) => {
+            let _ = app.emit("ghost-meta", serde_json::json!({ "name": name, "status": "cleaned" }));
+        }
+        crate::meta::Prep::Skipped(info) => {
+            let _ = app.emit("ghost-meta", serde_json::json!({ "name": name, "status": "skipped", "info": info }));
+        }
+        crate::meta::Prep::Failed(info) => {
+            let _ = app.emit("ghost-meta", serde_json::json!({ "name": name, "status": "failed", "info": info }));
+        }
+        crate::meta::Prep::Untouched => {}
+    }
+    match prep {
+        crate::meta::Prep::Cleaned(tmp) => tmp.to_string_lossy().to_string(),
+        _ => path.to_string(),
+    }
 }
 
 async fn send_one_gfile(conn: &Connection, path: &str, name: &str, size: u64) -> anyhow::Result<()> {
@@ -1575,12 +1605,15 @@ pub async fn send_file(
     let conn = current(slot)
         .await
         .ok_or_else(|| anyhow::anyhow!("pas connecté à un pair"))?;
-    let p = Path::new(path);
-    let name = p
+    // Le NOM affiché vient du fichier original ; les octets lus (taille, hash,
+    // tranches) viennent de la copie NETTOYÉE de ses métadonnées (meta.rs).
+    let name = Path::new(path)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("fichier")
         .to_string();
+    let read_path = prepare_meta(app, path, &name).await;
+    let p = Path::new(&read_path);
     let size = tokio::fs::metadata(p)
         .await
         .map_err(|e| anyhow::anyhow!("fichier introuvable: {e}"))?

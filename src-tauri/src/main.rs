@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod meta;
 mod net;
 
 use net::Net;
@@ -364,6 +365,9 @@ fn main() {
             app.manage(audio::GroupCall::default());
             app.manage(audio::ScreenAudio::default());
             app.manage(audio::AudioCfg::default());
+            // Purge des copies nettoyées (métadonnées) laissées par la session
+            // précédente — sinon elles ne partiraient qu'au prochain envoi.
+            std::thread::spawn(meta::gc_temp);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

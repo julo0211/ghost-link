@@ -79,6 +79,7 @@ export interface Events {
   "ghost-refused": string;
 
   "ghost-send-await": null;
+  "ghost-meta": { name: string; status: "cleaned" | "skipped" | "failed"; info?: string };
   "ghost-send-progress": { sent: number; size: number };
   "ghost-recv-start": { name: string; size: number };
   "ghost-recv-progress": { received: number; size: number };
