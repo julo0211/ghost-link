@@ -599,11 +599,14 @@ async function startScreen() {
     }
     screenBusy = true;
     try {
-        // VID-3 (1 fps + UI figée) : plafonner la capture à 1080p/30. Encoder un écran 1440p/4K
-        // en logiciel sature un cœur CPU : la vidéo tombe à 1-5 img/s et toute l'interface gèle.
-        // getDisplayMedia n'accepte que des bornes max (min/exact = TypeError) ; Chromium
-        // réduit l'image à la volée en gardant les proportions.
-        const vconf = { width: { max: 1920 }, height: { max: 1080 }, frameRate: { ideal: 30, max: 30 } };
+        // VID-5 : capture plafonnée à 720p/30 (était 1080p). Avec le profil écran
+        // « detail » + maintain-resolution (anti yo-yo), la résolution ne cède plus
+        // JAMAIS : en 1080p logiciel, dès que débit/CPU ne suivaient pas, tout se payait
+        // en images/s — plancher screencast VP9 à ~3-5 fps constaté en test réel (bug
+        // WebRTC 42223195). En 720p, 3 Mb/s tient 30 fps ET la lisibilité. getDisplayMedia
+        // n'accepte que des bornes max (min/exact = TypeError) ; Chromium réduit l'image
+        // à la volée en gardant les proportions.
+        const vconf = { width: { max: 1280 }, height: { max: 720 }, frameRate: { ideal: 30, max: 30 } };
         // Son : on demande TOUJOURS l'audio — la case « Partager l'audio » du sélecteur est
         // la SEULE source de vérité (l'ancien confirm() bloquant ici pouvait faire expirer
         // l'activation utilisateur et getDisplayMedia rejetait InvalidStateError sans même
