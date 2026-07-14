@@ -65,6 +65,7 @@ export interface Commands {
   group_call_volume: { args: { peer: string; vol: number }; ret: void };
   screen_audio_start: { args: { members: string[] }; ret: void };
   screen_audio_stop: { args: void; ret: void };
+  screen_audio_mute: { args: { peer: string; on: boolean }; ret: void };
   send_signal: { args: { peer: string; data: string }; ret: void };
   send_gfile: { args: { members: string[]; path: string }; ret: void };
   respond_gfile: { args: { id: number; accept: boolean }; ret: void };

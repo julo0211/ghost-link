@@ -322,7 +322,7 @@ function toggleTileFullscreen(el: HTMLElement): void {
     el.requestFullscreen().catch(() => log("Plein écran indisponible sur cette vue."));
   }
 }
-function showTile(key: string, label: string, stream: MediaStream, self: boolean): void {
+function showTile(key: string, label: string, stream: MediaStream, self: boolean, peer?: string): void {
   let w = document.getElementById("vidw_" + key);
   if (!w) {
     w = document.createElement("div");
@@ -334,7 +334,9 @@ function showTile(key: string, label: string, stream: MediaStream, self: boolean
     v.id = "vid_" + key;
     v.autoplay = true;
     v.playsInline = true;
-    v.muted = !!self;
+    // Vignette recréée (redémarrage du partage, renégociation) : refléter l'état de
+    // coupure DÉJÀ choisi pour ce pair, sinon on afficherait 🔊 sur un son coupé.
+    v.muted = !!self || (!!peer && !!S.screenMuted[peer]);
     v.style.cssText = "width:100%;aspect-ratio:4/3;object-fit:cover;display:block";
     const tag = document.createElement("div");
     tag.style.cssText = "position:absolute;bottom:4px;left:6px;font-size:11px;font-weight:700;color:#fff;text-shadow:0 1px 3px #000";
@@ -354,19 +356,41 @@ function showTile(key: string, label: string, stream: MediaStream, self: boolean
     w.appendChild(tag);
     w.appendChild(max);
     if (!self) {
-      // Bouton son DU FLUX, sur la vignette (accessible aussi en plein écran) :
-      // coupe localement l'audio reçu de ce stream, sans toucher à l'appel vocal.
+      // Bouton son DU PARTAGE, sur la vignette (accessible aussi en plein écran).
+      // Coupe localement le son de ce pair — LES DEUX voies : l'audio d'une piste
+      // WebRTC (v.muted) ET le son système capté en natif, qui ne passe PAS par la
+      // vidéo mais par le mixeur de l'appel (screen_audio_mute). L'état est stocké
+      // PAR PAIR (S.screenMuted) : un pair peut avoir 2 vignettes (cam + écran) —
+      // toutes ses vignettes partagent le même état et sont synchronisées au clic.
       const snd = document.createElement("button");
       snd.className = "vidsnd";
       snd.type = "button";
-      snd.textContent = "🔊";
-      snd.title = "Couper / remettre le son de ce flux";
+      if (peer) snd.dataset.snd = peer;
+      const muted0 = !!peer && !!S.screenMuted[peer];
+      snd.textContent = muted0 ? "🔇" : "🔊";
+      snd.title = "Couper / remettre le son de ce partage";
       snd.onclick = (e: MouseEvent) => {
         e.stopPropagation();
-        v.muted = !v.muted;
-        snd.textContent = v.muted ? "🔇" : "🔊";
+        if (!peer) {
+          v.muted = !v.muted;
+          snd.textContent = v.muted ? "🔇" : "🔊";
+          return;
+        }
+        const on = !S.screenMuted[peer];
+        S.screenMuted[peer] = on;
+        invoke("screen_audio_mute", { peer, on }).catch(() => {});
+        // Synchroniser TOUTES les vignettes du pair (cam + écran) : élément vidéo + icône.
+        document.querySelectorAll('[id^="vidw_' + peer + '_"] video').forEach((el) => {
+          (el as HTMLVideoElement).muted = on;
+        });
+        document.querySelectorAll('[data-snd="' + peer + '"]').forEach((b) => {
+          (b as HTMLElement).textContent = on ? "🔇" : "🔊";
+        });
       };
       w.appendChild(snd);
+      // Ré-affirmer la coupure au backend : après une reconnexion, receive_group_voice
+      // a pu réinitialiser le gain à 1.0 — sans ça, l'icône dirait 🔇 mais le son jouerait.
+      if (muted0) invoke("screen_audio_mute", { peer: peer as string, on: true }).catch(() => {});
     }
     vgrid().appendChild(w);
   }
@@ -463,7 +487,7 @@ function getPc(peer: string) {
     const stream = ev.streams[0];
     if (!stream) return;
     const key = peer + "_" + stream.id; // une vignette par flux (cam ET écran)
-    showTile(key, memberName(peer), stream, false);
+    showTile(key, memberName(peer), stream, false, peer);
     const drop = () => dropTile(key);
     // VID-2 : NE PAS retirer sur `onmute` — un mute survient sur une perte de paquets
     // transitoire (puis unmute) ; retirer ferait clignoter/disparaître la vignette à tort.
@@ -696,10 +720,10 @@ async function startScreen(): Promise<void> {
       screenAudioNative = true;
       // Indicateur permanent tant que le son système est capté en natif.
       $("#btnGroupScreen").textContent = "⏹️ Écran · 🔴 son système";
-      // Limite (anti-écho) : le loopback capte AUSSI les voix de l'appel jouées sur ce
-      // PC ; elles sont atténuées (duck côté Rust), pas soustraites. Un casque, ou une
-      // sortie voix différente de la sortie système, supprime totalement l'écho.
-      log("🔊 Son système capté en natif (loopback). Anti-écho : les voix de l'appel sont atténuées dans le flux, pas retirées.");
+      // Anti-écho À LA SOURCE : la capture exclut le processus de ghost link
+      // (process-loopback EXCLUDE), donc les voix de l'appel qu'on joue ne sont jamais
+      // réinjectées — les autres n'entendent QUE le son de l'appli partagée.
+      log("🔊 Son système capté en natif — les voix de l'appel sont exclues du flux (pas d'écho).");
     } catch (e) {
       log("🔇 Repli natif indisponible (" + e + ").");
     }

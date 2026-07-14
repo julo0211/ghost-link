@@ -47,6 +47,9 @@ export const S = {
     pendingInvite: null,
     meshOnline: new Set(),
     groupGains: {},
+    // Son du partage d'écran coupé, PAR pair (le son natif est per-pair, pas per-flux) :
+    // une vignette recréée relit cet état au lieu de repartir à « son activé ».
+    screenMuted: {},
     inGroupCall: false,
     groupMuted: false,
     groupCallId: null,

@@ -4,7 +4,7 @@
 // pour que l'appel fonctionne quelle que soit la carte son (ex. micro en 44,1 kHz).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -14,23 +14,7 @@ use iroh::endpoint::Connection;
 /// Opus fonctionne à 48 kHz mono, trame de 20 ms = 960 échantillons.
 const OPUS_FRAME: usize = 960;
 const VOICE_TAG: u8 = 1; // premier octet d'un datagramme = type « voix »
-const SCREEN_TAG: u8 = 2; // premier octet d'un datagramme = « son d'écran » (loopback système)
-
-// Anti-écho du partage d'écran : TOUTE sortie audio de l'app (mixage de groupe ET
-// lecture d'appel 1-à-1 / test vocal) publie ici le niveau crête (bits f32) du dernier
-// bloc joué. Le loopback système capte AUSSI ces voix distantes — sans précaution,
-// chaque pair réentendrait sa propre voix. On ATTÉNUE donc la capture quand ce niveau
-// dépasse un seuil (duck) ; ce n'est pas une annulation. Chaque thread propriétaire
-// d'un flux de sortie remet 0 APRÈS l'avoir droppé — sinon un dernier pic écrit par le
-// callback resterait figé et le duck ne se relâcherait jamais.
-static PLAY_LEVEL: AtomicU32 = AtomicU32::new(0);
-// Seuil/gain choisis pour ne PAS rendre le son d'écran inaudible : un seuil trop bas
-// (ex. 0.02 ≈ -34 dBFS) se déclenche sur le simple souffle du micro d'un pair et
-// atténue en quasi-permanence — perçu comme « pas de son ». 0.08 ≈ -22 dBFS = vraie
-// voix ; 0.35 ≈ -9 dB laisse le son d'écran intelligible pendant qu'on parle.
-const DUCK_THRESHOLD: f32 = 0.08;
-const DUCK_GAIN: f32 = 0.35;
-const DUCK_HOLD_FRAMES: u32 = 8; // maintien de l'atténuation 8 × 20 ms après la dernière voix
+const SCREEN_TAG: u8 = 2; // premier octet d'un datagramme = « son d'écran » (process-loopback)
 
 /// Clé du tampon de mixage pour le SON D'ÉCRAN d'un pair — distincte de sa voix pour
 /// que chaque flux garde SON décodeur Opus (les codes de pair ne contiennent pas `#`).
@@ -189,19 +173,12 @@ fn build_output(
                 config,
                 move |data: &mut [$t], _: &cpal::OutputCallbackInfo| {
                     if let Ok(mut q) = out_buf.lock() {
-                        let mut peak = 0.0f32;
                         for chunk in data.chunks_mut(ch) {
-                            let s = q.pop_front().unwrap_or(0.0);
-                            if s.abs() > peak {
-                                peak = s.abs();
-                            }
-                            let v = $conv(s);
+                            let v = $conv(q.pop_front().unwrap_or(0.0));
                             for x in chunk.iter_mut() {
                                 *x = v;
                             }
                         }
-                        // Publie le niveau joué : anti-écho du partage d'écran (loopback).
-                        PLAY_LEVEL.store(peak.to_bits(), Ordering::Relaxed);
                     } else {
                         let z = $conv(0.0);
                         for x in data.iter_mut() {
@@ -398,7 +375,7 @@ fn start_loopback(cfg: AudioCfg) -> anyhow::Result<Arc<AtomicBool>> {
         })();
 
         match setup {
-            Ok((_in_s, out_s, in_buf, out_buf, in_frame, out_frame, encoder, mut decoder)) => {
+            Ok((_in_s, _out_s, in_buf, out_buf, in_frame, out_frame, encoder, mut decoder)) => {
                 let _ = tx.send(Ok(()));
                 let out_cap = out_frame * 50;
                 let mut packet = [0u8; 4000];
@@ -439,11 +416,7 @@ fn start_loopback(cfg: AudioCfg) -> anyhow::Result<Arc<AtomicBool>> {
                         std::thread::sleep(std::time::Duration::from_millis(3));
                     }
                 }
-                // Drop du flux de sortie PUIS remise à zéro : dans cet ordre, le
-                // callback ne peut plus écraser le 0 (pic figé = duck permanent).
-                drop(out_s);
-                PLAY_LEVEL.store(0, Ordering::Relaxed);
-                // _in_s droppé ici → la capture s'arrête aussi.
+                // streams (_in_s, _out_s) droppés ici → capture/lecture arrêtées.
             }
             Err(e) => {
                 let _ = tx.send(Err(e.to_string()));
@@ -544,7 +517,7 @@ fn start_capture_send(
         })();
 
         match setup {
-            Ok(((_in_s, out_s, in_buf, in_frame, encoder), out_rate)) => {
+            Ok(((_in_s, _out_s, in_buf, in_frame, encoder), out_rate)) => {
                 let _ = tx.send(Ok(out_rate));
                 let mut packet = vec![0u8; 4000];
                 let mut framebuf = vec![0f32; in_frame];
@@ -574,11 +547,7 @@ fn start_capture_send(
                         std::thread::sleep(std::time::Duration::from_millis(3));
                     }
                 }
-                // Drop du flux de sortie PUIS remise à zéro : dans cet ordre, le
-                // callback ne peut plus écraser le 0 (pic figé = duck permanent).
-                drop(out_s);
-                PLAY_LEVEL.store(0, Ordering::Relaxed);
-                // _in_s droppé ici → la capture s'arrête aussi.
+                // streams (_in_s, _out_s) droppés ici → capture/lecture arrêtées.
             }
             Err(e) => {
                 let _ = tx.send(Err(e.to_string()));
@@ -681,12 +650,19 @@ impl GroupCall {
         *self.flag.lock().unwrap_or_else(|e| e.into_inner()) = Some(stop);
         Ok(())
     }
-    /// Règle le volume (gain) d'un pair dans le mixage. 1.0 = normal, 0 = muet, 2.0 = ×2.
-    /// S'applique à sa voix ET à son son d'écran (deux tampons distincts).
+    /// Règle le volume (gain) de la VOIX d'un pair. 1.0 = normal, 0 = muet, 2.0 = ×2.
+    /// Le son d'écran de ce pair a son propre contrôle (`set_screen_mute`) : le curseur
+    /// de volume ne coupe donc pas le partage, et couper le partage ne coupe pas la voix.
     pub fn set_gain(&self, code: &str, gain: f32) {
         if let Ok(mut p) = self.peers.lock() {
             p.entry(code.to_string()).or_insert((1.0, VecDeque::new())).0 = gain;
-            p.entry(screen_mix_key(code)).or_insert((1.0, VecDeque::new())).0 = gain;
+        }
+    }
+    /// Coupe (ou rétablit) le SON D'ÉCRAN partagé par un pair, indépendamment de sa voix.
+    pub fn set_screen_mute(&self, code: &str, muted: bool) {
+        if let Ok(mut p) = self.peers.lock() {
+            p.entry(screen_mix_key(code)).or_insert((1.0, VecDeque::new())).0 =
+                if muted { 0.0 } else { 1.0 };
         }
     }
     pub fn set_mute(&self, on: bool) {
@@ -696,9 +672,6 @@ impl GroupCall {
         if let Some(f) = self.flag.lock().unwrap_or_else(|e| e.into_inner()).take() {
             f.store(true, Ordering::SeqCst);
         }
-        // La sortie de groupe ne publie plus rien : repartir de « silence » pour que
-        // le loopback d'écran (s'il continue) n'atténue pas sur une valeur périmée.
-        PLAY_LEVEL.store(0, Ordering::Relaxed);
     }
 }
 
@@ -716,23 +689,16 @@ fn build_group_output(
                 config,
                 move |data: &mut [$t], _: &cpal::OutputCallbackInfo| {
                     if let Ok(mut m) = peers.lock() {
-                        let mut peak = 0.0f32;
                         for chunk in data.chunks_mut(ch) {
                             let mut s = 0.0f32;
                             for (gain, buf) in m.values_mut() {
                                 s += *gain * buf.pop_front().unwrap_or(0.0);
                             }
-                            let s = s.clamp(-1.0, 1.0);
-                            if s.abs() > peak {
-                                peak = s.abs();
-                            }
-                            let v = $conv(s);
+                            let v = $conv(s.clamp(-1.0, 1.0));
                             for x in chunk.iter_mut() {
                                 *x = v;
                             }
                         }
-                        // Publie le niveau joué : anti-écho du partage d'écran (loopback).
-                        PLAY_LEVEL.store(peak.to_bits(), Ordering::Relaxed);
                     } else {
                         let z = $conv(0.0);
                         for x in data.iter_mut() {
@@ -820,7 +786,7 @@ fn start_group_capture_mix(
             Ok(((input_stream, output_stream, in_buf, in_frame, encoder), out_rate))
         })();
         match setup {
-            Ok(((_in_s, out_s, in_buf, in_frame, encoder), out_rate)) => {
+            Ok(((_in_s, _out_s, in_buf, in_frame, encoder), out_rate)) => {
                 let _ = tx.send(Ok(out_rate));
                 let mut packet = vec![0u8; 4000];
                 let mut framebuf = vec![0f32; in_frame];
@@ -852,10 +818,7 @@ fn start_group_capture_mix(
                         std::thread::sleep(std::time::Duration::from_millis(3));
                     }
                 }
-                // Drop du flux de sortie PUIS remise à zéro : dans cet ordre, le
-                // callback ne peut plus écraser le 0 (pic figé = duck permanent).
-                drop(out_s);
-                PLAY_LEVEL.store(0, Ordering::Relaxed);
+                // streams (_in_s, _out_s) droppés ici → capture/lecture arrêtées.
             }
             Err(e) => {
                 let _ = tx.send(Err(e.to_string()));
@@ -926,57 +889,22 @@ async fn receive_group_voice(
     }
 }
 
-// ===== SON D'ÉCRAN (partage) : loopback système → Opus → datagrammes du maillage =====
-
-/// Ouvre un flux LOOPBACK : un flux d'ENTRÉE construit sur un périphérique de SORTIE.
-/// WASAPI (cpal) pose AUDCLNT_STREAMFLAGS_LOOPBACK dès que le périphérique est en
-/// eRender — mais les configs à essayer sont celles de SORTIE (le mix format) :
-/// `default_input_config()`/`supported_input_configs()` sont VIDES sur une sortie.
-fn open_loopback_stream(
-    device: &cpal::Device,
-    in_buf: Arc<Mutex<VecDeque<f32>>>,
-) -> anyhow::Result<(cpal::Stream, u32)> {
-    let mut candidates: Vec<cpal::SupportedStreamConfig> = Vec::new();
-    if let Ok(def) = device.default_output_config() {
-        candidates.push(def);
-    }
-    if let Ok(list) = device.supported_output_configs() {
-        for range in list {
-            let sr = if range.min_sample_rate().0 <= 48000 && 48000 <= range.max_sample_rate().0 {
-                cpal::SampleRate(48000)
-            } else {
-                range.max_sample_rate()
-            };
-            candidates.push(range.with_sample_rate(sr));
-        }
-    }
-    let mut last = anyhow::anyhow!("aucune configuration loopback disponible");
-    for sup in candidates {
-        let fmt = sup.sample_format();
-        let config: cpal::StreamConfig = sup.into();
-        let ch = (config.channels as usize).max(1);
-        let rate = config.sample_rate.0;
-        let in_cap = (rate as usize / 50) * 50; // ~1 s de coussin max, comme le micro
-        match build_input(device, &config, fmt, in_buf.clone(), ch, in_cap) {
-            Ok(s) => return Ok((s, rate)),
-            Err(e) => last = e,
-        }
-    }
-    Err(last)
-}
+// ===== SON D'ÉCRAN (partage) : process-loopback système → Opus → datagrammes =====
 
 /// Capture du SON SYSTÈME pour le partage d'écran — repli natif : WebView2 ne capture
 /// JAMAIS l'audio d'une fenêtre partagée, seulement « Écran entier » + case cochée
 /// (MicrosoftEdge/WebView2Feedback#4327). Les trames partent taguées SCREEN_TAG aux
 /// mêmes connexions que la voix de groupe ; seuls les membres DANS l'appel de groupe
-/// les décodent (receive_group_voice).
+/// les décodent (receive_group_voice). Anti-écho À LA SOURCE : la capture exclut notre
+/// propre processus (sysaudio, process-loopback EXCLUDE), donc les voix de l'appel que
+/// ghost link joue ne sont jamais réinjectées — aucun duck nécessaire.
 #[derive(Clone, Default)]
 pub struct ScreenAudio {
     flag: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
 impl ScreenAudio {
-    /// Démarre (ou redémarre) la capture loopback vers les connexions données.
+    /// Démarre (ou redémarre) la capture système vers les connexions données.
     pub fn start(&self, conns: Vec<Connection>) -> anyhow::Result<()> {
         self.stop();
         let f = start_screen_capture(conns)?;
@@ -991,104 +919,113 @@ impl ScreenAudio {
     }
 }
 
-/// Boucle la sortie système PAR DÉFAUT (là où les autres applis — jeu, vidéo — jouent
-/// leur son, pas forcément la sortie choisie pour la voix), 20 ms → 48 kHz → Opus →
-/// diffusion SCREEN_TAG. Anti-écho : le loopback capte aussi les voix de l'appel jouées
-/// par cette machine ; quand la sortie de groupe joue (PLAY_LEVEL), la capture est
-/// ATTÉNUÉE (duck), pas annulée — et l'audio WebRTC rendu par la WebView (écran distant
-/// partagé avec son navigateur) n'est pas couvert. Limite assumée, cf. groups.ts.
+/// Seuil de silence (crête) sous lequel une trame n'est pas envoyée. Le process-loopback
+/// livre un flux CONTINU (silence compris) tant qu'une sortie est active ; sans porte,
+/// on inonderait le réseau de trames muettes. Un court maintien évite de hacher les fins.
+#[cfg(windows)]
+const SILENCE_PEAK: f32 = 1e-4;
+#[cfg(windows)]
+const SILENCE_HANG_FRAMES: u32 = 25; // 500 ms : couvre les silences courts dans un morceau
+
+/// Thread de framing : lit le tampon rempli par la capture système (mono 48 kHz),
+/// découpe en trames de 20 ms, encode en Opus et diffuse en SCREEN_TAG. La capture
+/// WASAPI (COM) tourne sur SON propre thread dans `sysaudio`.
+#[cfg(windows)]
 fn start_screen_capture(conns: Vec<Connection>) -> anyhow::Result<Arc<AtomicBool>> {
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = stop.clone();
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
-    // cpal::Stream n'est pas `Send` : on construit ET on garde le flux sur CE thread,
-    // qui exécute aussi le framing 20 ms + Opus (hors du callback audio temps réel).
-    std::thread::spawn(move || {
-        type S = (
-            cpal::Stream,
-            Arc<Mutex<VecDeque<f32>>>, // tampon de capture (mono @ rate)
-            usize,                     // trame de capture (échantillons @ rate)
-            audiopus::coder::Encoder,
-        );
-        let setup = (|| -> anyhow::Result<S> {
-            let host = cpal::default_host();
-            let device = host
-                .default_output_device()
-                .ok_or_else(|| anyhow::anyhow!("aucune sortie audio système détectée"))?;
-            let in_buf: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
-            let (stream, rate) = open_loopback_stream(&device, in_buf.clone())?;
-            let in_frame = (rate as usize) / 50;
-            let encoder = new_screen_encoder()?;
-            stream.play()?;
-            Ok((stream, in_buf, in_frame, encoder))
-        })();
+    // Thread A : capture système (process-loopback EXCLUDE self), remplit `sink`.
+    let sink: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let sink_cap = 48_000; // ~1 s de coussin
+    {
+        let stop = stop.clone();
+        let sink = sink.clone();
+        std::thread::spawn(move || {
+            crate::sysaudio::capture_excluding_self(stop, ready_tx, sink, sink_cap);
+        });
+    }
 
-        match setup {
-            Ok((_s, in_buf, in_frame, encoder)) => {
-                let _ = tx.send(Ok(()));
-                let mut packet = vec![0u8; 4000];
-                let mut framebuf = vec![0f32; in_frame];
-                let mut duck_hold = 0u32;
-                while !stop_thread.load(Ordering::SeqCst) {
-                    let got = if let Ok(mut q) = in_buf.lock() {
-                        if q.len() >= in_frame {
-                            for x in framebuf.iter_mut() {
-                                *x = q.pop_front().unwrap_or(0.0);
-                            }
-                            true
-                        } else {
-                            false
+    // Thread B : framing + Opus + envoi. Démarré seulement si la capture s'est lancée.
+    let sink_b = sink.clone();
+    let stop_b = stop.clone();
+    let start_framing = move || {
+        std::thread::spawn(move || {
+            let encoder = match new_screen_encoder() {
+                Ok(e) => e,
+                // Sans ça, le thread B meurt mais le thread A de capture continuerait
+                // de tourner (CPU) sans que rien ne soit émis — échec silencieux.
+                Err(_) => {
+                    stop_b.store(true, Ordering::SeqCst);
+                    return;
+                }
+            };
+            let in_frame = OPUS_FRAME; // 48 kHz déjà : 960 échantillons = 20 ms
+            let mut packet = vec![0u8; 4000];
+            let mut framebuf = vec![0f32; in_frame];
+            let mut hang = 0u32;
+            while !stop_b.load(Ordering::SeqCst) {
+                let got = if let Ok(mut q) = sink_b.lock() {
+                    if q.len() >= in_frame {
+                        for x in framebuf.iter_mut() {
+                            *x = q.pop_front().unwrap_or(0.0);
                         }
+                        true
                     } else {
                         false
-                    };
-                    if got {
-                        // Duck : voix distantes en cours de lecture → atténuer la capture,
-                        // avec un maintien pour couvrir la latence du loopback WASAPI.
-                        if f32::from_bits(PLAY_LEVEL.load(Ordering::Relaxed)) > DUCK_THRESHOLD {
-                            duck_hold = DUCK_HOLD_FRAMES;
-                        }
-                        if duck_hold > 0 {
-                            duck_hold -= 1;
-                            for x in framebuf.iter_mut() {
-                                *x *= DUCK_GAIN;
-                            }
-                        }
-                        let frame48 = resample_block(&framebuf, OPUS_FRAME);
-                        if let Ok(n) = encoder.encode_float(&frame48, &mut packet[1..]) {
-                            packet[0] = SCREEN_TAG;
-                            let dg = bytes::Bytes::copy_from_slice(&packet[..1 + n]);
-                            for c in &conns {
-                                let _ = c.send_datagram(dg.clone());
-                            }
-                        }
-                    } else {
-                        // NB : WASAPI loopback ne livre des échantillons QUE si quelque chose
-                        // joue sur le périphérique — silence total = pas de datagrammes (voulu).
-                        std::thread::sleep(std::time::Duration::from_millis(3));
+                    }
+                } else {
+                    false
+                };
+                if !got {
+                    std::thread::sleep(std::time::Duration::from_millis(3));
+                    continue;
+                }
+                // Porte de silence : ne transmettre que si la trame porte du signal
+                // (ou juste après, pour ne pas couper les fins de sons).
+                let peak = framebuf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+                if peak >= SILENCE_PEAK {
+                    hang = SILENCE_HANG_FRAMES;
+                } else if hang > 0 {
+                    hang -= 1;
+                } else {
+                    continue; // silence prolongé : rien à envoyer
+                }
+                if let Ok(n) = encoder.encode_float(&framebuf, &mut packet[1..]) {
+                    packet[0] = SCREEN_TAG;
+                    let dg = bytes::Bytes::copy_from_slice(&packet[..1 + n]);
+                    for c in &conns {
+                        let _ = c.send_datagram(dg.clone());
                     }
                 }
-                // stream (_s) droppé ici → capture loopback arrêtée.
             }
-            Err(e) => {
-                let _ = tx.send(Err(e.to_string()));
-            }
-        }
-    });
+        });
+    };
 
-    // recv_timeout et non recv : si un appel WASAPI gèle (pilote défaillant,
-    // périphérique en mode exclusif) sans erreur ni panic, un recv() infini
-    // bloquerait la commande Tauri pour toujours. En cas de timeout on condamne
-    // aussi le thread : s'il finit par démarrer, il s'arrête aussitôt.
-    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(Ok(())) => Ok(stop),
-        Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+    // recv_timeout : si l'activation WASAPI gèle, ne pas bloquer la commande Tauri.
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(())) => {
+            start_framing();
+            Ok(stop)
+        }
+        Ok(Err(e)) => {
+            stop.store(true, Ordering::SeqCst);
+            Err(anyhow::anyhow!(e))
+        }
         Err(_) => {
             stop.store(true, Ordering::SeqCst);
             Err(anyhow::anyhow!(
-                "démarrage de la capture du son système impossible (périphérique audio bloqué ?)"
+                "démarrage de la capture du son système impossible (pilote audio bloqué ?)"
             ))
         }
     }
+}
+
+/// Hors Windows, la capture « process loopback » n'existe pas : échec propre (l'UI le
+/// signale, l'app ne compile pas moins).
+#[cfg(not(windows))]
+fn start_screen_capture(_conns: Vec<Connection>) -> anyhow::Result<Arc<AtomicBool>> {
+    Err(anyhow::anyhow!(
+        "capture du son système non disponible sur cette plateforme"
+    ))
 }
