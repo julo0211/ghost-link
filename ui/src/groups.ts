@@ -304,6 +304,9 @@ let retryVideoOnly = false;
 // donc sans ce drapeau un double-clic sur 🖥️ Écran lancerait deux sélecteurs et le
 // premier flux fuirait (diffusé aux pairs, inarrêtable depuis l'UI).
 let screenBusy = false;
+// L'encodeur MATÉRIEL H.264 est confirmé actif → le partage a été remonté en 1080p.
+// Jamais posé sur encodeur logiciel (le 1080p logiciel ramènerait le plancher 3 fps).
+let screenUpgraded = false;
 function vgrid(): any {
   return $("#groupVideos");
 }
@@ -436,7 +439,10 @@ function tuneVideoSender(pc: RTCPeerConnection, track: MediaStreamTrack): void {
     const p = sender.getParameters();
     if (!p.encodings || !p.encodings.length) p.encodings = [{}];
     p.encodings[0].maxFramerate = 30;
-    p.encodings[0].maxBitrate = isScreen ? 3_000_000 : 5_000_000;
+    // Écran : 3 Mb/s en 720p (base), 4,5 Mb/s une fois remonté en 1080p sur
+    // encodeur matériel confirmé (VID-6) — sinon une renégociation écraserait
+    // le débit relevé par maybeUpgradeScreen.
+    p.encodings[0].maxBitrate = isScreen ? (screenUpgraded ? 4_500_000 : 3_000_000) : 5_000_000;
     (p as RTCRtpSendParameters & { degradationPreference?: string }).degradationPreference =
       isScreen ? "maintain-resolution" : "maintain-framerate";
     // Échec visible en DevTools : un setParameters avalé en silence peut masquer des
@@ -454,6 +460,176 @@ function retuneSenders(pc: RTCPeerConnection): void {
     if (se.track) tuneVideoSender(pc, se.track);
   });
 }
+// VID-6 : préférer H.264 sur chaque transceiver vidéo. Chromium n'encode VP8/VP9
+// qu'en LOGICIEL (libvpx, un cœur CPU saturé = tout l'historique yo-yo/3 fps),
+// alors que H.264 passe par l'encodeur MATÉRIEL du GPU (Media Foundation :
+// NVENC/AMF/QuickSync). Les deux extrémités sont le même moteur WebView2 → le
+// décodage H.264 est garanti. À appeler côté offreur (avant la négociation) ET
+// côté répondeur (ontrack, avant l'answer — c'est l'ordre de l'ANSWER qui gagne).
+function preferH264(tr: RTCRtpTransceiver): void {
+  try {
+    // receiver.track existe toujours (même sans média) et porte le kind du
+    // transceiver : ne toucher QUE la vidéo (poser des codecs vidéo sur un
+    // transceiver AUDIO — piste audio navigateur du partage — serait rejeté).
+    if (!tr.receiver.track || tr.receiver.track.kind !== "video") return;
+    // Caps du RÉCEPTEUR : depuis Chromium M124, setCodecPreferences valide la liste
+    // contre RTCRtpReceiver.getCapabilities — une liste bâtie sur les caps du sender
+    // peut contenir un codec inconnu du receiver et tout rejeter (silencieusement ici).
+    const caps = RTCRtpReceiver.getCapabilities("video");
+    if (!caps || !caps.codecs.length) return;
+    const isH264 = (c: RTCRtpCodec) => /h264/i.test(c.mimeType);
+    const h264 = caps.codecs.filter(isH264);
+    if (!h264.length) return; // pas de H.264 sur ce moteur : négociation par défaut
+    // packetization-mode=1 d'abord (le profil le plus largement accéléré).
+    h264.sort(
+      (a, b) =>
+        Number(/packetization-mode=1/.test(b.sdpFmtpLine || "")) -
+        Number(/packetization-mode=1/.test(a.sdpFmtpLine || "")),
+    );
+    tr.setCodecPreferences([...h264, ...caps.codecs.filter((c) => !isH264(c))]);
+  } catch {
+    /* transceiver arrêté ou API absente : la négociation par défaut s'applique */
+  }
+}
+// ---- VID-6 : montée adaptative 720p → 1080p sur encodeur matériel CONFIRMÉ ----
+// En maillage, CHAQUE RTCPeerConnection a son propre encodeur pour le même track :
+// la décision d'upgrade doit être UNANIME (un seul pair en logiciel prendrait du
+// 1080p logiciel = retour du plancher 3-5 fps). Liste BLANCHE matérielle : tout nom
+// inconnu est traité comme logiciel (mode d'échec conservateur = rester en 720p).
+const HW_ENCODER = /MediaFoundation|ExternalEncoder|VideoToolbox|NVENC|QSV|AMF|VAAPI|HardwareVideoEncoder/i;
+let screenEncoderChecked = false; // verdict « logiciel » mémorisé pour CE partage
+let screenCheckBusy = false; // une seule chaîne de vérification à la fois
+let screenWatchdog: number | null = null;
+
+/// Le sender VIDÉO du partage d'écran sur un pc (jamais l'audio : la piste audio
+/// navigateur arrive AVANT la vidéo dans getTracks() et n'a pas d'encoderImplementation).
+function screenVideoSenderOf(pc: RTCPeerConnection): RTCRtpSender | undefined {
+  return pc
+    .getSenders()
+    .find(
+      (se) =>
+        se.track && se.track.kind === "video" && S.localScreen && S.localScreen.getTracks().includes(se.track),
+    );
+}
+
+/// encoderImplementation de l'encodeur écran d'UN pc ("" = pas encore disponible).
+async function screenEncoderImpl(pc: RTCPeerConnection): Promise<string> {
+  const sender = screenVideoSenderOf(pc);
+  if (!sender) return "";
+  try {
+    const stats = await sender.getStats();
+    let impl = "";
+    stats.forEach((r) => {
+      const o = r as unknown as { type?: string; encoderImplementation?: string };
+      if (o.type === "outbound-rtp" && o.encoderImplementation) impl = o.encoderImplementation;
+    });
+    return impl;
+  } catch {
+    return "";
+  }
+}
+
+function applyScreenBitrate(bps: number): void {
+  Object.values(S.pcs).forEach((st) => {
+    const se = screenVideoSenderOf(st.pc);
+    if (!se) return;
+    try {
+      const p = se.getParameters();
+      if (p.encodings && p.encodings.length) {
+        p.encodings[0].maxBitrate = bps;
+        void se.setParameters(p).catch((err) => console.warn("setParameters:", err));
+      }
+    } catch (err) {
+      console.warn("bitrate écran:", err);
+    }
+  });
+}
+
+// Vérifie quel encodeur tourne VRAIMENT (stats WebRTC) sur TOUS les pairs : upgrade
+// seulement à l'unanimité matérielle. Ré-essaie quelques fois : encoderImplementation
+// n'apparaît qu'après les premières trames encodées.
+function maybeUpgradeScreen(attempt = 0): void {
+  if (screenUpgraded || screenEncoderChecked || screenCheckBusy || attempt > 3 || !S.localScreen) return;
+  const track = S.localScreen.getVideoTracks()[0];
+  if (!track) return;
+  screenCheckBusy = true;
+  setTimeout(async () => {
+    try {
+      if (screenUpgraded || screenEncoderChecked || !S.localScreen || !S.localScreen.getVideoTracks().includes(track)) return;
+      const pcs = Object.values(S.pcs)
+        .map((st) => st.pc)
+        .filter((pc) => screenVideoSenderOf(pc));
+      if (!pcs.length) return; // pas encore de sender écran : un prochain « stable » relancera
+      const impls = await Promise.all(pcs.map(screenEncoderImpl));
+      if (impls.some((i) => !i || /unknown/i.test(i))) {
+        screenCheckBusy = false;
+        maybeUpgradeScreen(attempt + 1); // au moins un pair n'a pas encore de stats
+        return;
+      }
+      const soft = impls.find((i) => !HW_ENCODER.test(i));
+      if (soft !== undefined) {
+        screenEncoderChecked = true; // verdict pour CE partage : ne plus re-vérifier ni re-logger
+        log("ℹ️ Encodeur logiciel détecté (" + soft + ") — le partage reste en 720p30.");
+        return;
+      }
+      // Re-vérification de vie APRÈS les await : le partage a pu s'arrêter entre-temps.
+      if (screenUpgraded || !S.localScreen || !S.localScreen.getVideoTracks().includes(track)) return;
+      screenUpgraded = true;
+      try {
+        await track.applyConstraints({
+          width: { max: 1920 },
+          height: { max: 1080 },
+          frameRate: { ideal: 30, max: 30 },
+        });
+      } catch {
+        screenUpgraded = false;
+        return;
+      }
+      applyScreenBitrate(4_500_000);
+      log("🎮 Encodeur matériel confirmé sur tous les pairs — partage remonté en 1080p30.");
+      armScreenWatchdog(track);
+    } finally {
+      screenCheckBusy = false;
+    }
+  }, 2500 + attempt * 3000);
+}
+
+// Après l'upgrade : re-vérification périodique. libwebrtc peut retomber en LOGICIEL
+// en cours de flux (échec Media Foundation, sessions GPU épuisées — y compris à cause
+// de la reconfiguration 1080p elle-même) sans AUCUN événement JS ; et un pair qui
+// REJOINT après l'upgrade peut n'obtenir qu'un encodeur logiciel. Dans les deux cas :
+// redescendre en 720p30 et ne plus retenter pour ce partage.
+function armScreenWatchdog(track: MediaStreamTrack): void {
+  disarmScreenWatchdog();
+  screenWatchdog = window.setInterval(async () => {
+    if (!screenUpgraded || !S.localScreen || !S.localScreen.getVideoTracks().includes(track)) {
+      disarmScreenWatchdog();
+      return;
+    }
+    const pcs = Object.values(S.pcs)
+      .map((st) => st.pc)
+      .filter((pc) => screenVideoSenderOf(pc));
+    const impls = await Promise.all(pcs.map(screenEncoderImpl));
+    const bad = impls.find((i) => i && !/unknown/i.test(i) && !HW_ENCODER.test(i));
+    if (bad === undefined) return;
+    screenUpgraded = false;
+    screenEncoderChecked = true;
+    disarmScreenWatchdog();
+    try {
+      await track.applyConstraints({ width: { max: 1280 }, height: { max: 720 }, frameRate: { ideal: 30, max: 30 } });
+    } catch {
+      /* le track a pu se terminer : rien à faire */
+    }
+    applyScreenBitrate(3_000_000);
+    log("ℹ️ Encodeur logiciel apparu (" + bad + ") — partage redescendu en 720p30.");
+  }, 12_000);
+}
+function disarmScreenWatchdog(): void {
+  if (screenWatchdog != null) {
+    clearInterval(screenWatchdog);
+    screenWatchdog = null;
+  }
+}
 function getPc(peer: string) {
   if (S.pcs[peer]) return S.pcs[peer];
   const pc = new RTCPeerConnection(iceConfig());
@@ -469,6 +645,7 @@ function getPc(peer: string) {
       }
     }),
   );
+  pc.getTransceivers().forEach(preferH264); // AVANT la 1re négociation (VID-6)
   pc.onnegotiationneeded = async () => {
     try {
       st.makingOffer = true;
@@ -484,6 +661,9 @@ function getPc(peer: string) {
     if (ev.candidate) sigSend(peer, { candidate: ev.candidate });
   };
   pc.ontrack = (ev) => {
+    // Côté répondeur : ontrack arrive pendant setRemoteDescription, AVANT l'answer —
+    // c'est le bon moment pour imposer H.264 (l'ordre de l'answer fait foi).
+    if (ev.transceiver) preferH264(ev.transceiver);
     const stream = ev.streams[0];
     if (!stream) return;
     const key = peer + "_" + stream.id; // une vignette par flux (cam ET écran)
@@ -508,7 +688,7 @@ function ensureGroupPcs(): void {
   if (g) g.members.forEach((code) => getPc(code));
 }
 function addStreamToPcs(stream: MediaStream): void {
-  Object.values(S.pcs).forEach((st) =>
+  Object.values(S.pcs).forEach((st) => {
     stream.getTracks().forEach((t) => {
       if (!st.pc.getSenders().some((se) => se.track === t)) {
         try {
@@ -518,7 +698,9 @@ function addStreamToPcs(stream: MediaStream): void {
           /* ignore */
         }
       }
-    }),
+    });
+    st.pc.getTransceivers().forEach(preferH264); // les nouveaux transceivers (VID-6)
+  }
   );
 }
 function removeStreamFromPcs(stream: MediaStream): void {
@@ -603,14 +785,16 @@ async function startScreen(): Promise<void> {
   }
   screenBusy = true;
   try {
-    // VID-5 : capture plafonnée à 720p/30 (était 1080p). Avec le profil écran
-    // « detail » + maintain-resolution (anti yo-yo), la résolution ne cède plus
-    // JAMAIS : en 1080p logiciel, dès que débit/CPU ne suivaient pas, tout se payait
-    // en images/s — plancher screencast VP9 à ~3-5 fps constaté en test réel (bug
-    // WebRTC 42223195). En 720p, 3 Mb/s tient 30 fps ET la lisibilité. getDisplayMedia
-    // n'accepte que des bornes max (min/exact = TypeError) ; Chromium réduit l'image
-    // à la volée en gardant les proportions.
+    // VID-5 : capture DÉMARRE à 720p/30 — c'est la base sûre pour l'encodeur
+    // LOGICIEL (en 1080p logiciel, plancher screencast VP9 à ~3-5 fps constaté en
+    // test réel, bug WebRTC 42223195). VID-6 : une fois l'encodeur MATÉRIEL H.264
+    // confirmé par les stats (maybeUpgradeScreen), le track est remonté à 1080p30
+    // via applyConstraints. getDisplayMedia n'accepte que des bornes max
+    // (min/exact = TypeError) ; Chromium redimensionne en gardant les proportions.
     const vconf = { width: { max: 1280 }, height: { max: 720 }, frameRate: { ideal: 30, max: 30 } };
+    screenUpgraded = false;
+    screenEncoderChecked = false;
+    disarmScreenWatchdog();
     // Son : on demande TOUJOURS l'audio — la case « Partager l'audio » du sélecteur est
     // la SEULE source de vérité (l'ancien confirm() bloquant ici pouvait faire expirer
     // l'activation utilisateur et getDisplayMedia rejetait InvalidStateError sans même
@@ -741,6 +925,9 @@ function stopCam(): void {
   $("#btnGroupCam").textContent = "📹 Caméra";
 }
 function stopScreen(): void {
+  screenUpgraded = false; // le prochain partage repart en 720p jusqu'à confirmation
+  screenEncoderChecked = false;
+  disarmScreenWatchdog();
   if (screenAudioNative) {
     screenAudioNative = false;
     invoke("screen_audio_stop").catch(() => {});
@@ -950,7 +1137,10 @@ export function initGroups(): void {
           await pc.setLocalDescription();
           sigSend(peer, { description: pc.localDescription });
         }
-        if (pc.signalingState === "stable") retuneSenders(pc);
+        if (pc.signalingState === "stable") {
+          retuneSenders(pc);
+          maybeUpgradeScreen(); // unanimité matérielle → 1080p (VID-6)
+        }
       } else if (msg.candidate) {
         try {
           await pc.addIceCandidate(msg.candidate);
