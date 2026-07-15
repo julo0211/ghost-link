@@ -98,47 +98,8 @@ function initUpdates(): void {
 }
 
 // ===== Réglages (engrenage ⚙️) =====
-/// Liste des moniteurs pour le partage natif — rafraîchie à chaque ouverture des
-/// Réglages (un écran peut être branché/débranché entre deux partages).
-async function refreshMonitors(): Promise<void> {
-  const sel = $<HTMLSelectElement>("#setNativeMonitor");
-  try {
-    const mons = await invoke("video_list_monitors");
-    // On mémorise le szDevice STABLE ("\\.\DISPLAYn"), pas l'index d'énumération :
-    // brancher/débrancher un autre écran ne fait plus pointer sur le mauvais.
-    const saved = localStorage.getItem("ghostlink_native_monitor") ?? "";
-    sel.replaceChildren();
-    const auto = document.createElement("option");
-    auto.value = "";
-    auto.textContent = "Écran principal (auto)";
-    sel.appendChild(auto);
-    mons.forEach((m) => {
-      const o = document.createElement("option");
-      o.value = m.id;
-      o.textContent = m.name + " — " + m.w + "×" + m.h + (m.primary ? " (principal)" : "");
-      sel.appendChild(o);
-    });
-    // Écran mémorisé absent (débranché) : afficher « auto » SANS écraser la
-    // préférence — elle reste valable au retour, et Rust replie de toute façon au
-    // moment du partage. Effacer ici serait une perte définitive et silencieuse.
-    sel.value = saved;
-    if (saved !== "" && sel.value !== saved) {
-      sel.value = "";
-      const opt = document.createElement("option");
-      opt.value = saved;
-      opt.textContent = "Écran mémorisé (actuellement absent)";
-      sel.appendChild(opt);
-      sel.value = saved;
-    }
-  } catch {
-    /* commande indisponible : le select garde « Écran principal (auto) » */
-  }
-}
 function initSettings(): void {
-  $("#btnSettings").onclick = () => {
-    $("#settingsWrap").classList.toggle("hidden");
-    void refreshMonitors();
-  };
+  $("#btnSettings").onclick = () => $("#settingsWrap").classList.toggle("hidden");
   $("#btnCloseSettings").onclick = () => $("#settingsWrap").classList.add("hidden");
   $("#btnSaveName").onclick = () => {
     localStorage.setItem("ghostlink_name", $<HTMLInputElement>("#setName").value.trim());
@@ -175,12 +136,6 @@ function initSettings(): void {
     log(on
       ? "🧪 Partage d'écran natif activé (appliqué au prochain partage) — sans WebRTC/STUN."
       : "Partage d'écran natif désactivé — retour au partage WebRTC.");
-  };
-  // Moniteur du partage natif ("" = écran principal), appliqué au PROCHAIN partage.
-  $<HTMLSelectElement>("#setNativeMonitor").onchange = () => {
-    const v = $<HTMLSelectElement>("#setNativeMonitor").value;
-    localStorage.setItem("ghostlink_native_monitor", v);
-    log("Écran du partage natif : " + ($<HTMLSelectElement>("#setNativeMonitor").selectedOptions[0]?.textContent || "principal") + " (au prochain partage).");
   };
   $<HTMLSelectElement>("#setStreams").value = localStorage.getItem("ghostlink_streams") ?? "4";
   $<HTMLSelectElement>("#setStreams").onchange = () => {
@@ -279,7 +234,7 @@ setTimeout(
 );
 // Tampon de build du FRONTEND. Si « UI » diverge de la version Rust (app_version),
 // c'est que la WebView sert un ancien frontend en cache (et non le code compilé).
-const UI_BUILD = "0.32.0";
+const UI_BUILD = "0.33.0";
 invoke("app_version")
   .then((v) => {
     $("#appVer").textContent = v + " · UI " + UI_BUILD;

@@ -47,6 +47,8 @@ const GKIND_SIGNAL: u8 = 4; // signalisation WebRTC (vidéo) pair-à-pair
 const GKIND_GFILE: u8 = 5; // fichier diffusé dans le groupe (flux de contrôle)
 const GKIND_GFDATA: u8 = 6; // flux de données d'un fichier de groupe (multi-flux)
 pub const GKIND_VIDEO: u8 = 7; // partage d'écran NATIF (H.264 sur flux uni, video.rs)
+const GKIND_GMEMBERS: u8 = 8; // sync de roster de groupe (ajout de membres → union)
+const GKIND_KICK: u8 = 9; // un vote d'exclusion (vote-kick décentralisé)
 /// Taille maximale d'UNE image H.264 reçue (une keyframe 1440p à 12 Mb/s fait ~1-2 Mo) :
 /// borne les allocations pilotées par le réseau (même famille de garde que GL-1).
 const VIDEO_FRAME_MAX: usize = 8 * 1024 * 1024;
@@ -722,6 +724,24 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, video_rx:
                         if let Ok(data) = read_lp32(&mut recv).await {
                             let _ = a.emit("ghost-signal", serde_json::json!({ "from": from, "data": data }));
                         }
+                    } else if kind[0] == GKIND_GMEMBERS {
+                        // Sync de roster : un membre a ajouté des gens → l'UI fait l'union.
+                        if let (Ok(gid), Ok(name), Ok(members)) = (
+                            read_lp16(&mut recv).await,
+                            read_lp16(&mut recv).await,
+                            read_lp32(&mut recv).await,
+                        ) {
+                            let _ = a.emit("ghost-gmembers", serde_json::json!({ "group": gid, "name": name, "members": members, "from": from }));
+                        }
+                    } else if kind[0] == GKIND_KICK {
+                        // Un vote d'exclusion : [gid][cible][votant]. L'UI tallie et applique.
+                        if let (Ok(gid), Ok(target), Ok(voter)) = (
+                            read_lp16(&mut recv).await,
+                            read_lp16(&mut recv).await,
+                            read_lp16(&mut recv).await,
+                        ) {
+                            let _ = a.emit("ghost-kick", serde_json::json!({ "group": gid, "target": target, "voter": voter, "from": from }));
+                        }
                     } else if kind[0] == GKIND_GFILE {
                         let _ = recv_gfile(&a, &settings, &from, &mut send, &mut recv, &inbounds).await;
                     } else if kind[0] == GKIND_GFDATA {
@@ -908,6 +928,63 @@ pub async fn send_gchat(
             let _ = write_lp16(&mut send, gid).await;
             let _ = write_lp16(&mut send, author).await;
             let _ = write_lp32(&mut send, text).await;
+            let _ = send.finish();
+        }
+    }
+    Ok(())
+}
+
+/// Diffuse le roster à jour d'un groupe aux membres présents (ajout de membres → ils
+/// font l'union). `roster` = CSV de TOUS les membres (le nouvel état). Best-effort :
+/// un membre hors ligne rattrapera à une rediffusion ultérieure.
+pub async fn send_gmembers(
+    net: &Net,
+    members: Vec<String>,
+    gid: &str,
+    name: &str,
+    roster: &str,
+) -> anyhow::Result<()> {
+    let targets: Vec<Connection> = {
+        let m = net.mesh.lock().unwrap_or_else(|e| e.into_inner());
+        members
+            .iter()
+            .filter_map(|code| m.get(code.trim()).map(|(_, c)| c.clone()))
+            .collect()
+    };
+    for conn in targets {
+        if let Ok((mut send, _recv)) = conn.open_bi().await {
+            let _ = send.write_all(&[GKIND_GMEMBERS]).await;
+            let _ = write_lp16(&mut send, gid).await;
+            let _ = write_lp16(&mut send, name).await;
+            let _ = write_lp32(&mut send, roster).await;
+            let _ = send.finish();
+        }
+    }
+    Ok(())
+}
+
+/// Diffuse MON vote d'exclusion de `target` aux membres du groupe en ligne. Chaque
+/// client tallie de son côté ; le quorum (60 % des en-ligne) déclenche le retrait.
+pub async fn send_kick(
+    net: &Net,
+    members: Vec<String>,
+    gid: &str,
+    target: &str,
+    voter: &str,
+) -> anyhow::Result<()> {
+    let targets: Vec<Connection> = {
+        let m = net.mesh.lock().unwrap_or_else(|e| e.into_inner());
+        members
+            .iter()
+            .filter_map(|code| m.get(code.trim()).map(|(_, c)| c.clone()))
+            .collect()
+    };
+    for conn in targets {
+        if let Ok((mut send, _recv)) = conn.open_bi().await {
+            let _ = send.write_all(&[GKIND_KICK]).await;
+            let _ = write_lp16(&mut send, gid).await;
+            let _ = write_lp16(&mut send, target).await;
+            let _ = write_lp16(&mut send, voter).await;
             let _ = send.finish();
         }
     }

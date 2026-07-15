@@ -62,6 +62,13 @@ function renderGroupMembers(g) {
     const chip = (code, label, online, self) => {
         const c = document.createElement("div");
         c.className = "mem";
+        c.dataset.code = self ? "me" : code; // cible des mises à jour d'activité vocale
+        // État initial d'activité — seulement si CE groupe est celui de mon appel.
+        const act = S.inGroupCall && S.groupCallId === g.id ? S.voiceAct[self ? "me" : code] : undefined;
+        if (act?.inCall)
+            c.classList.add("incall");
+        if (act?.speaking)
+            c.classList.add("speaking");
         const d = document.createElement("span");
         d.className = online ? "dot on" : "dot";
         const t = document.createElement("span");
@@ -69,6 +76,19 @@ function renderGroupMembers(g) {
         t.textContent = label;
         c.appendChild(d);
         c.appendChild(t);
+        if (!self) {
+            // Vote d'exclusion (60 % des en-ligne). Discret, apparaît au survol du chip.
+            const kick = document.createElement("button");
+            kick.className = "memkick";
+            kick.type = "button";
+            kick.textContent = "🚫";
+            kick.title = "Voter pour exclure ce membre";
+            kick.onclick = (e) => {
+                e.stopPropagation();
+                castKick(g, code);
+            };
+            c.appendChild(kick);
+        }
         if (callActive && !self) {
             const r = document.createElement("input");
             r.type = "range";
@@ -128,6 +148,164 @@ export function renderGroupFriends() {
         box.appendChild(lab);
     });
 }
+// ----- Vote-kick décentralisé (≥ 60 % des membres EN LIGNE) -----
+// Un mesh sans serveur ne peut pas EXPULSER de force : chaque client tallie les votes
+// qu'il reçoit et, au quorum, retire la cible de SA liste + la met en liste noire de
+// groupe (pour qu'une sync de roster ne la ré-ajoute pas). Advisory : un client
+// malveillant peut s'ignorer, mais les honnêtes le lâchent.
+const KICK_TTL = 5 * 60 * 1000; // votes périmés après 5 min
+function kickKey(gid, target) {
+    return gid + "|" + target;
+}
+function kickedSet(gid) {
+    try {
+        const m = JSON.parse(localStorage.getItem("ghostlink_kicked") || "{}");
+        return new Set(m[gid] || []);
+    }
+    catch {
+        return new Set();
+    }
+}
+function saveKicked(gid, codes) {
+    let m = {};
+    try {
+        m = JSON.parse(localStorage.getItem("ghostlink_kicked") || "{}");
+    }
+    catch {
+        /* repart d'un objet vide */
+    }
+    if (codes.size)
+        m[gid] = Array.from(codes);
+    else
+        delete m[gid];
+    localStorage.setItem("ghostlink_kicked", JSON.stringify(m));
+}
+function onlineMemberCount(g) {
+    return 1 + g.members.filter((c) => S.meshOnline.has(c)).length; // + moi
+}
+function kickQuorum(g) {
+    // 60 % des en-ligne, plancher à 2 (jamais d'exclusion « solo »).
+    return Math.max(2, Math.ceil(0.6 * onlineMemberCount(g)));
+}
+function recordKickVote(gid, target, voter) {
+    const key = kickKey(gid, target);
+    const now = Date.now();
+    const votes = (S.kickVotes[key] = S.kickVotes[key] || {});
+    votes[voter] = now;
+    for (const v of Object.keys(votes))
+        if (now - votes[v] > KICK_TTL)
+            delete votes[v];
+    return Object.keys(votes).length;
+}
+function applyKick(g, target) {
+    const groups = loadGroups();
+    const gi = groups.find((x) => x.id === g.id);
+    if (!gi || !gi.members.includes(target))
+        return;
+    gi.members = gi.members.filter((c) => c !== target);
+    saveGroups(groups);
+    const s = kickedSet(g.id);
+    s.add(target);
+    saveKicked(g.id, s);
+    delete S.kickVotes[kickKey(g.id, target)];
+    renderGroups();
+    if (S.openGroupId === g.id)
+        refreshGroupCounts();
+    log("🚫 " + memberName(target) + " exclu du groupe « " + g.name + " » (vote atteint).");
+}
+function tallyKick(g, target) {
+    const n = Object.keys(S.kickVotes[kickKey(g.id, target)] || {}).length;
+    const q = kickQuorum(g);
+    if (n >= q) {
+        if (target === S.myCode) {
+            // C'est MOI qui suis exclu : quitter le groupe et le dire (sinon je resterais
+            // dedans à envoyer/recevoir sans que personne ne me voie).
+            leaveGroupSelf(g, "🚫 Tu as été exclu du groupe « " + g.name + " » (vote des membres).");
+        }
+        else {
+            applyKick(g, target);
+        }
+    }
+    else if (S.openGroupId === g.id) {
+        log("🗳️ Exclure " + memberName(target) + " : " + n + "/" + q + " votes.");
+    }
+}
+/// Je quitte le groupe (exclu par vote) : arrêt d'appel/partage, retrait local, message.
+function leaveGroupSelf(g, msg) {
+    if (S.inGroupCall && S.groupCallId === g.id)
+        stopGroupCall();
+    const groups = loadGroups().filter((x) => x.id !== g.id);
+    saveGroups(groups);
+    delete S.kickVotes[kickKey(g.id, S.myCode)];
+    if (S.openGroupId === g.id)
+        closeGroup();
+    renderGroups();
+    log(msg);
+}
+function castKick(g, target) {
+    if (!S.myCode || target === S.myCode || !g.members.includes(target))
+        return;
+    if (!confirm("Voter pour exclure " + memberName(target) + " du groupe « " + g.name + " » ?"))
+        return;
+    recordKickVote(g.id, target, S.myCode);
+    invoke("send_kick", { members: g.members, gid: g.id, target, voter: S.myCode }).catch(() => { });
+    tallyKick(g, target);
+}
+// ----- Ajouter des membres à un groupe existant -----
+function renderAddMembersFriends(g) {
+    const box = $("#addMembersFriends");
+    box.replaceChildren();
+    const inGroup = new Set([S.myCode, ...g.members]);
+    const cand = loadFriends().filter((f) => f.code && !inGroup.has(f.code));
+    if (!cand.length) {
+        const s = document.createElement("span");
+        s.className = "hint";
+        s.textContent = "Tous tes amis sont déjà dans ce groupe.";
+        box.appendChild(s);
+        return;
+    }
+    cand.forEach((f) => {
+        const lab = document.createElement("label");
+        lab.className = "row";
+        lab.style.cssText = "gap:6px;cursor:pointer;flex:0 0 auto";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.value = f.code;
+        cb.style.cssText = "width:auto;flex:0 0 auto";
+        const sp = document.createElement("span");
+        sp.style.fontSize = "13px";
+        sp.textContent = f.name;
+        lab.appendChild(cb);
+        lab.appendChild(sp);
+        box.appendChild(lab);
+    });
+}
+function addMembersToGroup(g, newCodes) {
+    if (!newCodes.length || !S.myCode)
+        return;
+    const groups = loadGroups();
+    const gi = groups.find((x) => x.id === g.id);
+    if (!gi)
+        return;
+    // Ré-ajout explicite : lever la liste noire pour ces personnes (ré-invitation).
+    const kset = kickedSet(g.id);
+    newCodes.forEach((c) => kset.delete(c));
+    saveKicked(g.id, kset);
+    gi.members = Array.from(new Set([...gi.members, ...newCodes])).filter((c) => c && c !== S.myCode);
+    saveGroups(groups);
+    const rosterCsv = [S.myCode, ...gi.members].join(",");
+    // Les NOUVEAUX : invitation (bannière chez eux) + mise en attente si hors ligne.
+    newCodes.forEach((code) => {
+        addPInv(code, g.id, g.name, rosterCsv);
+        invoke("send_ginvite", { member: code, gid: g.id, name: g.name, members: rosterCsv }).catch(() => { });
+    });
+    // Les membres DÉJÀ présents : sync du roster (ils font l'union).
+    invoke("send_gmembers", { members: gi.members, gid: g.id, name: g.name, roster: rosterCsv }).catch(() => { });
+    invoke("open_group", { members: friendsOnly(gi.members) }).catch(() => { });
+    renderGroups();
+    refreshGroupCounts();
+    log("➕ " + newCodes.length + " membre(s) ajouté(s) au groupe « " + g.name + " ».");
+}
 export function renderGroups() {
     const box = $("#groupList");
     if (!box)
@@ -183,6 +361,7 @@ function openGroup(id, skipDial) {
     renderGroupMembers(g);
     renderGroups(); // BUG : déplacer le surlignage « actif » vers le groupe ouvert (sinon il reste collé au 1er).
     $("#groupChannelCard").classList.remove("hidden");
+    $("#addMembersPanel").classList.add("hidden");
     showTab("group");
     if (!skipDial)
         invoke("open_group", { members: friendsOnly(g.members) }).catch(() => { });
@@ -361,45 +540,8 @@ function showTile(key, label, stream, self, peer) {
         w.appendChild(v);
         w.appendChild(tag);
         w.appendChild(max);
-        if (!self) {
-            // Bouton son DU PARTAGE, sur la vignette (accessible aussi en plein écran).
-            // Coupe localement le son de ce pair — LES DEUX voies : l'audio d'une piste
-            // WebRTC (v.muted) ET le son système capté en natif, qui ne passe PAS par la
-            // vidéo mais par le mixeur de l'appel (screen_audio_mute). L'état est stocké
-            // PAR PAIR (S.screenMuted) : un pair peut avoir 2 vignettes (cam + écran) —
-            // toutes ses vignettes partagent le même état et sont synchronisées au clic.
-            const snd = document.createElement("button");
-            snd.className = "vidsnd";
-            snd.type = "button";
-            if (peer)
-                snd.dataset.snd = peer;
-            const muted0 = !!peer && !!S.screenMuted[peer];
-            snd.textContent = muted0 ? "🔇" : "🔊";
-            snd.title = "Couper / remettre le son de ce partage";
-            snd.onclick = (e) => {
-                e.stopPropagation();
-                if (!peer) {
-                    v.muted = !v.muted;
-                    snd.textContent = v.muted ? "🔇" : "🔊";
-                    return;
-                }
-                const on = !S.screenMuted[peer];
-                S.screenMuted[peer] = on;
-                invoke("screen_audio_mute", { peer, on }).catch(() => { });
-                // Synchroniser TOUTES les vignettes du pair (cam + écran) : élément vidéo + icône.
-                document.querySelectorAll('[id^="vidw_' + peer + '_"] video').forEach((el) => {
-                    el.muted = on;
-                });
-                document.querySelectorAll('[data-snd="' + peer + '"]').forEach((b) => {
-                    b.textContent = on ? "🔇" : "🔊";
-                });
-            };
-            w.appendChild(snd);
-            // Ré-affirmer la coupure au backend : après une reconnexion, receive_group_voice
-            // a pu réinitialiser le gain à 1.0 — sans ça, l'icône dirait 🔇 mais le son jouerait.
-            if (muted0)
-                invoke("screen_audio_mute", { peer: peer, on: true }).catch(() => { });
-        }
+        if (!self && peer)
+            attachStreamAudio(w, peer, v);
         vgrid().appendChild(w);
     }
     document.getElementById("vid_" + key).srcObject = stream;
@@ -410,6 +552,75 @@ function dropTile(key) {
     if (w)
         w.remove();
     maybeHideGrid();
+}
+// Contrôles audio du partage d'un pair, sur sa vignette : bouton 🔇/🔊 (raccourci
+// mute) + curseur de VOLUME 0–200 % (« le stream qu'on regarde »). L'état est PAR PAIR
+// (S.screenMuted / S.screenGains) : un pair peut avoir plusieurs vignettes (cam +
+// écran), toutes synchronisées via les sélecteurs data-snd / data-vol. Le son passe
+// par le mixeur natif de l'appel (screen_audio_gain) et, si présent, par la piste
+// WebRTC du <video> (video.volume, plafonné à 1.0).
+function applyStreamGain(peer, video) {
+    const muted = !!S.screenMuted[peer];
+    const pct = S.screenGains[peer] ?? 100;
+    invoke("screen_audio_gain", { peer, vol: muted ? 0 : pct / 100 }).catch(() => { });
+    // Piloter AUSSI l'état .muted du <video> WebRTC : showTile le fige à la création
+    // depuis S.screenMuted, donc sans le réécrire ici une vignette recréée en muet ne
+    // se démuterait jamais (le curseur/le bouton ne toucheraient que le volume).
+    document.querySelectorAll('[id^="vidw_' + peer + '_"] video').forEach((el) => {
+        const v = el;
+        v.muted = muted;
+        v.volume = Math.min(1, pct / 100);
+    });
+    if (video) {
+        video.muted = muted;
+        video.volume = Math.min(1, pct / 100);
+    }
+}
+function attachStreamAudio(w, peer, video) {
+    const snd = document.createElement("button");
+    snd.className = "vidsnd";
+    snd.type = "button";
+    snd.dataset.snd = peer;
+    snd.title = "Couper / remettre le son de ce partage";
+    const syncIcons = () => {
+        document.querySelectorAll('[data-snd="' + peer + '"]').forEach((b) => {
+            b.textContent = S.screenMuted[peer] ? "🔇" : "🔊";
+        });
+    };
+    snd.textContent = S.screenMuted[peer] ? "🔇" : "🔊";
+    snd.onclick = (e) => {
+        e.stopPropagation();
+        S.screenMuted[peer] = !S.screenMuted[peer];
+        applyStreamGain(peer);
+        syncIcons();
+    };
+    w.appendChild(snd);
+    // Curseur de volume (apparaît au survol, comme les boutons de la vignette).
+    const vol = document.createElement("input");
+    vol.type = "range";
+    vol.min = "0";
+    vol.max = "200";
+    vol.step = "5";
+    vol.className = "vidvol";
+    vol.dataset.vol = peer;
+    vol.value = String(S.screenGains[peer] ?? 100);
+    vol.title = "Volume du partage";
+    vol.onclick = (e) => e.stopPropagation(); // ne pas déclencher le plein écran
+    vol.oninput = () => {
+        const v = +vol.value;
+        S.screenGains[peer] = v;
+        if (v > 0 && S.screenMuted[peer])
+            S.screenMuted[peer] = false; // bouger = démuter
+        applyStreamGain(peer);
+        syncIcons();
+        document.querySelectorAll('[data-vol="' + peer + '"]').forEach((r) => {
+            r.value = String(v);
+        });
+    };
+    w.appendChild(vol);
+    // Ré-affirmer l'état au backend : après une reconnexion, receive_group_voice a pu
+    // réinitialiser le gain à 1.0 — sans ça, l'icône dirait 🔇 mais le son jouerait.
+    applyStreamGain(peer, video);
 }
 // Vignette à CANVAS (vidéo native décodée par WebCodecs — pas de MediaStream).
 // Même enveloppe que showTile : plein écran au clic, bouton son du partage pour un
@@ -442,32 +653,8 @@ function showCanvasTile(key, label, peer) {
         w.appendChild(c);
         w.appendChild(tag);
         w.appendChild(max);
-        if (peer) {
-            // Ici il n'y a pas d'élément <video> : seule la voie « son système natif »
-            // (screen_audio_mute) est à couper — l'état par pair reste S.screenMuted.
-            const snd = document.createElement("button");
-            snd.className = "vidsnd";
-            snd.type = "button";
-            snd.dataset.snd = peer;
-            const muted0 = !!S.screenMuted[peer];
-            snd.textContent = muted0 ? "🔇" : "🔊";
-            snd.title = "Couper / remettre le son de ce partage";
-            snd.onclick = (e) => {
-                e.stopPropagation();
-                const on = !S.screenMuted[peer];
-                S.screenMuted[peer] = on;
-                invoke("screen_audio_mute", { peer, on }).catch(() => { });
-                document.querySelectorAll('[id^="vidw_' + peer + '_"] video').forEach((el) => {
-                    el.muted = on;
-                });
-                document.querySelectorAll('[data-snd="' + peer + '"]').forEach((b) => {
-                    b.textContent = on ? "🔇" : "🔊";
-                });
-            };
-            w.appendChild(snd);
-            if (muted0)
-                invoke("screen_audio_mute", { peer, on: true }).catch(() => { });
-        }
+        if (peer)
+            attachStreamAudio(w, peer); // pas de <video> ici : gain natif seulement
         vgrid().appendChild(w);
     }
     vgrid().classList.remove("hidden");
@@ -872,10 +1059,13 @@ async function startScreen() {
         log("📞 Rejoins d'abord l'appel de groupe — comme sur Discord, l'écran se partage dans l'appel.");
         return;
     }
-    // 🧪 Chemin NATIF (Réglages) : pas de getDisplayMedia, pas de WebRTC — et pas de
-    // confirm() de confidentialité : aucune IP n'est exposée, aucun STUN contacté.
+    // 🧪 Chemin NATIF (Réglages) : ouvrir le picker (écran OU fenêtre). Pas de
+    // getDisplayMedia, pas de WebRTC, pas de confirm() de confidentialité — aucune IP
+    // exposée, aucun STUN contacté.
     if (nativeVideoWanted()) {
-        await startScreenNative();
+        const g = loadGroups().find((x) => x.id === S.openGroupId);
+        if (g)
+            await openNativePicker(g);
         return;
     }
     // Au TOUT premier usage vidéo, le confirm() de confidentialité consomme le délai
@@ -999,7 +1189,8 @@ async function startScreen() {
             return;
         const g = loadGroups().find((x) => x.id === S.openGroupId);
         try {
-            await invoke("screen_audio_start", { members: g ? g.members : [] });
+            // Partage WebRTC (fenêtre sans audio navigateur) → son SYSTÈME complet (pid null).
+            await invoke("screen_audio_start", { members: g ? g.members : [], pid: null });
             // Le partage a pu être arrêté PENDANT l'await (jusqu'à 5 s côté Rust) : stopScreen
             // a alors vu screenAudioNative=false et n'a rien arrêté — compenser ici, sinon la
             // capture du son système continuerait ORPHELINE (fuite de confidentialité).
@@ -1048,6 +1239,7 @@ function stopScreen() {
         });
         nativeShareMembers = null;
         nativeShareName = "";
+        nativeSharePid = null;
         dropTile("moi" + NATIVE_KEY);
     }
     screenUpgraded = false; // le prochain partage repart en 720p jusqu'à confirmation
@@ -1344,20 +1536,73 @@ function drawNativeStats(s, w, h) {
         ctx.fillText("qualité maximale", c.width / 2, 184);
     }
 }
-async function startScreenNative() {
-    const g = loadGroups().find((x) => x.id === S.openGroupId);
-    if (!g)
-        return;
+let nativeSharePid = null;
+// ----- Picker de partage natif (écran OU fenêtre), au clic sur 🖥️ -----
+function closeNativePicker() {
+    $("#nativePickerWrap").classList.add("hidden");
+}
+function pickerItem(label, onClick) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "item";
+    b.style.cssText = "width:100%;text-align:left;cursor:pointer;border:none;background:transparent;color:var(--text);padding:8px 10px;font-size:13.5px";
+    b.textContent = label;
+    b.onclick = onClick;
+    return b;
+}
+async function openNativePicker(g) {
+    const screensBox = $("#nativePickerScreens");
+    const winsBox = $("#nativePickerWindows");
+    screensBox.replaceChildren();
+    winsBox.replaceChildren();
+    const start = (t) => {
+        closeNativePicker();
+        void startScreenNative(g, t);
+    };
+    let mons = [];
+    try {
+        mons = await invoke("video_list_monitors");
+    }
+    catch {
+        /* liste vide → repli « Écran principal » ci-dessous */
+    }
+    if (mons.length) {
+        mons.forEach((m) => screensBox.appendChild(pickerItem("🖵 " + m.name + " — " + m.w + "×" + m.h + (m.primary ? " (principal)" : ""), () => start({ kind: "screen", id: m.id, name: m.name }))));
+    }
+    else {
+        screensBox.appendChild(pickerItem("🖵 Écran principal", () => start({ kind: "screen", id: "", name: "Écran principal" })));
+    }
+    let wins = [];
+    try {
+        wins = await invoke("video_list_windows");
+    }
+    catch {
+        /* liste vide */
+    }
+    if (wins.length) {
+        wins.forEach((wd) => winsBox.appendChild(pickerItem("🪟 " + wd.name, () => start({ kind: "window", id: wd.id, name: wd.name, pid: wd.pid }))));
+    }
+    else {
+        const s = document.createElement("span");
+        s.className = "hint";
+        s.textContent = "Aucune fenêtre partageable détectée.";
+        winsBox.appendChild(s);
+    }
+    $("#nativePickerWrap").classList.remove("hidden");
+}
+async function startScreenNative(g, target) {
     screenBusy = true;
     try {
         const epoch0 = nativeShareEpoch;
-        // Écran choisi dans Réglages ("" = principal). C'est le szDevice STABLE : s'il a
-        // disparu depuis, Rust replie sur l'écran principal et le signale (monitorFound).
-        const monSaved = localStorage.getItem("ghostlink_native_monitor") || "";
-        const monitor = monSaved !== "" ? monSaved : null;
+        const isWindow = target.kind === "window";
+        // Écran = szDevice STABLE (Rust replie sur le principal si absent, monitorFound) ;
+        // Fenêtre = HWND.
+        const args = isWindow
+            ? { members: g.members, monitor: null, window: target.id }
+            : { members: g.members, monitor: target.id || null, window: null };
         let info;
         try {
-            info = await invoke("video_share_start", { members: g.members, monitor });
+            info = await invoke("video_share_start", args);
         }
         catch (e) {
             log("🧪 Partage natif impossible : " + e + " — décoche « Partage d'écran natif » dans Réglages pour repasser en WebRTC.");
@@ -1373,8 +1618,9 @@ async function startScreenNative() {
         }
         S.localScreenNative = true;
         lastNativeLevel = 0; // chaque partage repart à qualité max
-        nativeShareName = info.monitor; // nom de l'écran RÉELLEMENT capturé (vignette + logs)
+        nativeShareName = info.monitor; // nom réel de l'écran/fenêtre capturé (vignette + logs)
         nativeShareMembers = g.members.slice(); // destinataires du signal d'arrêt
+        nativeSharePid = isWindow ? target.pid ?? null : null; // pour le son de la fenêtre
         // Annonce aux membres en ligne. Limite v1 : un membre qui arrive APRÈS le
         // démarrage ne reçoit pas ce partage (relancer ⏹️/🖥️ pour l'inclure).
         g.members.forEach((m) => {
@@ -1383,30 +1629,34 @@ async function startScreenNative() {
         });
         showNativePlaceholder(info.w, info.h);
         $("#btnGroupScreen").textContent = "⏹️ Écran";
-        log("🖥️ Partage d'écran NATIF lancé — " + info.monitor + " (" + info.w + "×" + info.h + "@" + info.fps + ", H.264 matériel, sans WebRTC/STUN).");
-        // L'écran demandé était introuvable (débranché, topologie changée) : Rust a
-        // replié sur le principal — le dire fort, c'est peut-être un écran privé diffusé.
-        if (monitor && !info.monitorFound) {
-            log("⚠️ L'écran choisi est introuvable — c'est " + info.monitor + " (principal) qui est partagé. Vérifie dans Réglages.");
+        log("🖥️ Partage NATIF lancé — " + info.monitor + " (" + info.w + "×" + info.h + "@" + info.fps + ", H.264 matériel, sans WebRTC/STUN).");
+        // Écran demandé introuvable (débranché) : Rust a replié sur le principal — le dire
+        // fort, c'est peut-être un écran privé diffusé.
+        if (!isWindow && target.id && !info.monitorFound) {
+            log("⚠️ L'écran choisi est introuvable — c'est " + info.monitor + " (principal) qui est partagé.");
         }
-        // Son : le chemin natif n'a jamais d'audio navigateur — proposer directement le
-        // repli système (loopback anti-écho), comme pour une fenêtre en WebRTC.
-        const wantNative = confirm("Partager aussi le SON ?\n\nghost link peut capter le son système en natif (TOUT le son du PC). Le flux chiffré part vers les membres du groupe en ligne ; seuls ceux qui ont rejoint l'appel l'entendent.\n\nOK = capter le son système · Annuler = vidéo seule");
+        // Son : pas d'audio navigateur ici — proposer le repli natif. Pour une FENÊTRE, on
+        // ne capte que le son de SON process (pid) ; pour un écran, tout le son système.
+        const wantNative = confirm(isWindow
+            ? "Partager aussi le SON de cette fenêtre ?\n\nghost link peut capter le son de CETTE application seulement. Le flux chiffré part vers les membres en ligne ; seuls ceux dans l'appel l'entendent.\n\nOK = capter le son de la fenêtre · Annuler = vidéo seule"
+            : "Partager aussi le SON ?\n\nghost link peut capter le son système en natif (TOUT le son du PC). Le flux chiffré part vers les membres en ligne ; seuls ceux dans l'appel l'entendent.\n\nOK = capter le son système · Annuler = vidéo seule");
         if (!wantNative || !S.localScreenNative)
             return;
         try {
-            await invoke("screen_audio_start", { members: g.members });
+            await invoke("screen_audio_start", { members: g.members, pid: nativeSharePid });
             if (!S.localScreenNative) {
                 // Partage arrêté PENDANT l'await : ne pas laisser la capture orpheline.
                 invoke("screen_audio_stop").catch(() => { });
                 return;
             }
             screenAudioNative = true;
-            $("#btnGroupScreen").textContent = "⏹️ Écran · 🔴 son système";
-            log("🔊 Son système capté en natif — les voix de l'appel sont exclues du flux (pas d'écho).");
+            $("#btnGroupScreen").textContent = isWindow ? "⏹️ Écran · 🔴 son fenêtre" : "⏹️ Écran · 🔴 son système";
+            log(isWindow
+                ? "🔊 Son de la fenêtre capté en natif (seulement cette appli)."
+                : "🔊 Son système capté en natif — les voix de l'appel sont exclues du flux (pas d'écho).");
         }
         catch (e) {
-            log("🔇 Son système indisponible (" + e + ").");
+            log("🔇 Son natif indisponible (" + e + ").");
         }
     }
     finally {
@@ -1504,6 +1754,31 @@ export function initGroups() {
         openGroup(id, true); // skipDial : send_ginvite a déjà connecté les membres en ligne
     };
     $("#btnCloseGroup").onclick = closeGroup;
+    $("#btnNativePickerCancel").onclick = closeNativePicker;
+    $("#btnAddMembers").onclick = () => {
+        const g = loadGroups().find((x) => x.id === S.openGroupId);
+        if (!g)
+            return;
+        const panel = $("#addMembersPanel");
+        if (panel.classList.contains("hidden"))
+            renderAddMembersFriends(g);
+        panel.classList.toggle("hidden");
+    };
+    $("#btnAddMembersCancel").onclick = () => $("#addMembersPanel").classList.add("hidden");
+    $("#btnAddMembersDo").onclick = () => {
+        const g = loadGroups().find((x) => x.id === S.openGroupId);
+        if (!g)
+            return;
+        const sel = Array.from($("#addMembersFriends").querySelectorAll("input:checked"))
+            .map((c) => c.value)
+            .filter(Boolean);
+        if (!sel.length) {
+            log("Sélectionne au moins un ami à ajouter.");
+            return;
+        }
+        addMembersToGroup(g, sel);
+        $("#addMembersPanel").classList.add("hidden");
+    };
     $("#btnGroupSend").onclick = sendGroupMsg;
     $("#groupChatInput").onkeydown = (e) => {
         if (e.key === "Enter") {
@@ -1610,6 +1885,16 @@ export function initGroups() {
             if (S.localScreenNative && nativeShareMembers && nativeShareMembers.includes(e.payload)) {
                 log("ℹ️ " + memberName(e.payload) + " vient de se connecter — relance le partage (⏹️ puis 🖥️) pour l'inclure.");
             }
+            // Convergence de roster : envoyer MA vue des groupes qu'on partage à ce pair qui
+            // (re)vient en ligne — rattrape les ajouts de membres manqués pendant qu'il était
+            // hors ligne (send_gmembers ne touche que les en-ligne au moment de l'ajout).
+            const peer = e.payload;
+            loadGroups().forEach((g) => {
+                if (!g.members.includes(peer))
+                    return;
+                const roster = [S.myCode, ...g.members].join(",");
+                invoke("send_gmembers", { members: [peer], gid: g.id, name: g.name, roster }).catch(() => { });
+            });
         }
         refreshGroupCounts();
     });
@@ -1641,6 +1926,69 @@ export function initGroups() {
         $("#groupInviteText").textContent =
             '👪 Invitation au groupe « ' + (p.name || "?") + " » (" + full.length + " membres).";
         $("#groupInviteBanner").classList.remove("hidden");
+    });
+    // Sync de roster : un membre a ajouté des gens → union dans MA liste locale.
+    listen("ghost-gmembers", (e) => {
+        const p = e.payload || {};
+        const groups = loadGroups();
+        const g = groups.find((x) => x.id === p.group);
+        if (!g)
+            return; // pas (encore) dans ce groupe → les nouveaux reçoivent une invite
+        // SÉCURITÉ : n'accepter une sync de roster QUE d'un membre déjà connu (p.from =
+        // remote_id authentifié) — sinon n'importe quel ami connaissant le gid pourrait
+        // injecter des membres arbitraires dans le roster local des autres.
+        if (!p.from || (!g.members.includes(p.from) && p.from !== S.myCode))
+            return;
+        const kset = kickedSet(g.id); // ne pas ré-admettre un exclu via une sync de roster
+        const incoming = (p.members || "")
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+        const merged = Array.from(new Set([...g.members, ...incoming])).filter((c) => c && c !== S.myCode && !kset.has(c));
+        if (merged.length === g.members.length)
+            return; // rien de neuf
+        g.members = merged;
+        saveGroups(groups);
+        renderGroups();
+        if (S.openGroupId === g.id)
+            refreshGroupCounts();
+        invoke("open_group", { members: friendsOnly(merged) }).catch(() => { });
+        log("👥 Nouveaux membres dans le groupe « " + g.name + " ».");
+    });
+    // Activité vocale (~10 Hz) : qui est en appel / qui parle. On bascule des classes
+    // CSS sur les chips par data-code — SANS re-render (coûteux à cette fréquence).
+    // L'activité est GLOBALE (celle de l'appel où JE suis) : ne l'appliquer que si le
+    // groupe ouvert EST celui de mon appel, sinon on allumerait des pastilles sur des
+    // chips d'un autre groupe sans appel.
+    listen("ghost-voice-activity", (e) => {
+        const act = e.payload || {};
+        S.voiceAct = act;
+        const showHere = S.inGroupCall && S.groupCallId === S.openGroupId;
+        document.querySelectorAll(".mem[data-code]").forEach((el) => {
+            const code = el.dataset.code || "";
+            const a = showHere ? act[code] : undefined;
+            el.classList.toggle("incall", !!a?.inCall);
+            el.classList.toggle("speaking", !!a?.speaking);
+        });
+    });
+    // Un vote d'exclusion reçu : tallie et applique au quorum (60 % des en-ligne).
+    listen("ghost-kick", (e) => {
+        const p = e.payload || {};
+        if (!p.target || !p.voter)
+            return;
+        // SÉCURITÉ : le vote ne compte que si l'EXPÉDITEUR AUTHENTIFIÉ (p.from = remote_id,
+        // inforgeable) est bien le votant déclaré. Sans ça, un seul pair pourrait forger le
+        // quorum en envoyant des votes au nom de tous les autres membres.
+        if (!p.from || p.from !== p.voter)
+            return;
+        const g = loadGroups().find((x) => x.id === p.group);
+        if (!g)
+            return;
+        // Le votant doit être un membre du groupe (anti-vote d'un tiers).
+        if (!g.members.includes(p.voter))
+            return;
+        recordKickVote(g.id, p.target, p.voter);
+        tallyKick(g, p.target);
     });
     listen("ghost-gcall", (e) => {
         const p = e.payload || {};

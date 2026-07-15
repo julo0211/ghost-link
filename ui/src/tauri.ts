@@ -67,14 +67,17 @@ export interface Commands {
 
   open_group: { args: { members: string[] }; ret: void };
   send_ginvite: { args: { member: string; gid: string; name: string; members: string }; ret: void };
+  send_gmembers: { args: { members: string[]; gid: string; name: string; roster: string }; ret: void };
+  send_kick: { args: { members: string[]; gid: string; target: string; voter: string }; ret: void };
   send_gchat: { args: { members: string[]; gid: string; name: string; text: string }; ret: void };
   group_call_start: { args: { members: string[]; gid: string; announce: boolean }; ret: void };
   group_call_stop: { args: void; ret: void };
   group_call_mute: { args: { on: boolean }; ret: void };
   group_call_volume: { args: { peer: string; vol: number }; ret: void };
-  screen_audio_start: { args: { members: string[] }; ret: void };
+  screen_audio_start: { args: { members: string[]; pid: number | null }; ret: void };
   screen_audio_stop: { args: void; ret: void };
   screen_audio_mute: { args: { peer: string; on: boolean }; ret: void };
+  screen_audio_gain: { args: { peer: string; vol: number }; ret: void };
   send_signal: { args: { peer: string; data: string }; ret: void };
   send_gfile: { args: { members: string[]; path: string }; ret: void };
   respond_gfile: { args: { id: number; accept: boolean }; ret: void };
@@ -82,7 +85,7 @@ export interface Commands {
 
   // Partage d'écran NATIF (sans WebRTC/STUN) — video.rs.
   video_share_start: {
-    args: { members: string[]; monitor: string | null };
+    args: { members: string[]; monitor: string | null; window: string | null };
     ret: { w: number; h: number; fps: number; monitor: string; monitorFound: boolean };
   };
   video_share_stop: { args: void; ret: void };
@@ -91,6 +94,7 @@ export interface Commands {
     args: void;
     ret: { id: string; name: string; w: number; h: number; primary: boolean }[];
   };
+  video_list_windows: { args: void; ret: { id: string; name: string; pid: number }[] };
 }
 
 // --- Événements émis par Rust : forme du payload reçu ---
@@ -128,6 +132,8 @@ export interface Events {
   "ghost-mesh-down": string;
   "ghost-gchat": { group: string; author?: string; text?: string };
   "ghost-ginvite": { id: string; name?: string; members?: string };
+  "ghost-gmembers": { group: string; name?: string; members?: string; from?: string };
+  "ghost-kick": { group: string; target: string; voter: string; from?: string };
   "ghost-gcall": { group: string };
   "ghost-signal": { from?: string; data: string };
   "ghost-grecv-start": { name?: string; from?: string };
@@ -138,6 +144,7 @@ export interface Events {
   "ghost-video-ended": { reason?: string };
   "ghost-video-rx-end": string;
   "ghost-video-peer-dead": string;
+  "ghost-voice-activity": Record<string, { inCall: boolean; speaking: boolean }>;
   "ghost-video-stats": {
     fps: number;
     kbps: number;

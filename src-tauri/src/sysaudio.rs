@@ -20,7 +20,8 @@ use windows::Win32::Media::Audio::{
     IAudioCaptureClient, IAudioClient, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
     AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
-    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
     WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
@@ -60,14 +61,33 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Completion_Impl {
     }
 }
 
-/// Active le client audio « process loopback EXCLUDE self » et renvoie l'IAudioClient prêt.
-unsafe fn activate_exclude_self() -> anyhow::Result<IAudioClient> {
+/// Cible de capture « process loopback » : soit TOUT le système sauf nous (partage
+/// d'écran plein / anti-écho), soit le son d'UN process précis (partage d'une fenêtre
+/// → seul le son de cette appli). Le PID et le mode INCLUDE/EXCLUDE en découlent.
+#[derive(Clone, Copy)]
+pub enum LoopbackTarget {
+    /// Tout le son système EN EXCLUANT notre propre arbre de processus (anti-écho).
+    ExcludeSelf,
+    /// Uniquement le son de l'arbre de processus donné (une fenêtre partagée).
+    IncludeProcess(u32),
+}
+
+/// Active le client audio « process loopback » pour la cible et renvoie l'IAudioClient.
+unsafe fn activate_loopback(target: LoopbackTarget) -> anyhow::Result<IAudioClient> {
+    let (pid, mode) = match target {
+        LoopbackTarget::ExcludeSelf => {
+            (std::process::id(), PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE)
+        }
+        LoopbackTarget::IncludeProcess(pid) => {
+            (pid, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE)
+        }
+    };
     let params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
-                TargetProcessId: std::process::id(),
-                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+                TargetProcessId: pid,
+                ProcessLoopbackMode: mode,
             },
         },
     };
@@ -108,7 +128,8 @@ unsafe fn activate_exclude_self() -> anyhow::Result<IAudioClient> {
 /// dans `sink` jusqu'à ce que `stop` passe à true. Envoie `ready` UNE fois l'init OK
 /// (ou l'erreur d'init) — l'appelant sait alors si la capture a démarré. Doit tourner
 /// sur son propre thread (COM STA/MTA + boucle bloquante).
-pub fn capture_excluding_self(
+pub fn capture_process_loopback(
+    target: LoopbackTarget,
     stop: Arc<AtomicBool>,
     ready: Sender<Result<(), String>>,
     sink: Arc<Mutex<VecDeque<f32>>>,
@@ -121,7 +142,7 @@ pub fn capture_excluding_self(
         let co = CoInitializeEx(None, COINIT_MULTITHREADED);
         let co_ok = co.is_ok(); // S_OK/S_FALSE : à désinitialiser ; RPC_E_CHANGED_MODE : non
         let setup = (|| -> anyhow::Result<(IAudioClient, IAudioCaptureClient)> {
-            let client = activate_exclude_self()?;
+            let client = activate_loopback(target)?;
             let format = WAVEFORMATEX {
                 wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
                 nChannels: CAPTURE_CH,

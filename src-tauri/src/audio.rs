@@ -4,17 +4,32 @@
 // pour que l'appel fonctionne quelle que soit la carte son (ex. micro en 44,1 kHz).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
 use iroh::endpoint::Connection;
+use tauri::{AppHandle, Emitter};
 
 /// Opus fonctionne à 48 kHz mono, trame de 20 ms = 960 échantillons.
 const OPUS_FRAME: usize = 960;
 const VOICE_TAG: u8 = 1; // premier octet d'un datagramme = type « voix »
 const SCREEN_TAG: u8 = 2; // premier octet d'un datagramme = « son d'écran » (process-loopback)
+const CALL_PING: u8 = 3; // balise « je suis dans l'appel » (indépendante de la parole)
+/// Seuil de crête au-dessus duquel une trame voix compte comme « parle ».
+const SPEAK_PEAK: f32 = 0.02;
+
+/// Activité vocale d'un participant : dernier instant où il a PARLÉ (voix > seuil) et
+/// dernière balise CALL_PING reçue. Sert à l'indicateur « en appel / parle » de l'UI.
+#[derive(Clone, Copy, Default)]
+struct VoiceMark {
+    last_voice: Option<Instant>,
+    last_ping: Option<Instant>,
+}
+/// Activité par code de pair (+ clé « me » pour mon propre micro).
+type VoiceAct = Arc<Mutex<HashMap<String, VoiceMark>>>;
 
 /// Clé du tampon de mixage pour le SON D'ÉCRAN d'un pair — distincte de sa voix pour
 /// que chaque flux garde SON décodeur Opus (les codes de pair ne contiennent pas `#`).
@@ -617,12 +632,20 @@ pub struct GroupCall {
     flag: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     muted: Arc<AtomicBool>,
     peers: Peers,
+    act: VoiceAct,
+    /// Génération de l'appel : incrémentée à chaque start(). L'émetteur d'activité ne
+    /// publie son événement de fin (« plus personne en vocal ») que s'il est ENCORE la
+    /// génération courante — sinon, basculer d'un appel à l'autre effacerait les
+    /// indicateurs tout juste allumés par le nouvel appel.
+    gen: Arc<AtomicU64>,
 }
 
 impl GroupCall {
     /// Démarre l'appel de groupe avec la liste des pairs (code, connexion du maillage).
+    /// `app` sert à pousser l'activité vocale (« qui est en appel / parle ») à l'UI.
     pub fn start(
         &self,
+        app: AppHandle,
         conns: Vec<(String, Connection)>,
         rt: tokio::runtime::Handle,
         cfg: AudioCfg,
@@ -632,8 +655,12 @@ impl GroupCall {
         if let Ok(mut p) = self.peers.lock() {
             p.clear();
         }
+        if let Ok(mut a) = self.act.lock() {
+            a.clear();
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let peers = self.peers.clone();
+        let act = self.act.clone();
         let conn_list: Vec<Connection> = conns.iter().map(|(_, c)| c.clone()).collect();
         // Capture micro → diffusion à tous + sortie mixée. Renvoie le taux de sortie.
         let out_rate = start_group_capture_mix(
@@ -642,11 +669,15 @@ impl GroupCall {
             peers.clone(),
             cfg,
             self.muted.clone(),
+            act.clone(),
         )?;
         // Une tâche de réception par pair → décodage → tampon du pair (mixé à la lecture).
         for (peer, conn) in conns {
-            rt.spawn(receive_group_voice(conn, stop.clone(), peers.clone(), peer, out_rate));
+            rt.spawn(receive_group_voice(conn, stop.clone(), peers.clone(), peer, out_rate, act.clone()));
         }
+        // Émetteur d'activité : pousse ~10 Hz à l'UI qui est en appel et qui parle.
+        let my_gen = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
+        rt.spawn(emit_voice_activity(app, stop.clone(), act, self.gen.clone(), my_gen));
         *self.flag.lock().unwrap_or_else(|e| e.into_inner()) = Some(stop);
         Ok(())
     }
@@ -663,6 +694,14 @@ impl GroupCall {
         if let Ok(mut p) = self.peers.lock() {
             p.entry(screen_mix_key(code)).or_insert((1.0, VecDeque::new())).0 =
                 if muted { 0.0 } else { 1.0 };
+        }
+    }
+    /// Règle le VOLUME du son d'écran partagé par un pair (le « stream qu'on regarde »).
+    /// 1.0 = normal, 0 = muet, 2.0 = ×2. Même clé que set_screen_mute → cohérent avec
+    /// le bouton 🔇 (qui reste un raccourci mute).
+    pub fn set_screen_gain(&self, code: &str, gain: f32) {
+        if let Ok(mut p) = self.peers.lock() {
+            p.entry(screen_mix_key(code)).or_insert((1.0, VecDeque::new())).0 = gain.max(0.0);
         }
     }
     pub fn set_mute(&self, on: bool) {
@@ -760,6 +799,7 @@ fn start_group_capture_mix(
     peers: Peers,
     cfg: AudioCfg,
     muted: Arc<AtomicBool>,
+    act: VoiceAct,
 ) -> anyhow::Result<u32> {
     let (tx, rx) = std::sync::mpsc::channel::<Result<u32, String>>();
     std::thread::spawn(move || {
@@ -790,6 +830,7 @@ fn start_group_capture_mix(
                 let _ = tx.send(Ok(out_rate));
                 let mut packet = vec![0u8; 4000];
                 let mut framebuf = vec![0f32; in_frame];
+                let mut ping_ctr = 0u32; // ~50 trames de 20 ms = 1 s → une balise CALL_PING
                 while !stop.load(Ordering::SeqCst) {
                     let got = if let Ok(mut q) = in_buf.lock() {
                         if q.len() >= in_frame {
@@ -805,6 +846,14 @@ fn start_group_capture_mix(
                     };
                     if got {
                         if !muted.load(Ordering::SeqCst) {
+                            // Indicateur « je parle » : crête du micro (mais pas si muet —
+                            // je ne transmets rien, donc je ne « parle » pas pour les autres).
+                            let peak = framebuf.iter().fold(0f32, |m, &s| m.max(s.abs()));
+                            if peak > SPEAK_PEAK {
+                                if let Ok(mut a) = act.lock() {
+                                    a.entry("me".to_string()).or_default().last_voice = Some(Instant::now());
+                                }
+                            }
                             let frame48 = resample_block(&framebuf, OPUS_FRAME);
                             if let Ok(n) = encoder.encode_float(&frame48, &mut packet[1..]) {
                                 packet[0] = VOICE_TAG;
@@ -812,6 +861,16 @@ fn start_group_capture_mix(
                                 for c in &conns {
                                     let _ = c.send_datagram(dg.clone());
                                 }
+                            }
+                        }
+                        // Balise « je suis dans l'appel » ~1 Hz, ÉMISE MÊME SI MUET (les
+                        // autres doivent voir un participant muet comme présent).
+                        ping_ctr += 1;
+                        if ping_ctr >= 50 {
+                            ping_ctr = 0;
+                            let dg = bytes::Bytes::copy_from_slice(&[CALL_PING]);
+                            for c in &conns {
+                                let _ = c.send_datagram(dg.clone());
                             }
                         }
                     } else {
@@ -842,6 +901,7 @@ async fn receive_group_voice(
     peers: Peers,
     peer: String,
     out_rate: u32,
+    act: VoiceAct,
 ) {
     let mut voice_dec = match new_decoder() {
         Ok(d) => d,
@@ -860,9 +920,24 @@ async fn receive_group_voice(
             res = conn.read_datagram() => {
                 match res {
                     Ok(dg) => {
-                        if dg.len() > 1 && (dg[0] == VOICE_TAG || dg[0] == SCREEN_TAG) {
+                        if dg.len() == 1 && dg[0] == CALL_PING {
+                            // Balise de présence : ce pair est dans l'appel (même muet).
+                            if let Ok(mut a) = act.lock() {
+                                a.entry(peer.clone()).or_default().last_ping = Some(Instant::now());
+                            }
+                        } else if dg.len() > 1 && (dg[0] == VOICE_TAG || dg[0] == SCREEN_TAG) {
                             let dec = if dg[0] == SCREEN_TAG { &mut screen_dec } else { &mut voice_dec };
                             if let Ok(samples) = dec.decode_float(Some(&dg[1..]), &mut decoded[..], false) {
+                                // Indicateur « parle » : seulement la VOIX du pair (pas
+                                // son son d'écran), au-dessus du seuil de crête.
+                                if dg[0] == VOICE_TAG {
+                                    let peak = decoded[..samples].iter().fold(0f32, |m, &s| m.max(s.abs()));
+                                    if peak > SPEAK_PEAK {
+                                        if let Ok(mut a) = act.lock() {
+                                            a.entry(peer.clone()).or_default().last_voice = Some(Instant::now());
+                                        }
+                                    }
+                                }
                                 let play = resample_block(&decoded[..samples], out_frame);
                                 let key = if dg[0] == SCREEN_TAG { &skey } else { &peer };
                                 if let Ok(mut m) = peers.lock() {
@@ -887,6 +962,43 @@ async fn receive_group_voice(
         m.remove(&peer);
         m.remove(&skey);
     }
+    if let Ok(mut a) = act.lock() {
+        a.remove(&peer);
+    }
+}
+
+/// Pousse l'activité vocale à l'UI ~10 Hz : par code, `inCall` (balise ou voix < 3 s) et
+/// `speaking` (voix < 400 ms). « me » est toujours en appel tant que la boucle tourne.
+async fn emit_voice_activity(
+    app: AppHandle,
+    stop: Arc<AtomicBool>,
+    act: VoiceAct,
+    gen: Arc<AtomicU64>,
+    my_gen: u64,
+) {
+    while !stop.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let now = Instant::now();
+        let mut map = serde_json::Map::new();
+        if let Ok(a) = act.lock() {
+            for (code, v) in a.iter() {
+                let speaking = v.last_voice.map(|t| now.duration_since(t).as_millis() < 400).unwrap_or(false);
+                let in_call = code == "me"
+                    || v.last_ping.map(|t| now.duration_since(t).as_secs() < 3).unwrap_or(false)
+                    || v.last_voice.map(|t| now.duration_since(t).as_secs() < 3).unwrap_or(false);
+                map.insert(code.clone(), serde_json::json!({ "inCall": in_call, "speaking": speaking }));
+            }
+        }
+        if !map.contains_key("me") {
+            map.insert("me".to_string(), serde_json::json!({ "inCall": true, "speaking": false }));
+        }
+        let _ = app.emit("ghost-voice-activity", serde_json::Value::Object(map));
+    }
+    // Fin d'appel : signaler que plus personne n'est en vocal — MAIS seulement si un
+    // nouvel appel n'a pas déjà démarré (sinon on éteindrait ses indicateurs).
+    if gen.load(Ordering::SeqCst) == my_gen {
+        let _ = app.emit("ghost-voice-activity", serde_json::json!({}));
+    }
 }
 
 // ===== SON D'ÉCRAN (partage) : process-loopback système → Opus → datagrammes =====
@@ -904,10 +1016,12 @@ pub struct ScreenAudio {
 }
 
 impl ScreenAudio {
-    /// Démarre (ou redémarre) la capture système vers les connexions données.
-    pub fn start(&self, conns: Vec<Connection>) -> anyhow::Result<()> {
+    /// Démarre (ou redémarre) la capture vers les connexions données. `pid = None` →
+    /// TOUT le son système sauf nous (écran plein). `pid = Some(p)` → uniquement le son
+    /// de ce process (partage d'UNE fenêtre : on ne diffuse que le son de cette appli).
+    pub fn start(&self, conns: Vec<Connection>, pid: Option<u32>) -> anyhow::Result<()> {
         self.stop();
-        let f = start_screen_capture(conns)?;
+        let f = start_screen_capture(conns, pid)?;
         *self.flag.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
         Ok(())
     }
@@ -931,18 +1045,23 @@ const SILENCE_HANG_FRAMES: u32 = 25; // 500 ms : couvre les silences courts dans
 /// découpe en trames de 20 ms, encode en Opus et diffuse en SCREEN_TAG. La capture
 /// WASAPI (COM) tourne sur SON propre thread dans `sysaudio`.
 #[cfg(windows)]
-fn start_screen_capture(conns: Vec<Connection>) -> anyhow::Result<Arc<AtomicBool>> {
+fn start_screen_capture(conns: Vec<Connection>, pid: Option<u32>) -> anyhow::Result<Arc<AtomicBool>> {
     let stop = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
-    // Thread A : capture système (process-loopback EXCLUDE self), remplit `sink`.
+    // Thread A : capture (EXCLUDE self = système entier, ou INCLUDE le PID d'une
+    // fenêtre = son de cette appli seulement), remplit `sink`.
     let sink: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
     let sink_cap = 48_000; // ~1 s de coussin
+    let target = match pid {
+        Some(p) => crate::sysaudio::LoopbackTarget::IncludeProcess(p),
+        None => crate::sysaudio::LoopbackTarget::ExcludeSelf,
+    };
     {
         let stop = stop.clone();
         let sink = sink.clone();
         std::thread::spawn(move || {
-            crate::sysaudio::capture_excluding_self(stop, ready_tx, sink, sink_cap);
+            crate::sysaudio::capture_process_loopback(target, stop, ready_tx, sink, sink_cap);
         });
     }
 
@@ -1024,7 +1143,7 @@ fn start_screen_capture(conns: Vec<Connection>) -> anyhow::Result<Arc<AtomicBool
 /// Hors Windows, la capture « process loopback » n'existe pas : échec propre (l'UI le
 /// signale, l'app ne compile pas moins).
 #[cfg(not(windows))]
-fn start_screen_capture(_conns: Vec<Connection>) -> anyhow::Result<Arc<AtomicBool>> {
+fn start_screen_capture(_conns: Vec<Connection>, _pid: Option<u32>) -> anyhow::Result<Arc<AtomicBool>> {
     Err(anyhow::anyhow!(
         "capture du son système non disponible sur cette plateforme"
     ))

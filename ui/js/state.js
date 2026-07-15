@@ -55,10 +55,17 @@ export const S = {
     // Son du partage d'écran coupé, PAR pair (le son natif est per-pair, pas per-flux) :
     // une vignette recréée relit cet état au lieu de repartir à « son activé ».
     screenMuted: {},
+    // Volume du son d'écran d'un pair, en % (0..200) — le « stream qu'on regarde ».
+    // Défaut 100 (non stocké = 100). Relu par une vignette recréée.
+    screenGains: {},
     inGroupCall: false,
     groupMuted: false,
     groupCallId: null,
     pendingGCall: null,
+    // Votes d'exclusion en cours : clé "gid|cible" → { codeVotant: horodatage }.
+    kickVotes: {},
+    // Qui est en vocal / parle en ce moment (event ghost-voice-activity), par code.
+    voiceAct: {},
     gfileOfferId: null,
     // vidéo (WebRTC)
     localCam: null,

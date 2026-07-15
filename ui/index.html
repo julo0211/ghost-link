@@ -219,6 +219,14 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 
 /* ---------- Membres ---------- */
 .mem{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:4px;font-size:14px;color:var(--text)}
+/* Vote-kick : bouton discret révélé au survol du chip membre. */
+.memkick{border:none;background:transparent;color:var(--muted);cursor:pointer;font-size:12px;flex:0 0 auto;opacity:0;transition:.12s;padding:2px}
+.mem:hover .memkick{opacity:.7}
+.memkick:hover{opacity:1;filter:brightness(1.3)}
+/* Activité vocale : « en appel » = pastille pleine accent ; « parle » = anneau animé. */
+.mem.incall .dot{background:var(--accent)}
+.mem.speaking .dot{background:var(--good);box-shadow:0 0 0 0 var(--good);animation:memspk 1s ease-out infinite}
+@keyframes memspk{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--good) 70%,transparent)}100%{box-shadow:0 0 0 7px transparent}}
 .mem:hover{background:var(--hover)}
 
 /* ---------- Modale réglages ---------- */
@@ -241,6 +249,9 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 .vidsnd{position:absolute;top:5px;right:36px;border:none;background:rgba(0,0,0,.5);color:#fff;border-radius:6px;width:26px;height:26px;font-size:13px;cursor:pointer;display:grid;place-items:center;opacity:0;transition:.12s;line-height:1}
 .vidtile:hover .vidsnd{opacity:1}
 .vidsnd:hover{background:rgba(0,0,0,.8)}
+/* Curseur de volume du partage (créé par groups.ts), au bas de la vignette. */
+.vidvol{position:absolute;left:6px;right:6px;bottom:6px;width:auto;height:4px;opacity:0;transition:.12s;cursor:pointer;accent-color:var(--accent)}
+.vidtile:hover .vidvol,.vidtile:fullscreen .vidvol{opacity:.9}
 .vidtile:fullscreen{display:flex;align-items:center;justify-content:center;background:#000;border-radius:0;cursor:default;max-width:none}
 .vidtile:fullscreen video,.vidtile:fullscreen canvas{width:100%!important;height:100%!important;max-height:none!important;aspect-ratio:auto!important;object-fit:contain!important}
 .vidtile:fullscreen .vidmax,.vidtile:fullscreen .vidsnd{opacity:1}
@@ -428,7 +439,14 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
             <button class="pill hidden" id="btnGroupMute">🔇 Couper</button>
             <button class="pill" id="btnGroupCam">📹 Caméra</button>
             <button class="pill" id="btnGroupScreen">🖥️ Écran</button>
+            <button class="pill" id="btnAddMembers">➕ Membres</button>
             <span class="hint" id="groupCallStatus" style="margin:0"></span>
+          </div>
+          <!-- Ajout de membres (repliable) : liste d'amis PAS encore dans le groupe. -->
+          <div id="addMembersPanel" class="actions nb hidden" style="flex-wrap:wrap;gap:8px">
+            <div id="addMembersFriends" class="row" style="flex:1 1 200px;flex-wrap:wrap;gap:8px;min-width:0"></div>
+            <button class="pill go" id="btnAddMembersDo">Ajouter</button>
+            <button class="pill" id="btnAddMembersCancel">Annuler</button>
           </div>
           <div class="actions nb">
             <input type="text" id="groupFilePath" class="mono" placeholder="…chemin d'un fichier pour le groupe" style="flex:1 1 200px;width:auto;min-width:0;font-size:12px">
@@ -447,6 +465,17 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
       <div class="sec">Membres</div>
       <div id="groupMembers" class="list"></div>
     </aside>
+  </div>
+
+  <!-- ===== Picker de partage natif (écran OU fenêtre), au clic sur 🖥️ ===== -->
+  <div class="modal-wrap hidden" id="nativePickerWrap">
+    <div class="modal" id="nativePickerCard">
+      <div class="row" style="justify-content:space-between;flex-wrap:nowrap"><h2>🖥️ Partager…</h2><button class="btn sm ghost-btn" id="btnNativePickerCancel">Annuler</button></div>
+      <p class="hint" style="margin:14px 0 4px">Écrans</p>
+      <div id="nativePickerScreens" class="list"></div>
+      <p class="hint" style="margin:16px 0 4px">Fenêtres</p>
+      <div id="nativePickerWindows" class="list" style="max-height:38vh;overflow:auto"></div>
+    </div>
   </div>
 
   <!-- ===== Modale réglages (héberge aussi Mises à jour + Journal) ===== -->
@@ -482,9 +511,7 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
       <p class="hint" style="margin:6px 0 0">⚠️ Un STUN expose ton IP aux membres. Vide = vidéo en réseau local seulement.</p>
 
       <label class="row" style="margin-top:14px;cursor:pointer;gap:8px;display:flex"><input type="checkbox" id="setNativeVideo" style="width:auto;flex:0 0 auto"> <span style="font-size:13.5px;color:var(--text)">🧪 Partage d'écran natif (expérimental)</span></label>
-      <p class="hint" style="margin:4px 0 0">Capture + encodage H.264 matériel intégrés, envoyés sur le canal chiffré habituel : <b>sans WebRTC ni STUN — ton IP n'est jamais exposée</b>. Sans aperçu local ; qualité auto-adaptée au réseau. La caméra reste en WebRTC.</p>
-      <p class="hint" style="margin:10px 0 4px">Écran partagé (mode natif)</p>
-      <select id="setNativeMonitor"><option value="">Écran principal (auto)</option></select>
+      <p class="hint" style="margin:4px 0 0">Capture + encodage H.264 matériel intégrés, envoyés sur le canal chiffré habituel : <b>sans WebRTC ni STUN — ton IP n'est jamais exposée</b>. Au clic sur 🖥️, un choix <b>écran ou fenêtre</b> s'ouvre. Sans aperçu local ; qualité auto-adaptée au réseau. La caméra reste en WebRTC.</p>
 
       <div style="margin-top:18px;border-top:1px solid var(--hair);padding-top:14px">
         <div class="row" style="justify-content:space-between;flex-wrap:nowrap"><h2 class="sub-h">⬆️ Mises à jour</h2><button class="btn sm ghost-btn" id="btnCheckUpdate">Vérifier</button></div>

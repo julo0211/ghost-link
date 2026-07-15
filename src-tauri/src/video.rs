@@ -57,6 +57,14 @@ pub struct StartInfo {
     pub monitor_found: bool,
 }
 
+/// Ce qu'on partage : un moniteur (par szDevice stable ; None = principal) ou une
+/// fenêtre précise (par HWND). Choisi dans le picker au clic sur 🖥️.
+#[derive(Clone)]
+pub enum ShareTarget {
+    Monitor(Option<String>),
+    Window(isize),
+}
+
 impl VideoShare {
     /// Démarre (ou redémarre) le partage vers les connexions de maillage données.
     /// `monitor` : szDevice stable renvoyé par `list_monitors` (None = écran principal ;
@@ -67,7 +75,7 @@ impl VideoShare {
         app: AppHandle,
         conns: Vec<(String, Connection)>,
         rt: tokio::runtime::Handle,
-        monitor: Option<String>,
+        target: ShareTarget,
     ) -> anyhow::Result<StartInfo> {
         self.stop();
         let stop = Arc::new(AtomicBool::new(false));
@@ -79,7 +87,7 @@ impl VideoShare {
         {
             let stop = stop.clone();
             std::thread::spawn(move || {
-                win::capture_encode_thread(app, conns, rt, stop, ready_tx, monitor);
+                win::capture_encode_thread(app, conns, rt, stop, ready_tx, target);
             });
         }
         // Init WGC + NVENC : rapide en pratique ; 10 s couvre un GPU occupé.
@@ -114,7 +122,7 @@ impl VideoShare {
         _app: AppHandle,
         _conns: Vec<(String, Connection)>,
         _rt: tokio::runtime::Handle,
-        _monitor: Option<String>,
+        _target: ShareTarget,
     ) -> anyhow::Result<StartInfo> {
         Err(anyhow::anyhow!("partage d'écran natif non disponible sur cette plateforme"))
     }
@@ -138,6 +146,18 @@ pub fn list_monitors() -> Vec<serde_json::Value> {
 pub fn list_monitors() -> Vec<serde_json::Value> {
     Vec::new()
 }
+
+/// Fenêtres partageables (top-level visibles titrées) : { id (HWND), name, pid }.
+#[cfg(windows)]
+pub fn list_windows() -> Vec<serde_json::Value> {
+    win::list_windows()
+}
+
+#[cfg(not(windows))]
+pub fn list_windows() -> Vec<serde_json::Value> {
+    Vec::new()
+}
+
 
 /// Écrit les images d'un pair sur SON flux QUIC uni-directionnel, dans l'ordre.
 /// Framing : [u64 frame_id][u8 flags bit0=keyframe][u32 len][len octets H.264 Annex-B].
@@ -284,7 +304,11 @@ mod win {
         D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
         D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
     };
-    use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumChildWindows, EnumWindows, GetWindowTextLengthW, GetWindowTextW,
+        GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    };
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
     use windows::Win32::Graphics::Dxgi::IDXGIDevice;
     use windows::Win32::Graphics::Gdi::{
@@ -404,21 +428,107 @@ mod win {
             .collect()
     }
 
+    /// Titre d'une fenêtre (chaîne vide si sans titre).
+    unsafe fn window_title(h: HWND) -> String {
+        let len = GetWindowTextLengthW(h);
+        if len <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let n = GetWindowTextW(h, &mut buf);
+        String::from_utf16_lossy(&buf[..n as usize])
+    }
+
+    /// PID de l'appli pour capter SON son. Les fenêtres UWP/Store sont hébergées par
+    /// ApplicationFrameHost.exe : le PID top-level est alors celui de l'HÔTE (qui ne
+    /// joue aucun son), et la vraie appli est une fenêtre ENFANT (CoreWindow) d'un
+    /// autre process. On cherche donc un enfant dont le PID diffère de l'hôte ; sinon
+    /// (appli Win32 classique) le PID top-level est déjà le bon.
+    unsafe fn app_pid_of(h: HWND, host_pid: u32) -> u32 {
+        unsafe extern "system" fn child_cb(h: HWND, lp: LPARAM) -> BOOL {
+            let data = &mut *(lp.0 as *mut (u32, u32)); // (host_pid, résultat)
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(h, Some(&mut pid));
+            if pid != 0 && pid != data.0 {
+                data.1 = pid;
+                return false.into(); // trouvé → arrêter l'énumération
+            }
+            true.into()
+        }
+        let mut data = (host_pid, 0u32);
+        let _ = EnumChildWindows(h, Some(child_cb), LPARAM(&mut data as *mut _ as isize));
+        if data.1 != 0 {
+            data.1
+        } else {
+            host_pid
+        }
+    }
+
+    /// Fenêtres partageables pour l'UI : top-level VISIBLES et TITRÉES (on saute la
+    /// nôtre). { id (HWND en décimal), name (titre), pid (résolu, cf. UWP) }.
+    pub(super) fn list_windows() -> Vec<serde_json::Value> {
+        unsafe extern "system" fn cb(h: HWND, lp: LPARAM) -> BOOL {
+            let out = &mut *(lp.0 as *mut Vec<serde_json::Value>);
+            if IsWindowVisible(h).as_bool() {
+                let title = window_title(h);
+                if !title.is_empty() && title != "ghost link" {
+                    let mut host_pid = 0u32;
+                    GetWindowThreadProcessId(h, Some(&mut host_pid));
+                    out.push(serde_json::json!({
+                        "id": (h.0 as isize).to_string(),
+                        "name": title,
+                        "pid": app_pid_of(h, host_pid),
+                    }));
+                }
+            }
+            true.into()
+        }
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        unsafe {
+            let _ = EnumWindows(Some(cb), LPARAM(&mut out as *mut _ as isize));
+        }
+        out
+    }
+
     /// Conversion BGRA (avec pitch) → NV12 (BT.709, plage limitée), par blocs 2×2.
-    /// `out` : plan Y (w*h) puis plan UV entrelacé (w*h/2). Boucle chaude : voir
-    /// l'opt-level 1 du profil dev dans Cargo.toml.
-    fn bgra_to_nv12(src: *const u8, pitch: usize, w: usize, h: usize, out: &mut [u8]) {
+    /// `out` : plan Y (w*h) puis plan UV entrelacé (w*h/2). `cover_w/cover_h` (pairs,
+    /// ≤ w/h) = zone RÉELLEMENT couverte par la source : au-delà on écrit du noir. Sert
+    /// au letterbox/crop d'une fenêtre redimensionnée dans un tampon d'encodeur FIXE
+    /// (la fenêtre a rétréci → bords noirs ; elle a grandi → on rogne). Boucle chaude :
+    /// voir l'opt-level 1 du profil dev dans Cargo.toml.
+    fn bgra_to_nv12(src: *const u8, pitch: usize, w: usize, h: usize, cover_w: usize, cover_h: usize, out: &mut [u8]) {
         let (y_plane, uv_plane) = out.split_at_mut(w * h);
         for by in 0..h / 2 {
             let y0 = by * 2;
-            let row0 = unsafe { std::slice::from_raw_parts(src.add(y0 * pitch), w * 4) };
-            let row1 = unsafe { std::slice::from_raw_parts(src.add((y0 + 1) * pitch), w * 4) };
+            let uvrow = &mut uv_plane[by * w..(by + 1) * w];
+            // Bloc de 2 lignes ENTIÈREMENT hors couverture → noir (Y=16, chroma neutre).
+            if y0 >= cover_h {
+                for x in 0..w {
+                    y_plane[y0 * w + x] = 16;
+                    y_plane[(y0 + 1) * w + x] = 16;
+                }
+                for c in uvrow.iter_mut() {
+                    *c = 128;
+                }
+                continue;
+            }
+            let row0 = unsafe { std::slice::from_raw_parts(src.add(y0 * pitch), cover_w * 4) };
+            let row1 = unsafe { std::slice::from_raw_parts(src.add((y0 + 1) * pitch), cover_w * 4) };
             let (yrow0, yrow1) = {
                 let (a, b) = y_plane[y0 * w..(y0 + 2) * w].split_at_mut(w);
                 (a, b)
             };
-            let uvrow = &mut uv_plane[by * w..(by + 1) * w];
             for bx in 0..w / 2 {
+                // Colonne hors couverture → noir.
+                if bx * 2 >= cover_w {
+                    yrow0[bx * 2] = 16;
+                    yrow0[bx * 2 + 1] = 16;
+                    yrow1[bx * 2] = 16;
+                    yrow1[bx * 2 + 1] = 16;
+                    uvrow[bx * 2] = 128;
+                    uvrow[bx * 2 + 1] = 128;
+                    continue;
+                }
                 let x0 = bx * 2 * 4;
                 let mut rs = 0i32;
                 let mut gs = 0i32;
@@ -620,17 +730,30 @@ mod win {
         closed: Arc<AtomicBool>,
     }
 
-    /// Capture WGC du moniteur demandé (par szDevice stable ; None ou introuvable =
-    /// écran principal) + texture de relecture CPU (dimensions paires).
-    unsafe fn build_capture(device: &ID3D11Device, monitor: Option<&str>) -> anyhow::Result<Capture> {
+    /// Capture WGC de la CIBLE demandée (moniteur par szDevice stable, ou fenêtre par
+    /// HWND) + texture de relecture CPU (dimensions paires).
+    unsafe fn build_capture(device: &ID3D11Device, target: &super::ShareTarget) -> anyhow::Result<Capture> {
         let ctx = device.GetImmediateContext()?;
         let dxgi: IDXGIDevice = device.cast()?;
         let inspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi)?;
         let winrt_dev: windows::Graphics::DirectX::Direct3D11::IDirect3DDevice =
             inspectable.cast()?;
-        let (hmon, label, found) = resolve_monitor(monitor);
         let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
-        let item: GraphicsCaptureItem = interop.CreateForMonitor(hmon)?;
+        let (item, label, found): (GraphicsCaptureItem, String, bool) = match target {
+            super::ShareTarget::Monitor(dev) => {
+                let (hmon, label, found) = resolve_monitor(dev.as_deref());
+                (interop.CreateForMonitor(hmon)?, label, found)
+            }
+            super::ShareTarget::Window(hwnd) => {
+                let h = HWND(*hwnd as *mut _);
+                if !IsWindow(h).as_bool() {
+                    anyhow::bail!("fenêtre introuvable (fermée ?) — relance le partage");
+                }
+                let title = window_title(h);
+                let label = if title.is_empty() { "Fenêtre".to_string() } else { title };
+                (interop.CreateForWindow(h)?, label, true)
+            }
+        };
         let size = item.Size()?;
         let w = (size.Width as u32) & !1;
         let h = (size.Height as u32) & !1;
@@ -684,24 +807,28 @@ mod win {
             }
         }
         let Some(frame) = latest else { return Ok(false) };
-        if let Ok(size) = frame.ContentSize() {
-            if (size.Width as u32) & !1 != cap.w || (size.Height as u32) & !1 != cap.h {
-                let _ = frame.Close();
-                anyhow::bail!("résolution de l'écran modifiée — relance le partage");
-            }
-        }
+        // Taille COURANTE de la source (une fenêtre partagée change de taille). On la
+        // letterbox/crop dans le tampon FIXE de l'encodeur (cap.w×cap.h) : rétréci →
+        // bords noirs, agrandi → rogné. Jamais d'arrêt ni de reconfiguration NVENC.
+        let (cover_w, cover_h) = match frame.ContentSize() {
+            Ok(s) => (
+                ((s.Width as u32) & !1).min(cap.w),
+                ((s.Height as u32) & !1).min(cap.h),
+            ),
+            Err(_) => (cap.w, cap.h),
+        };
         let ok = (|| -> anyhow::Result<()> {
             let surface = frame.Surface()?;
             let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
             let tex: ID3D11Texture2D = access.GetInterface()?;
-            // CopySubresourceRegion (pas CopyResource) : la texture WGC peut dépasser
-            // d'un pixel nos dimensions paires.
+            // CopySubresourceRegion (pas CopyResource) : ne copier que la zone couverte
+            // (bornée à la texture source ET au tampon fixe).
             let src_box = D3D11_BOX {
                 left: 0,
                 top: 0,
                 front: 0,
-                right: cap.w,
-                bottom: cap.h,
+                right: cover_w.max(2),
+                bottom: cover_h.max(2),
                 back: 1,
             };
             cap.ctx
@@ -713,6 +840,8 @@ mod win {
                 mapped.RowPitch as usize,
                 cap.w as usize,
                 cap.h as usize,
+                cover_w as usize,
+                cover_h as usize,
                 nv12,
             );
             cap.ctx.Unmap(&cap.staging, 0);
@@ -737,7 +866,7 @@ mod win {
         rt: tokio::runtime::Handle,
         stop: Arc<AtomicBool>,
         ready: std::sync::mpsc::Sender<Result<(u32, u32, String, bool), String>>,
-        monitor: Option<String>,
+        target: super::ShareTarget,
     ) {
         unsafe {
             // Apartment WinRT multithread pour WGC ; toléré s'il est déjà initialisé.
@@ -763,7 +892,7 @@ mod win {
                 // Requis avec le DXGI Device Manager (l'encodeur travaille sur d'autres threads).
                 let mt: ID3D10Multithread = device.cast()?;
                 let _ = mt.SetMultithreadProtected(true);
-                let cap = build_capture(&device, monitor.as_deref())?;
+                let cap = build_capture(&device, &target)?;
                 let enc = build_encoder(&device, cap.w, cap.h)?;
                 Ok((cap, enc, device))
             })();
@@ -1002,7 +1131,7 @@ mod win {
                 px[3] = 255;
             }
             let mut out = vec![0u8; W * H * 3 / 2];
-            bgra_to_nv12(src.as_ptr(), W * 4, W, H, &mut out);
+            bgra_to_nv12(src.as_ptr(), W * 4, W, H, W, H, &mut out);
             (out[0], out[W * H], out[W * H + 1])
         }
 
@@ -1038,10 +1167,28 @@ mod win {
                 }
             }
             let mut out = vec![0u8; W * H * 3 / 2];
-            bgra_to_nv12(src.as_ptr(), PITCH, W, H, &mut out);
+            bgra_to_nv12(src.as_ptr(), PITCH, W, H, W, H, &mut out);
             for &y in &out[..W * H] {
                 assert!((233..=237).contains(&y), "Y = {y}");
             }
+        }
+
+        #[test]
+        fn nv12_letterbox_borde_de_noir() {
+            // Fenêtre 4×4 rétrécie couvrant seulement 2×2 d'un tampon 4×4 : le coin
+            // haut-gauche = blanc, le reste = noir (Y=16, chroma neutre).
+            const W: usize = 4;
+            const H: usize = 4;
+            let mut src = vec![255u8; W * H * 4]; // tout blanc opaque
+            let mut out = vec![0u8; W * H * 3 / 2];
+            bgra_to_nv12(src.as_mut_ptr(), W * 4, W, H, 2, 2, &mut out);
+            // Y : (0,0) et (1,1) couverts (~235), (2,*) et (*,2) noirs (16).
+            assert!((233..=237).contains(&out[0]), "Y couvert = {}", out[0]);
+            assert_eq!(out[2], 16, "Y bord droit doit être noir");
+            assert_eq!(out[2 * W], 16, "Y bord bas doit être noir");
+            // Chroma du bloc couvert (0,0) neutre-ish ; bloc bord = 128/128.
+            assert_eq!(out[W * H + 2], 128);
+            assert_eq!(out[W * H + 3], 128);
         }
 
         #[test]
@@ -1051,6 +1198,111 @@ mod win {
             assert!(looks_like_keyframe(&[0x09, 0x10, 0, 0, 0, 1, 0x65]));
             assert!(!looks_like_keyframe(&[0, 0, 0, 1, 0x41, 0x9a]));
             assert!(!looks_like_keyframe(&[0, 0, 0]));
+        }
+
+        #[test]
+        fn enumeration_fenetres_ne_panique_pas() {
+            // Ne doit jamais paniquer ; chaque entrée a un id/pid non vides.
+            for w in list_windows() {
+                assert!(!w["id"].as_str().unwrap_or("").is_empty());
+                assert!(w["pid"].as_u64().unwrap_or(0) > 0, "pid manquant: {w:?}");
+            }
+        }
+
+        /// Smoke matériel de la capture de FENÊTRE (CreateForWindow + letterbox) : prend
+        /// la 1re fenêtre partageable et encode quelques trames. `cargo test -- --ignored`.
+        #[test]
+        #[ignore = "matériel : GPU + une fenêtre visible requis"]
+        fn smoke_window_capture() {
+            let wins = list_windows();
+            let Some(first) = wins.first() else {
+                eprintln!("aucune fenêtre — test ignoré de fait");
+                return;
+            };
+            let hwnd: isize = first["id"].as_str().unwrap().parse().unwrap();
+            unsafe {
+                let _ = RoInitialize(RO_INIT_MULTITHREADED);
+                MFStartup(MF_VERSION, MFSTARTUP_FULL).unwrap();
+                let mut device: Option<ID3D11Device> = None;
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    None,
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    None,
+                )
+                .unwrap();
+                let device = device.unwrap();
+                let mt: ID3D10Multithread = device.cast().unwrap();
+                let _ = mt.SetMultithreadProtected(true);
+                let cap = build_capture(&device, &crate::video::ShareTarget::Window(hwnd))
+                    .expect("capture de fenêtre");
+                let enc = build_encoder(&device, cap.w, cap.h).expect("encodeur");
+                let (w, h) = (cap.w as usize, cap.h as usize);
+                let mut nv12 = vec![0u8; w * h * 3 / 2];
+                let frame_dur: i64 = 10_000_000 / FPS as i64;
+                let mut fed = 0u64;
+                let mut got = 0u64;
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while got < 8 && Instant::now() < deadline {
+                    let ev = match enc.gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+                        Ok(e) => e,
+                        Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(e) => panic!("GetEvent: {e}"),
+                    };
+                    let ty = ev.GetType().unwrap() as i32;
+                    if ty == METransformNeedInput.0 {
+                        let mut fails = 0u32;
+                        let _ = grab_latest(&cap, &mut nv12, &mut fails);
+                        let mb = MFCreateMemoryBuffer(nv12.len() as u32).unwrap();
+                        let mut dst: *mut u8 = std::ptr::null_mut();
+                        mb.Lock(&mut dst, None, None).unwrap();
+                        std::ptr::copy_nonoverlapping(nv12.as_ptr(), dst, nv12.len());
+                        mb.Unlock().unwrap();
+                        mb.SetCurrentLength(nv12.len() as u32).unwrap();
+                        let sample = MFCreateSample().unwrap();
+                        sample.AddBuffer(&mb).unwrap();
+                        sample.SetSampleTime(fed as i64 * frame_dur).unwrap();
+                        sample.SetSampleDuration(frame_dur).unwrap();
+                        enc.transform.ProcessInput(0, &sample, 0).unwrap();
+                        fed += 1;
+                    } else if ty == METransformHaveOutput.0 {
+                        let mut out = [MFT_OUTPUT_DATA_BUFFER {
+                            dwStreamID: 0,
+                            pSample: ManuallyDrop::new(None),
+                            dwStatus: 0,
+                            pEvents: ManuallyDrop::new(None),
+                        }];
+                        let mut status = 0u32;
+                        enc.transform.ProcessOutput(0, &mut out, &mut status).unwrap();
+                        let sample = ManuallyDrop::take(&mut out[0].pSample);
+                        let _ = ManuallyDrop::take(&mut out[0].pEvents);
+                        if let Some(sample) = sample {
+                            let (_key, data) = read_sample(&sample).unwrap();
+                            assert!(
+                                data.starts_with(&[0, 0, 0, 1]) || data.starts_with(&[0, 0, 1]),
+                                "sortie sans start code Annex-B"
+                            );
+                            got += 1;
+                        }
+                    }
+                }
+                let _ = cap.session.Close();
+                let _ = cap.pool.Close();
+                enc.shutdown();
+                drop(cap);
+                drop(device);
+                let _ = MFShutdown();
+                assert!(got >= 8, "seulement {got} trames encodées depuis « {} »", first["name"]);
+                println!("✅ smoke fenêtre {}x{} « {} » : {got} trames H.264", w, h, first["name"]);
+            }
         }
 
         #[test]
@@ -1089,7 +1341,7 @@ mod win {
                 let device = device.unwrap();
                 let mt: ID3D10Multithread = device.cast().unwrap();
                 let _ = mt.SetMultithreadProtected(true);
-                let cap = build_capture(&device, None).expect("capture WGC");
+                let cap = build_capture(&device, &crate::video::ShareTarget::Monitor(None)).expect("capture WGC");
                 let enc = build_encoder(&device, cap.w, cap.h).expect("encodeur matériel");
                 let (w, h) = (cap.w as usize, cap.h as usize);
                 let mut nv12 = vec![0u8; w * h * 3 / 2];

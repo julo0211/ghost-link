@@ -87,6 +87,16 @@ async fn send_ginvite(state: State<'_, Net>, member: String, gid: String, name: 
 }
 
 #[tauri::command]
+async fn send_gmembers(state: State<'_, Net>, members: Vec<String>, gid: String, name: String, roster: String) -> Result<(), String> {
+    net::send_gmembers(state.inner(), members, &gid, &name, &roster).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn send_kick(state: State<'_, Net>, members: Vec<String>, gid: String, target: String, voter: String) -> Result<(), String> {
+    net::send_kick(state.inner(), members, &gid, &target, &voter).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn set_download_dir(state: State<'_, Net>, path: String) {
     net::set_download_dir(&state.settings, &path);
 }
@@ -174,6 +184,7 @@ fn call_set_mute(call: State<'_, audio::Call>, on: bool) {
 
 #[tauri::command]
 async fn group_call_start(
+    app: tauri::AppHandle,
     net: State<'_, Net>,
     call: State<'_, audio::GroupCall>,
     cfg: State<'_, audio::AudioCfg>,
@@ -188,7 +199,7 @@ async fn group_call_start(
     let c = call.inner().clone();
     let acfg = cfg.inner().clone();
     let rt = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || c.start(conns, rt, acfg))
+    tokio::task::spawn_blocking(move || c.start(app, conns, rt, acfg))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
@@ -229,6 +240,7 @@ async fn screen_audio_start(
     net: State<'_, Net>,
     sa: State<'_, audio::ScreenAudio>,
     members: Vec<String>,
+    pid: Option<u32>,
 ) -> Result<(), String> {
     let conns: Vec<_> = net::group_conns(net.inner(), &members)
         .into_iter()
@@ -238,7 +250,7 @@ async fn screen_audio_start(
         return Err("aucun membre du groupe en ligne".to_string());
     }
     let s = sa.inner().clone();
-    tokio::task::spawn_blocking(move || s.start(conns))
+    tokio::task::spawn_blocking(move || s.start(conns, pid))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
@@ -256,6 +268,12 @@ fn screen_audio_mute(call: State<'_, audio::GroupCall>, peer: String, on: bool) 
     call.set_screen_mute(&peer, on);
 }
 
+// Volume LOCAL du son d'écran d'un pair (le « stream qu'on regarde ») : 0.0..=2.0.
+#[tauri::command]
+fn screen_audio_gain(call: State<'_, audio::GroupCall>, peer: String, vol: f64) {
+    call.set_screen_gain(&peer, vol as f32);
+}
+
 #[tauri::command]
 async fn send_signal(state: State<'_, Net>, peer: String, data: String) -> Result<(), String> {
     net::send_signal(state.inner(), &peer, &data).await.map_err(|e| e.to_string())
@@ -271,14 +289,23 @@ async fn video_share_start(
     app: tauri::AppHandle,
     members: Vec<String>,
     monitor: Option<String>,
+    window: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let conns = net::group_conns(net.inner(), &members);
     if conns.is_empty() {
         return Err("aucun membre du groupe en ligne".to_string());
     }
+    // Fenêtre choisie (HWND décimal) → capture de fenêtre ; sinon moniteur (szDevice).
+    let target = match window.as_deref() {
+        Some(w) if !w.is_empty() => {
+            let hwnd = w.parse::<isize>().map_err(|_| "fenêtre invalide".to_string())?;
+            video::ShareTarget::Window(hwnd)
+        }
+        _ => video::ShareTarget::Monitor(monitor),
+    };
     let v = vs.inner().clone();
     let rt = tokio::runtime::Handle::current();
-    let info = tokio::task::spawn_blocking(move || v.start(app, conns, rt, monitor))
+    let info = tokio::task::spawn_blocking(move || v.start(app, conns, rt, target))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
@@ -296,10 +323,16 @@ fn video_share_stop(vs: State<'_, video::VideoShare>) {
     vs.stop();
 }
 
-/// Moniteurs disponibles pour le partage natif (Réglages → « Écran partagé »).
+/// Moniteurs disponibles pour le partage natif (picker au clic sur 🖥️).
 #[tauri::command]
 fn video_list_monitors() -> Vec<serde_json::Value> {
     video::list_monitors()
+}
+
+/// Fenêtres partageables (picker) : { id (HWND), name, pid }.
+#[tauri::command]
+fn video_list_windows() -> Vec<serde_json::Value> {
+    video::list_windows()
 }
 
 /// La WebView s'abonne au flux vidéo natif entrant (un canal binaire par page).
@@ -446,9 +479,9 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            perm_code, eph_code, rotate_eph_code, probe, connect, send_file, send_chat, send_freq, send_faccept, open_group, send_gchat, send_ginvite,
-            group_call_start, group_call_stop, group_call_mute, group_call_volume, screen_audio_start, screen_audio_stop, screen_audio_mute, send_signal, send_gfile,
-            video_share_start, video_share_stop, video_receive_attach, video_list_monitors,
+            perm_code, eph_code, rotate_eph_code, probe, connect, send_file, send_chat, send_freq, send_faccept, open_group, send_gchat, send_ginvite, send_gmembers, send_kick,
+            group_call_start, group_call_stop, group_call_mute, group_call_volume, screen_audio_start, screen_audio_stop, screen_audio_mute, screen_audio_gain, send_signal, send_gfile,
+            video_share_start, video_share_stop, video_receive_attach, video_list_monitors, video_list_windows,
             fingerprint, app_version, check_update, install_update, set_download_dir,
             get_download_dir, set_only_friends, set_friends, voice_test_start, voice_test_stop,
             call_start, call_stop, call_set_mute, list_audio_devices, set_audio_input,
