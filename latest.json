@@ -1,11 +1,11 @@
 {
-  "version": "0.32.0",
-  "notes": "Partage natif adaptatif + choix de l'écran + stats en direct",
-  "pub_date": "2026-07-15T14:54:08.703Z",
+  "version": "0.33.0",
+  "notes": "Volume du stream, indicateur vocal, groupes (ajout + vote-kick), partage écran ou fenêtre + son de fenêtre",
+  "pub_date": "2026-07-15T21:03:26.004Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVpiZ3hCN1ZWbzVyNDBMY0d0Rm1adjFRVTBLVkx4bzZFSkN1QXAySDhyK2xla29hMDd0UGQwWlJDUVpiN0RvMXorVDExUXRMbmpFSXFwRUFjSFE3b0FvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MTI3MjQ3CWZpbGU6Z2hvc3QtbGlua18wLjMyLjBfeDY0LXNldHVwLmV4ZQp6alk3eDZPK0VxVlArbDlHL2NSUHFzZkx6T0Jlb0VIRC9kSWVubldBZU1mTjdpMXpvWk1Ec0dKbytDSVhNZU0wTmMvelpoRlV5SjdKSFFYUzRkL1dEUT09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.32.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRWExK3hmZEQwazhvblh1SHJGRmNPdEJGSWJSbHJVTEhuZi9XVHdrYU1UOTJhTXpBOEl1UXV4SjJMUmxXcU53aHBZQnJoTDMwT1VRR1o2d3VPa0RncEFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MTQ5NDA1CWZpbGU6Z2hvc3QtbGlua18wLjMzLjBfeDY0LXNldHVwLmV4ZQpEa1FUS0l6Umd5SGd6MjFMR0UyNUxNa29UanY0SWk0VFM4VGNSQld2QVd1eHhVbTdxcGN5R1Z1SUdKOFNRUnpjTkR0RmZkT21sbHQwRkthTWNKM1hBQT09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.33.0_x64-setup.exe"
     }
   }
 }
