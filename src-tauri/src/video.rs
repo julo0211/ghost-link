@@ -27,6 +27,11 @@ const FPS: u32 = 30;
 const KEYFRAME_SECS: u32 = 2;
 /// Profondeur de la file d'envoi par pair (~2 s de vidéo) avant de sauter des trames.
 const PEER_QUEUE: usize = 64;
+/// Échelle d'adaptation (étape 3) : (fps, % du débit de base). Niveau 0 = qualité
+/// max ; on descend d'un cran quand les files des pairs débordent (réseau saturé),
+/// on remonte d'un cran après 12 s de calme. Le débit NVENC est reconfiguré À CHAUD
+/// (ICodecAPI) — validé sur cette machine par le smoke test matériel.
+const LEVELS: [(u32, u32); 4] = [(30, 100), (20, 66), (12, 40), (8, 25)];
 
 /// Une image encodée, partagée entre tous les pairs (clone = comptage de références).
 #[derive(Clone)]
@@ -42,32 +47,44 @@ pub struct VideoShare {
     flag: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
+/// Écran réellement capturé, remonté à l'UI (nom + « écran demandé trouvé ? »).
+#[derive(Clone)]
+pub struct StartInfo {
+    pub w: u32,
+    pub h: u32,
+    pub fps: u32,
+    pub monitor: String,
+    pub monitor_found: bool,
+}
+
 impl VideoShare {
     /// Démarre (ou redémarre) le partage vers les connexions de maillage données.
-    /// Renvoie (largeur, hauteur, fps) une fois la capture ET l'encodeur prêts.
+    /// `monitor` : szDevice stable renvoyé par `list_monitors` (None = écran principal ;
+    /// un szDevice devenu introuvable retombe sur le principal, `monitor_found=false`).
     #[cfg(windows)]
     pub fn start(
         &self,
         app: AppHandle,
         conns: Vec<(String, Connection)>,
         rt: tokio::runtime::Handle,
-    ) -> anyhow::Result<(u32, u32, u32)> {
+        monitor: Option<String>,
+    ) -> anyhow::Result<StartInfo> {
         self.stop();
         let stop = Arc::new(AtomicBool::new(false));
         // Publier le drapeau AVANT l'init : un stop() qui tombe PENDANT l'init
         // (raccrochage de l'appel, filet de group_call_stop) ne doit jamais être
         // perdu — il tuera cette capture dès sa première boucle.
         *self.flag.lock().unwrap_or_else(|e| e.into_inner()) = Some(stop.clone());
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(u32, u32), String>>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(u32, u32, String, bool), String>>();
         {
             let stop = stop.clone();
             std::thread::spawn(move || {
-                win::capture_encode_thread(app, conns, rt, stop, ready_tx);
+                win::capture_encode_thread(app, conns, rt, stop, ready_tx, monitor);
             });
         }
         // Init WGC + NVENC : rapide en pratique ; 10 s couvre un GPU occupé.
         match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(Ok((w, h))) => Ok((w, h, FPS)),
+            Ok(Ok((w, h, monitor, monitor_found))) => Ok(StartInfo { w, h, fps: FPS, monitor, monitor_found }),
             Ok(Err(e)) => {
                 stop.store(true, Ordering::SeqCst);
                 self.clear_if(&stop);
@@ -97,7 +114,8 @@ impl VideoShare {
         _app: AppHandle,
         _conns: Vec<(String, Connection)>,
         _rt: tokio::runtime::Handle,
-    ) -> anyhow::Result<(u32, u32, u32)> {
+        _monitor: Option<String>,
+    ) -> anyhow::Result<StartInfo> {
         Err(anyhow::anyhow!("partage d'écran natif non disponible sur cette plateforme"))
     }
 
@@ -107,6 +125,18 @@ impl VideoShare {
             f.store(true, Ordering::SeqCst);
         }
     }
+}
+
+/// Moniteurs disponibles pour le partage, dans l'ordre d'énumération Windows.
+/// L'index renvoyé est celui attendu par `VideoShare::start(monitor)`.
+#[cfg(windows)]
+pub fn list_monitors() -> Vec<serde_json::Value> {
+    win::list_monitors()
+}
+
+#[cfg(not(windows))]
+pub fn list_monitors() -> Vec<serde_json::Value> {
+    Vec::new()
 }
 
 /// Écrit les images d'un pair sur SON flux QUIC uni-directionnel, dans l'ordre.
@@ -161,25 +191,35 @@ struct PeerOut {
     dead: bool,
 }
 
+/// Résultat d'une diffusion : pairs dont le flux vient de mourir (à signaler à
+/// l'UI) et signal de congestion (au moins une file pleine — carburant du
+/// contrôleur adaptatif de l'étape 3).
+#[derive(Default)]
+struct DispatchOutcome {
+    newly_dead: Vec<String>,
+    congested: bool,
+}
+
 /// Diffuse une image encodée à tous les pairs, sans jamais bloquer l'encodeur.
-/// Renvoie les codes des pairs dont le flux vient de MOURIR (writer terminé) —
-/// l'appelant les signale à l'UI plutôt que de les laisser disparaître en silence.
-fn dispatch(peers: &mut [PeerOut], frame: &Frame) -> Vec<String> {
-    let mut newly_dead = Vec::new();
+fn dispatch(peers: &mut [PeerOut], frame: &Frame) -> DispatchOutcome {
+    let mut out = DispatchOutcome::default();
     for p in peers.iter_mut() {
         if p.dead || (p.wait_key && !frame.key) {
             continue;
         }
         match p.tx.try_send(frame.clone()) {
             Ok(()) => p.wait_key = false,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => p.wait_key = true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                p.wait_key = true;
+                out.congested = true;
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 p.dead = true;
-                newly_dead.push(p.code.clone());
+                out.newly_dead.push(p.code.clone());
             }
         }
     }
-    newly_dead
+    out
 }
 
 #[cfg(test)]
@@ -196,12 +236,13 @@ mod tests {
         // et ne reprendre QUE sur une image clé (sinon le GOP est corrompu).
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(1);
         let mut peers = vec![PeerOut { code: "p1".into(), tx, wait_key: false, dead: false }];
-        assert!(dispatch(&mut peers, &f(1, true)).is_empty()); // remplit la file
-        dispatch(&mut peers, &f(2, false)); // Full → wait_key
-        assert!(peers[0].wait_key);
+        let o = dispatch(&mut peers, &f(1, true)); // remplit la file
+        assert!(o.newly_dead.is_empty() && !o.congested);
+        let o = dispatch(&mut peers, &f(2, false)); // Full → wait_key + congestion
+        assert!(peers[0].wait_key && o.congested);
         assert_eq!(rx.try_recv().unwrap().id, 1); // on vide la file
-        dispatch(&mut peers, &f(3, false)); // delta : sautée malgré la place
-        assert!(rx.try_recv().is_err());
+        let o = dispatch(&mut peers, &f(3, false)); // delta : sautée malgré la place
+        assert!(rx.try_recv().is_err() && !o.congested); // saut silencieux ≠ congestion
         dispatch(&mut peers, &f(4, true)); // keyframe : reprise
         assert!(!peers[0].wait_key);
         let got = rx.try_recv().unwrap();
@@ -213,16 +254,17 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Frame>(1);
         drop(rx);
         let mut peers = vec![PeerOut { code: "p1".into(), tx, wait_key: false, dead: false }];
-        assert_eq!(dispatch(&mut peers, &f(1, true)), vec!["p1".to_string()]);
+        assert_eq!(dispatch(&mut peers, &f(1, true)).newly_dead, vec!["p1".to_string()]);
         assert!(peers[0].dead);
-        // Une fois mort : plus jamais re-signalé.
-        assert!(dispatch(&mut peers, &f(2, true)).is_empty());
+        // Une fois mort : plus jamais re-signalé, et jamais compté congestionné.
+        let o = dispatch(&mut peers, &f(2, true));
+        assert!(o.newly_dead.is_empty() && !o.congested);
     }
 }
 
 #[cfg(windows)]
 mod win {
-    use super::{dispatch, peer_writer, Frame, PeerOut, FPS, KEYFRAME_SECS, PEER_QUEUE};
+    use super::{dispatch, peer_writer, Frame, PeerOut, FPS, KEYFRAME_SECS, LEVELS, PEER_QUEUE};
     use std::mem::ManuallyDrop;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -242,9 +284,15 @@ mod win {
         D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
         D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
     };
+    use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
     use windows::Win32::Graphics::Dxgi::IDXGIDevice;
-    use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO,
+        MONITORINFOEXW, MONITOR_DEFAULTTOPRIMARY,
+    };
+    /// MONITORINFOF_PRIMARY (winuser.h) — absent des bindings windows 0.58.
+    const MONITORINFOF_PRIMARY: u32 = 1;
     use windows::Win32::Media::MediaFoundation::{
         ICodecAPI, IMFActivate, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFSample,
         IMFTransform, MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer,
@@ -258,7 +306,7 @@ mod win {
         MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
         MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK,
         MF_VERSION, MFSTARTUP_FULL, MFVideoFormat_H264, MFVideoFormat_NV12,
-        MFVideoInterlace_Progressive, CODECAPI_AVEncMPVGOPSize,
+        MFVideoInterlace_Progressive, CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncMPVGOPSize,
     };
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::System::WinRT::Direct3D11::{
@@ -277,6 +325,83 @@ mod win {
         } else {
             5_000_000
         }
+    }
+
+    /// Poignées des moniteurs, dans l'ordre d'énumération Windows.
+    fn monitor_handles() -> Vec<isize> {
+        unsafe extern "system" fn cb(h: HMONITOR, _dc: HDC, _rc: *mut RECT, lp: LPARAM) -> BOOL {
+            let v = &mut *(lp.0 as *mut Vec<isize>);
+            v.push(h.0 as isize);
+            true.into()
+        }
+        let mut out: Vec<isize> = Vec::new();
+        unsafe {
+            let _ = EnumDisplayMonitors(None, None, Some(cb), LPARAM(&mut out as *mut _ as isize));
+        }
+        out
+    }
+
+    /// Lit le szDevice ("\\.\DISPLAYn") d'un moniteur — c'est notre IDENTITÉ STABLE :
+    /// contrairement à l'index d'énumération, elle ne change PAS si un autre écran est
+    /// branché/débranché entre deux partages (sinon on capturerait le mauvais écran).
+    unsafe fn monitor_device(h: isize) -> Option<String> {
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if !GetMonitorInfoW(HMONITOR(h as *mut _), &mut info.monitorInfo as *mut MONITORINFO).as_bool() {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&info.szDevice).trim_end_matches('\0').to_string())
+    }
+
+    /// "\\.\DISPLAY3" → « Écran 3 » (numéro système, indépendant de l'ordre d'énum).
+    fn monitor_label(dev: &str, fallback_idx: usize) -> String {
+        let num = dev.rfind(|c: char| !c.is_ascii_digit()).map(|p| &dev[p + 1..]).unwrap_or("");
+        if num.is_empty() { format!("Écran {}", fallback_idx + 1) } else { format!("Écran {num}") }
+    }
+
+    /// Résout l'écran à capturer par son szDevice stable. Renvoie (handle, label,
+    /// found) : found=false = szDevice demandé introuvable → repli sur le principal
+    /// (l'appelant en avertit l'UI au lieu de diffuser le mauvais écran en silence).
+    unsafe fn resolve_monitor(want: Option<&str>) -> (HMONITOR, String, bool) {
+        let handles = monitor_handles();
+        if let Some(dev) = want {
+            for (i, &h) in handles.iter().enumerate() {
+                if monitor_device(h).as_deref() == Some(dev) {
+                    return (HMONITOR(h as *mut _), monitor_label(dev, i), true);
+                }
+            }
+        }
+        // Défaut / non trouvé : écran principal.
+        let hprim = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let idx = handles.iter().position(|&h| h == hprim.0 as isize).unwrap_or(0);
+        let label = monitor_device(hprim.0 as isize)
+            .map(|d| monitor_label(&d, idx))
+            .unwrap_or_else(|| "Écran principal".into());
+        (hprim, label, want.is_none())
+    }
+
+    /// Description des moniteurs pour l'UI : { id (szDevice), name, w, h, primary }.
+    pub(super) fn list_monitors() -> Vec<serde_json::Value> {
+        monitor_handles()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, h)| unsafe {
+                let mut info = MONITORINFOEXW::default();
+                info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+                if !GetMonitorInfoW(HMONITOR(h as *mut _), &mut info.monitorInfo as *mut MONITORINFO).as_bool() {
+                    return None;
+                }
+                let r = info.monitorInfo.rcMonitor;
+                let dev = String::from_utf16_lossy(&info.szDevice).trim_end_matches('\0').to_string();
+                Some(serde_json::json!({
+                    "id": dev,
+                    "name": monitor_label(&dev, i),
+                    "w": r.right - r.left,
+                    "h": r.bottom - r.top,
+                    "primary": info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+                }))
+            })
+            .collect()
     }
 
     /// Conversion BGRA (avec pitch) → NV12 (BT.709, plage limitée), par blocs 2×2.
@@ -331,15 +456,35 @@ mod win {
         activate: IMFActivate,
         transform: IMFTransform,
         gen: IMFMediaEventGenerator,
+        /// ICodecAPI de l'encodeur (si exposée) : réglages À CHAUD du débit moyen et
+        /// du GOP — le levier du contrôleur adaptatif (étape 3).
+        codec_api: Option<ICodecAPI>,
     }
 
     impl Encoder {
+        /// Change le débit moyen cible pendant l'encodage. Best-effort : false si
+        /// l'encodeur ne le supporte pas (le contrôleur garde alors le seul levier
+        /// fps — moins efficace, mais jamais bloquant).
+        unsafe fn set_bitrate(&self, bps: u32) -> bool {
+            let Some(ca) = &self.codec_api else { return false };
+            let v = windows::core::VARIANT::from(bps);
+            ca.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v).is_ok()
+        }
+
+        /// Change l'intervalle d'images clés (en trames) pendant l'encodage.
+        unsafe fn set_gop(&self, frames: u32) -> bool {
+            let Some(ca) = &self.codec_api else { return false };
+            let v = windows::core::VARIANT::from(frames);
+            ca.SetValue(&CODECAPI_AVEncMPVGOPSize, &v).is_ok()
+        }
+
         /// Libération COMPLÈTE de l'encodeur matériel : relâcher transform/gen puis
         /// `ShutdownObject` sur l'activation. Sans ça, la session NVENC (limitées à
         /// quelques-unes par GPU GeForce) fuit à CHAQUE partage — au bout de N
         /// partages, plus aucun encodeur matériel disponible sur la machine.
         unsafe fn shutdown(self) {
-            let Encoder { activate, transform, gen } = self;
+            let Encoder { activate, transform, gen, codec_api } = self;
+            drop(codec_api);
             drop(gen);
             drop(transform);
             let _ = activate.ShutdownObject();
@@ -441,8 +586,10 @@ mod win {
             .SetInputType(0, &in_ty, 0)
             .map_err(|e| anyhow::anyhow!("SetInputType: {e}"))?;
 
-        // Intervalle d'images clés (best-effort : tous les encodeurs ne l'exposent pas).
-        if let Ok(ca) = transform.cast::<ICodecAPI>() {
+        // ICodecAPI : GOP initial + leviers à chaud du contrôleur adaptatif
+        // (best-effort : tous les encodeurs ne l'exposent pas).
+        let codec_api = transform.cast::<ICodecAPI>().ok();
+        if let Some(ca) = &codec_api {
             let gop = windows::core::VARIANT::from(FPS * KEYFRAME_SECS);
             let _ = ca.SetValue(&CODECAPI_AVEncMPVGOPSize, &gop);
         }
@@ -452,7 +599,7 @@ mod win {
         transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
         // Succès : désamorcer la garde, Encoder::shutdown fera le ShutdownObject.
         let activate = guard.0.take().expect("garde d'activation déjà consommée");
-        Ok(Encoder { activate, transform, gen })
+        Ok(Encoder { activate, transform, gen, codec_api })
     }
 
     struct Capture {
@@ -462,20 +609,26 @@ mod win {
         ctx: ID3D11DeviceContext,
         w: u32,
         h: u32,
+        /// Nom de l'écran RÉELLEMENT capturé (pour l'UI de l'émetteur).
+        label: String,
+        /// false = l'écran demandé (szDevice) était introuvable → on a replié sur le
+        /// principal ; l'UI l'annonce pour ne pas diffuser le mauvais écran en silence.
+        found: bool,
         /// Posé par l'événement Closed de l'item WGC (moniteur débranché, session
         /// terminée par le système). Sans lui, la mort de la source serait
         /// indiscernable d'un écran statique : image figée diffusée pour toujours.
         closed: Arc<AtomicBool>,
     }
 
-    /// Capture WGC de l'écran principal + texture de relecture CPU (dimensions paires).
-    unsafe fn build_capture(device: &ID3D11Device) -> anyhow::Result<Capture> {
+    /// Capture WGC du moniteur demandé (par szDevice stable ; None ou introuvable =
+    /// écran principal) + texture de relecture CPU (dimensions paires).
+    unsafe fn build_capture(device: &ID3D11Device, monitor: Option<&str>) -> anyhow::Result<Capture> {
         let ctx = device.GetImmediateContext()?;
         let dxgi: IDXGIDevice = device.cast()?;
         let inspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi)?;
         let winrt_dev: windows::Graphics::DirectX::Direct3D11::IDirect3DDevice =
             inspectable.cast()?;
-        let hmon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let (hmon, label, found) = resolve_monitor(monitor);
         let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
         let item: GraphicsCaptureItem = interop.CreateForMonitor(hmon)?;
         let size = item.Size()?;
@@ -513,7 +666,7 @@ mod win {
         let mut staging: Option<ID3D11Texture2D> = None;
         device.CreateTexture2D(&desc, None, Some(&mut staging))?;
         let staging = staging.ok_or_else(|| anyhow::anyhow!("texture de relecture impossible"))?;
-        Ok(Capture { pool, session, staging, ctx, w, h, closed })
+        Ok(Capture { pool, session, staging, ctx, w, h, label, found, closed })
     }
 
     /// S'il y a une (ou plusieurs) nouvelle(s) trame(s) WGC, copie la plus récente dans
@@ -583,7 +736,8 @@ mod win {
         conns: Vec<(String, Connection)>,
         rt: tokio::runtime::Handle,
         stop: Arc<AtomicBool>,
-        ready: std::sync::mpsc::Sender<Result<(u32, u32), String>>,
+        ready: std::sync::mpsc::Sender<Result<(u32, u32, String, bool), String>>,
+        monitor: Option<String>,
     ) {
         unsafe {
             // Apartment WinRT multithread pour WGC ; toléré s'il est déjà initialisé.
@@ -609,7 +763,7 @@ mod win {
                 // Requis avec le DXGI Device Manager (l'encodeur travaille sur d'autres threads).
                 let mt: ID3D10Multithread = device.cast()?;
                 let _ = mt.SetMultithreadProtected(true);
-                let cap = build_capture(&device)?;
+                let cap = build_capture(&device, monitor.as_deref())?;
                 let enc = build_encoder(&device, cap.w, cap.h)?;
                 Ok((cap, enc, device))
             })();
@@ -621,7 +775,7 @@ mod win {
                     return;
                 }
             };
-            let _ = ready.send(Ok((cap.w, cap.h)));
+            let _ = ready.send(Ok((cap.w, cap.h, cap.label.clone(), cap.found)));
 
             // Un flux QUIC par pair, alimenté par une file bornée (contre-pression).
             let mut peers: Vec<PeerOut> = conns
@@ -657,7 +811,10 @@ mod win {
         }
     }
 
-    /// Boucle NeedInput/HaveOutput cadencée à FPS avec duplication de trame.
+    /// Boucle NeedInput/HaveOutput avec duplication de trame, cadence ADAPTATIVE
+    /// (étape 3 : les débordements des files par pair font descendre l'échelle
+    /// LEVELS — fps ET débit NVENC à chaud — ; 12 s de calme la font remonter) et
+    /// stats émises chaque seconde vers l'UI (ghost-video-stats).
     unsafe fn encode_loop(
         app: &AppHandle,
         cap: &Capture,
@@ -670,12 +827,26 @@ mod win {
         for uv in nv12[w * h..].iter_mut() {
             *uv = 128;
         }
-        let frame_dur_100ns: i64 = 10_000_000 / FPS as i64;
-        let frame_interval = Duration::from_nanos(1_000_000_000 / FPS as u64);
+        let base_bitrate = bitrate_for(cap.w, cap.h);
+        let mut level: usize = 0;
+        let mut frame_interval = Duration::from_nanos(1_000_000_000 / LEVELS[level].0 as u64);
+        // « dyn » = le débit est-il RÉELLEMENT reconfigurable à chaud ? Optimiste tant
+        // qu'aucune baisse n'a été tentée ; corrigé au 1er set_bitrate (un encodeur peut
+        // exposer ICodecAPI mais rejeter AVEncCommonMeanBitRate en cours de flux). Sinon
+        // l'UI annoncerait une baisse de débit qui n'a pas eu lieu (seul le fps a bougé).
+        let mut dynamic_ok = enc.codec_api.is_some();
         let mut next_due = Instant::now();
-        let mut fed: u64 = 0;
+        let t0 = Instant::now();
+        let mut last_ts_100ns: i64 = -1;
         let mut out_id: u64 = 0;
         let mut grab_fails: u32 = 0;
+        // Fenêtre de stats/contrôle (1 s) : trames et octets encodés, congestion vue.
+        let mut win_start = Instant::now();
+        let mut win_frames: u32 = 0;
+        let mut win_bytes: u64 = 0;
+        let mut win_congested = false;
+        let mut last_congestion: Option<Instant> = None;
+        let mut last_level_change = Instant::now();
         while !stop.load(Ordering::SeqCst) {
             let ev = match enc.gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
                 Ok(e) => e,
@@ -696,7 +867,7 @@ mod win {
                 if cap.closed.load(Ordering::SeqCst) {
                     anyhow::bail!("écran capturé déconnecté (moniteur débranché ?) — relance le partage");
                 }
-                // Cadence : attendre le prochain tick (l'encodeur va plus vite que 30 fps).
+                // Cadence : attendre le prochain tick (l'encodeur va plus vite que nous).
                 let now = Instant::now();
                 if next_due > now {
                     std::thread::sleep(next_due - now);
@@ -723,10 +894,16 @@ mod win {
                 }
                 let sample = MFCreateSample()?;
                 sample.AddBuffer(&mb)?;
-                sample.SetSampleTime(fed as i64 * frame_dur_100ns)?;
-                sample.SetSampleDuration(frame_dur_100ns)?;
+                // Horodatage TEMPS RÉEL (la cadence varie avec le niveau) — strictement
+                // croissant, exigence du pilotage du débit par l'encodeur.
+                let mut ts = (t0.elapsed().as_nanos() / 100) as i64;
+                if ts <= last_ts_100ns {
+                    ts = last_ts_100ns + 1;
+                }
+                last_ts_100ns = ts;
+                sample.SetSampleTime(ts)?;
+                sample.SetSampleDuration(frame_interval.as_nanos() as i64 / 100)?;
                 enc.transform.ProcessInput(0, &sample, 0)?;
-                fed += 1;
             } else if ty == METransformHaveOutput.0 {
                 let mut out = [MFT_OUTPUT_DATA_BUFFER {
                     dwStreamID: 0,
@@ -741,12 +918,70 @@ mod win {
                 let Some(sample) = sample else { continue };
                 let (key, data) = read_sample(&sample)?;
                 out_id += 1;
-                let dead = dispatch(peers, &Frame { id: out_id, key, data: bytes::Bytes::from(data) });
-                for code in dead {
+                win_frames += 1;
+                win_bytes += data.len() as u64;
+                let outcome = dispatch(peers, &Frame { id: out_id, key, data: bytes::Bytes::from(data) });
+                win_congested |= outcome.congested;
+                for code in outcome.newly_dead {
                     // L'UI de l'émetteur doit savoir qu'un pair ne reçoit plus rien.
                     let _ = app.emit("ghost-video-peer-dead", &code);
                 }
             }
+
+            // ---- Tick 1 s : contrôleur adaptatif + stats vers l'UI ----
+            if win_start.elapsed() < Duration::from_secs(1) {
+                continue;
+            }
+            // Un pair encore en attente d'image clé compte comme congestion : ses
+            // débordements ne se re-manifestent qu'aux tentatives de keyframe.
+            let waiting = peers.iter().any(|p| !p.dead && p.wait_key);
+            let congested = win_congested || waiting;
+            if congested {
+                last_congestion = Some(Instant::now());
+            }
+            let since_change = last_level_change.elapsed();
+            let calm = last_congestion.map(|t| t.elapsed() >= Duration::from_secs(12)).unwrap_or(true);
+            let new_level = if congested && level + 1 < LEVELS.len() && since_change >= Duration::from_secs(2) {
+                level + 1
+            } else if !congested && calm && level > 0 && since_change >= Duration::from_secs(12) {
+                level - 1
+            } else {
+                level
+            };
+            if new_level != level {
+                level = new_level;
+                last_level_change = Instant::now();
+                let (fps_l, pct) = LEVELS[level];
+                frame_interval = Duration::from_nanos(1_000_000_000 / fps_l as u64);
+                // Débit + GOP à chaud (best-effort : sans reconfiguration réelle, seul
+                // le fps bouge — ça soulage l'encodeur mais pas le réseau, le saut de
+                // trames fait alors le reste, comme avant l'étape 3). Le retour RÉEL du
+                // 1er set_bitrate corrige « dyn » pour que l'UI ne mente pas.
+                if enc.codec_api.is_some() {
+                    dynamic_ok = enc.set_bitrate(base_bitrate / 100 * pct);
+                }
+                let _ = enc.set_gop(fps_l * KEYFRAME_SECS);
+            }
+            let alive = peers.iter().filter(|p| !p.dead).count();
+            let ok = peers.iter().filter(|p| !p.dead && !p.wait_key).count();
+            let _ = app.emit(
+                "ghost-video-stats",
+                serde_json::json!({
+                    "fps": win_frames,
+                    "kbps": win_bytes * 8 / 1000,
+                    "peers": alive,
+                    "peersOk": ok,
+                    "level": level,
+                    "pct": LEVELS[level].1,
+                    "dyn": dynamic_ok,
+                    "w": cap.w,
+                    "h": cap.h,
+                }),
+            );
+            win_start = Instant::now();
+            win_frames = 0;
+            win_bytes = 0;
+            win_congested = false;
         }
         Ok(())
     }
@@ -818,6 +1053,18 @@ mod win {
             assert!(!looks_like_keyframe(&[0, 0, 0]));
         }
 
+        #[test]
+        fn enumeration_moniteurs() {
+            // Ne doit jamais paniquer ; sur une session avec affichage, il y a au
+            // moins un moniteur et exactement un « principal ».
+            let mons = list_monitors();
+            if !mons.is_empty() {
+                let primaries = mons.iter().filter(|m| m["primary"] == true).count();
+                assert_eq!(primaries, 1, "un et un seul écran principal: {mons:?}");
+                assert!(mons[0]["w"].as_i64().unwrap_or(0) > 0);
+            }
+        }
+
         /// Smoke test MATÉRIEL de la chaîne complète capture→NV12→NVENC (nécessite
         /// un GPU avec encodeur H.264 et un écran) : `cargo test -- --ignored`.
         #[test]
@@ -842,15 +1089,25 @@ mod win {
                 let device = device.unwrap();
                 let mt: ID3D10Multithread = device.cast().unwrap();
                 let _ = mt.SetMultithreadProtected(true);
-                let cap = build_capture(&device).expect("capture WGC");
+                let cap = build_capture(&device, None).expect("capture WGC");
                 let enc = build_encoder(&device, cap.w, cap.h).expect("encodeur matériel");
                 let (w, h) = (cap.w as usize, cap.h as usize);
                 let mut nv12 = vec![0u8; w * h * 3 / 2];
                 let frame_dur: i64 = 10_000_000 / FPS as i64;
                 let mut fed: u64 = 0;
                 let mut outs: Vec<(bool, usize)> = Vec::new();
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while outs.len() < 10 && Instant::now() < deadline {
+                // Étape 3 : valider le débit À CHAUD — 60 trames à débit de base,
+                // puis reconfiguration à 1 Mb/s et 60 trames de plus.
+                let total_wanted = 120usize;
+                let mut lowered = false;
+                let mut dyn_ok = false;
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while outs.len() < total_wanted && Instant::now() < deadline {
+                    if outs.len() >= 60 && !lowered {
+                        lowered = true;
+                        dyn_ok = enc.set_bitrate(1_000_000);
+                        let _ = enc.set_gop(FPS * KEYFRAME_SECS);
+                    }
                     let ev = match enc.gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
                         Ok(e) => e,
                         Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
@@ -902,13 +1159,29 @@ mod win {
                 drop(cap);
                 drop(device);
                 let _ = MFShutdown();
-                assert!(outs.len() >= 10, "seulement {} images encodées ({} nourries)", outs.len(), fed);
+                assert!(outs.len() >= 60, "seulement {} images encodées ({} nourries)", outs.len(), fed);
                 assert!(outs[0].0, "la première image encodée doit être une keyframe");
+                // Vérification du levier adaptatif : débit AVANT vs APRÈS la baisse
+                // (moyennes hors keyframes pour ne pas biaiser). Informatif d'abord,
+                // mais si SetValue a dit OK, la baisse doit être réelle.
+                let avg = |s: &[(bool, usize)]| {
+                    let d: Vec<usize> = s.iter().filter(|(k, _)| !k).map(|(_, l)| *l).collect();
+                    if d.is_empty() { 0 } else { d.iter().sum::<usize>() / d.len() }
+                };
+                let before = avg(&outs[10..60.min(outs.len())]);
+                let after = if outs.len() > 80 { avg(&outs[80..]) } else { 0 };
                 println!(
-                    "✅ smoke {}x{} : {} images, 1re = clé, tailles {:?}",
+                    "✅ smoke {}x{} : {} images, 1re = clé | débit à chaud: SetValue={} | delta moyen {}o → {}o",
                     w, h, outs.len(),
-                    outs.iter().map(|(_, l)| *l).collect::<Vec<_>>()
+                    if dyn_ok { "OK" } else { "REFUSÉ" },
+                    before, after
                 );
+                if dyn_ok && after > 0 {
+                    assert!(
+                        after < before,
+                        "SetValue(bitrate) accepté mais sans effet mesurable ({before}o → {after}o)"
+                    );
+                }
             }
         }
     }

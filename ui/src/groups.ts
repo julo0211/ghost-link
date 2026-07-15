@@ -1011,6 +1011,7 @@ function stopScreen(): void {
       if (S.meshOnline.has(m)) sigSend(m, { nativeVideo: { start: false } });
     });
     nativeShareMembers = null;
+    nativeShareName = "";
     dropTile("moi" + NATIVE_KEY);
   }
   screenUpgraded = false; // le prochain partage repart en 720p jusqu'à confirmation
@@ -1074,6 +1075,8 @@ const nativeBroken = new Set<string>();
 // Membres et groupe du partage natif ÉMIS en cours : le signal d'arrêt doit aller
 // aux destinataires du partage, pas aux membres du groupe actuellement OUVERT.
 let nativeShareMembers: string[] | null = null;
+// Nom de l'écran RÉELLEMENT capturé (repli inclus) — affiché dans la vignette d'état.
+let nativeShareName = "";
 // Époque du partage natif émis : incrémentée par TOUT arrêt (stopScreen, erreur
 // encodeur). startScreenNative la snapshote avant l'invoke et n'engage l'état
 // « partage actif » que si rien ne l'a interrompu PENDANT l'init.
@@ -1260,9 +1263,18 @@ function initNativeVideoRx(): void {
   }
 }
 
-/// Vignette locale du partage natif : un panneau statique (pas d'aperçu — les images
+/// Vignette locale du partage natif : un panneau d'ÉTAT (pas d'aperçu — les images
 /// encodées ne repassent pas par la WebView, c'est le prix du zéro-copie local).
+/// Redessinée chaque seconde par ghost-video-stats (fps, débit, pairs, qualité).
 function showNativePlaceholder(w: number, h: number): void {
+  drawNativeStats(null, w, h);
+}
+let lastNativeLevel = 0;
+function drawNativeStats(
+  s: { fps: number; kbps: number; peers: number; peersOk: number; level: number; pct: number; dyn: boolean } | null,
+  w: number,
+  h: number,
+): void {
   const c = showCanvasTile("moi" + NATIVE_KEY, "Moi (écran · natif)");
   c.width = 320;
   c.height = 240;
@@ -1270,11 +1282,29 @@ function showNativePlaceholder(w: number, h: number): void {
   if (!ctx) return;
   ctx.fillStyle = "#0b0b10";
   ctx.fillRect(0, 0, c.width, c.height);
-  ctx.fillStyle = "#8b8b9a";
-  ctx.font = "13px sans-serif";
   ctx.textAlign = "center";
-  ctx.fillText("🖥️ Écran partagé en " + w + "×" + h, c.width / 2, c.height / 2 - 8);
-  ctx.fillText("(natif, sans aperçu local)", c.width / 2, c.height / 2 + 14);
+  ctx.fillStyle = "#c8c8d4";
+  ctx.font = "bold 13px sans-serif";
+  ctx.fillText("🖥️ " + (nativeShareName || "Écran") + " · " + w + "×" + h, c.width / 2, 70);
+  ctx.fillStyle = "#8b8b9a";
+  ctx.font = "12px sans-serif";
+  ctx.fillText("(natif, sans aperçu local)", c.width / 2, 90);
+  if (!s) return;
+  ctx.font = "bold 15px sans-serif";
+  ctx.fillStyle = s.peersOk === s.peers ? "#7fd77f" : "#e6c86e";
+  ctx.fillText(s.fps + " img/s · " + (s.kbps / 1000).toFixed(1) + " Mb/s", c.width / 2, 138);
+  ctx.font = "13px sans-serif";
+  ctx.fillStyle = "#8b8b9a";
+  ctx.fillText("pairs servis : " + s.peersOk + "/" + s.peers, c.width / 2, 162);
+  // Sans reconfiguration réelle du débit (dyn=false), le levier est le fps seul :
+  // ne pas afficher un « % du débit » trompeur.
+  if (s.level > 0) {
+    ctx.fillStyle = "#e6c86e";
+    ctx.fillText(s.dyn ? "qualité adaptée : " + s.pct + " %" : "fps réduit (réseau chargé)", c.width / 2, 184);
+  } else {
+    ctx.fillStyle = "#7fd77f";
+    ctx.fillText("qualité maximale", c.width / 2, 184);
+  }
 }
 
 async function startScreenNative(): Promise<void> {
@@ -1283,9 +1313,13 @@ async function startScreenNative(): Promise<void> {
   screenBusy = true;
   try {
     const epoch0 = nativeShareEpoch;
-    let info: { w: number; h: number; fps: number };
+    // Écran choisi dans Réglages ("" = principal). C'est le szDevice STABLE : s'il a
+    // disparu depuis, Rust replie sur l'écran principal et le signale (monitorFound).
+    const monSaved = localStorage.getItem("ghostlink_native_monitor") || "";
+    const monitor = monSaved !== "" ? monSaved : null;
+    let info: { w: number; h: number; fps: number; monitor: string; monitorFound: boolean };
     try {
-      info = await invoke("video_share_start", { members: g.members });
+      info = await invoke("video_share_start", { members: g.members, monitor });
     } catch (e) {
       log("🧪 Partage natif impossible : " + e + " — décoche « Partage d'écran natif » dans Réglages pour repasser en WebRTC.");
       return;
@@ -1299,6 +1333,8 @@ async function startScreenNative(): Promise<void> {
       return;
     }
     S.localScreenNative = true;
+    lastNativeLevel = 0; // chaque partage repart à qualité max
+    nativeShareName = info.monitor; // nom de l'écran RÉELLEMENT capturé (vignette + logs)
     nativeShareMembers = g.members.slice(); // destinataires du signal d'arrêt
     // Annonce aux membres en ligne. Limite v1 : un membre qui arrive APRÈS le
     // démarrage ne reçoit pas ce partage (relancer ⏹️/🖥️ pour l'inclure).
@@ -1307,7 +1343,12 @@ async function startScreenNative(): Promise<void> {
     });
     showNativePlaceholder(info.w, info.h);
     $("#btnGroupScreen").textContent = "⏹️ Écran";
-    log("🖥️ Partage d'écran NATIF lancé (" + info.w + "×" + info.h + "@" + info.fps + ", H.264 matériel, sans WebRTC/STUN).");
+    log("🖥️ Partage d'écran NATIF lancé — " + info.monitor + " (" + info.w + "×" + info.h + "@" + info.fps + ", H.264 matériel, sans WebRTC/STUN).");
+    // L'écran demandé était introuvable (débranché, topologie changée) : Rust a
+    // replié sur le principal — le dire fort, c'est peut-être un écran privé diffusé.
+    if (monitor && !info.monitorFound) {
+      log("⚠️ L'écran choisi est introuvable — c'est " + info.monitor + " (principal) qui est partagé. Vérifie dans Réglages.");
+    }
     // Son : le chemin natif n'a jamais d'audio navigateur — proposer directement le
     // repli système (loopback anti-écho), comme pour une fenêtre en WebRTC.
     const wantNative = confirm(
@@ -1369,6 +1410,23 @@ export function initGroups(): void {
   listen("ghost-video-peer-dead", (e) => {
     if (e.payload && S.localScreenNative) {
       log("⚠️ " + memberName(e.payload) + " ne reçoit plus le partage d'écran (connexion interrompue).");
+    }
+  });
+  // Stats de l'émetteur natif (1 Hz) : redessiner la vignette d'état + tracer les
+  // changements de niveau du contrôleur adaptatif dans le journal.
+  listen("ghost-video-stats", (e) => {
+    if (!S.localScreenNative) return;
+    const s = e.payload;
+    drawNativeStats(s, s.w, s.h);
+    if (s.level !== lastNativeLevel) {
+      // Le % de débit n'a de sens que si l'encodeur est vraiment reconfigurable
+      // (dyn) ; sinon c'est le fps seul qui bouge — le dire dans les DEUX sens.
+      const desc = s.dyn ? s.pct + " % du débit" : "fps réduit (encodeur non reconfigurable)";
+      const descUp = s.dyn ? "remonté à " + s.pct + " % du débit" : "fps rétabli";
+      log(s.level > lastNativeLevel
+        ? "📉 Réseau chargé — partage adapté : " + desc + "."
+        : "📈 Réseau rétabli — " + descUp + ".");
+      lastNativeLevel = s.level;
     }
   });
   $("#btnCreateGroup").onclick = () => {

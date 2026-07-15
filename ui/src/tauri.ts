@@ -81,9 +81,16 @@ export interface Commands {
   set_streams: { args: { n: number }; ret: void };
 
   // Partage d'écran NATIF (sans WebRTC/STUN) — video.rs.
-  video_share_start: { args: { members: string[] }; ret: { w: number; h: number; fps: number } };
+  video_share_start: {
+    args: { members: string[]; monitor: string | null };
+    ret: { w: number; h: number; fps: number; monitor: string; monitorFound: boolean };
+  };
   video_share_stop: { args: void; ret: void };
   video_receive_attach: { args: { channel: BinChannel }; ret: void };
+  video_list_monitors: {
+    args: void;
+    ret: { id: string; name: string; w: number; h: number; primary: boolean }[];
+  };
 }
 
 // --- Événements émis par Rust : forme du payload reçu ---
@@ -131,6 +138,17 @@ export interface Events {
   "ghost-video-ended": { reason?: string };
   "ghost-video-rx-end": string;
   "ghost-video-peer-dead": string;
+  "ghost-video-stats": {
+    fps: number;
+    kbps: number;
+    peers: number;
+    peersOk: number;
+    level: number;
+    pct: number;
+    dyn: boolean;
+    w: number;
+    h: number;
+  };
 
   "tauri://drag-enter": unknown;
   "tauri://drag-over": unknown;

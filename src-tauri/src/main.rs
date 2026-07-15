@@ -270,6 +270,7 @@ async fn video_share_start(
     vs: State<'_, video::VideoShare>,
     app: tauri::AppHandle,
     members: Vec<String>,
+    monitor: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let conns = net::group_conns(net.inner(), &members);
     if conns.is_empty() {
@@ -277,16 +278,28 @@ async fn video_share_start(
     }
     let v = vs.inner().clone();
     let rt = tokio::runtime::Handle::current();
-    let (w, h, fps) = tokio::task::spawn_blocking(move || v.start(app, conns, rt))
+    let info = tokio::task::spawn_blocking(move || v.start(app, conns, rt, monitor))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "w": w, "h": h, "fps": fps }))
+    Ok(serde_json::json!({
+        "w": info.w,
+        "h": info.h,
+        "fps": info.fps,
+        "monitor": info.monitor,
+        "monitorFound": info.monitor_found,
+    }))
 }
 
 #[tauri::command]
 fn video_share_stop(vs: State<'_, video::VideoShare>) {
     vs.stop();
+}
+
+/// Moniteurs disponibles pour le partage natif (Réglages → « Écran partagé »).
+#[tauri::command]
+fn video_list_monitors() -> Vec<serde_json::Value> {
+    video::list_monitors()
 }
 
 /// La WebView s'abonne au flux vidéo natif entrant (un canal binaire par page).
@@ -435,7 +448,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             perm_code, eph_code, rotate_eph_code, probe, connect, send_file, send_chat, send_freq, send_faccept, open_group, send_gchat, send_ginvite,
             group_call_start, group_call_stop, group_call_mute, group_call_volume, screen_audio_start, screen_audio_stop, screen_audio_mute, send_signal, send_gfile,
-            video_share_start, video_share_stop, video_receive_attach,
+            video_share_start, video_share_stop, video_receive_attach, video_list_monitors,
             fingerprint, app_version, check_update, install_update, set_download_dir,
             get_download_dir, set_only_friends, set_friends, voice_test_start, voice_test_stop,
             call_start, call_stop, call_set_mute, list_audio_devices, set_audio_input,
