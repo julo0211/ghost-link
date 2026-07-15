@@ -8,6 +8,7 @@ mod meta;
 mod net;
 #[cfg(windows)]
 mod sysaudio;
+mod video;
 
 use net::Net;
 use std::sync::atomic::Ordering;
@@ -198,12 +199,17 @@ async fn group_call_start(
 }
 
 #[tauri::command]
-fn group_call_stop(call: State<'_, audio::GroupCall>, sa: State<'_, audio::ScreenAudio>) {
+fn group_call_stop(
+    call: State<'_, audio::GroupCall>,
+    sa: State<'_, audio::ScreenAudio>,
+    vs: State<'_, video::VideoShare>,
+) {
     call.stop();
     // Filet : le partage d'écran ne vit que DANS l'appel — si un chemin d'arrêt côté
-    // front a raté screen_audio_stop (course UI), la capture du son système ne doit
-    // pas survivre au raccrochage. stop() est idempotent.
+    // front a raté screen_audio_stop / video_share_stop (course UI), ni la capture du
+    // son système ni celle de l'écran ne doivent survivre au raccrochage. Idempotent.
     sa.stop();
+    vs.stop();
 }
 
 #[tauri::command]
@@ -253,6 +259,52 @@ fn screen_audio_mute(call: State<'_, audio::GroupCall>, peer: String, on: bool) 
 #[tauri::command]
 async fn send_signal(state: State<'_, Net>, peer: String, data: String) -> Result<(), String> {
     net::send_signal(state.inner(), &peer, &data).await.map_err(|e| e.to_string())
+}
+
+// Partage d'écran NATIF (video.rs) : capture WGC + H.264 matériel + flux QUIC du
+// maillage — aucun WebRTC/STUN, l'IP n'est jamais exposée. Renvoie { w, h, fps }
+// pour que l'UI l'annonce aux membres via la signalisation existante.
+#[tauri::command]
+async fn video_share_start(
+    net: State<'_, Net>,
+    vs: State<'_, video::VideoShare>,
+    app: tauri::AppHandle,
+    members: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    let conns = net::group_conns(net.inner(), &members);
+    if conns.is_empty() {
+        return Err("aucun membre du groupe en ligne".to_string());
+    }
+    let v = vs.inner().clone();
+    let rt = tokio::runtime::Handle::current();
+    let (w, h, fps) = tokio::task::spawn_blocking(move || v.start(app, conns, rt))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "w": w, "h": h, "fps": fps }))
+}
+
+#[tauri::command]
+fn video_share_stop(vs: State<'_, video::VideoShare>) {
+    vs.stop();
+}
+
+/// La WebView s'abonne au flux vidéo natif entrant (un canal binaire par page).
+#[tauri::command]
+fn video_receive_attach(
+    net: State<'_, Net>,
+    vs: State<'_, video::VideoShare>,
+    sa: State<'_, audio::ScreenAudio>,
+    channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+) {
+    // Une (ré)attache = page (re)chargée : un partage émetteur encore actif serait
+    // invisible et incontrôlable depuis la nouvelle page — on le coupe, ET son
+    // demi-frère audio (loopback système) avec : le laisser diffuser TOUT le son du
+    // PC sans indication serait une fuite de confidentialité. Sans effet au premier
+    // chargement (les deux stop() sont idempotents).
+    vs.stop();
+    sa.stop();
+    net::video_attach(net.inner(), channel);
 }
 
 #[tauri::command]
@@ -374,6 +426,7 @@ fn main() {
             app.manage(audio::GroupCall::default());
             app.manage(audio::ScreenAudio::default());
             app.manage(audio::AudioCfg::default());
+            app.manage(video::VideoShare::default());
             // Purge des copies nettoyées (métadonnées) laissées par la session
             // précédente — sinon elles ne partiraient qu'au prochain envoi.
             std::thread::spawn(meta::gc_temp);
@@ -382,6 +435,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             perm_code, eph_code, rotate_eph_code, probe, connect, send_file, send_chat, send_freq, send_faccept, open_group, send_gchat, send_ginvite,
             group_call_start, group_call_stop, group_call_mute, group_call_volume, screen_audio_start, screen_audio_stop, screen_audio_mute, send_signal, send_gfile,
+            video_share_start, video_share_stop, video_receive_attach,
             fingerprint, app_version, check_update, install_update, set_download_dir,
             get_download_dir, set_only_friends, set_friends, voice_test_start, voice_test_stop,
             call_start, call_stop, call_set_mute, list_audio_devices, set_audio_input,

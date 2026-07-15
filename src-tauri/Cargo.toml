@@ -40,10 +40,32 @@ windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Wi
 # Capture « process loopback » du son système en EXCLUANT notre propre processus
 # (anti-écho parfait pour le partage d'écran) — WASAPI, Windows 10 2004+.
 windows-core = "0.58"
+# Les features Graphics/DirectX/MediaFoundation servent au partage d'écran NATIF
+# (video.rs : capture WGC → NVENC → flux QUIC, sans WebRTC ni STUN).
 windows = { version = "0.58", features = [
     "implement",
     "Win32_Media_Audio",
     "Win32_System_Com",
     "Win32_System_Threading",
     "Win32_Foundation",
+    "Foundation",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D10",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
 ] }
+
+# La conversion BGRA→NV12 (video.rs) est une boucle par pixel : à opt-level 0 elle
+# plafonnerait à quelques fps en `cargo tauri dev`. opt-level 1 suffit pour tenir
+# 30 fps en dev sans sacrifier les temps de compilation ni le débogage.
+[profile.dev]
+opt-level = 1

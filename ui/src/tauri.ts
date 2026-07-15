@@ -3,10 +3,19 @@
 // les noms de commandes/événements ET la forme de leurs données sont vérifiés
 // à la compilation. Une faute de frappe = erreur de build.
 
+/** Canal binaire Tauri (Rust → WebView), créé côté JS et passé en argument d'invoke.
+ *  Utilisé par la vidéo native : un message = une image encodée (voir groups.ts). */
+export interface BinChannel {
+  onmessage: ((data: unknown) => void) | null;
+}
+
 declare global {
   interface Window {
     __TAURI__: {
-      core: { invoke(cmd: string, args?: Record<string, unknown>): Promise<unknown> };
+      core: {
+        invoke(cmd: string, args?: Record<string, unknown>): Promise<unknown>;
+        Channel: new () => BinChannel;
+      };
       event: {
         listen(
           event: string,
@@ -70,6 +79,11 @@ export interface Commands {
   send_gfile: { args: { members: string[]; path: string }; ret: void };
   respond_gfile: { args: { id: number; accept: boolean }; ret: void };
   set_streams: { args: { n: number }; ret: void };
+
+  // Partage d'écran NATIF (sans WebRTC/STUN) — video.rs.
+  video_share_start: { args: { members: string[] }; ret: { w: number; h: number; fps: number } };
+  video_share_stop: { args: void; ret: void };
+  video_receive_attach: { args: { channel: BinChannel }; ret: void };
 }
 
 // --- Événements émis par Rust : forme du payload reçu ---
@@ -114,6 +128,9 @@ export interface Events {
   "ghost-grecv-offer": { id: number; name?: string; size?: number; from?: string };
   "ghost-grecv-rejected": { name?: string };
   "ghost-grecv-corrupt": { name?: string; from?: string };
+  "ghost-video-ended": { reason?: string };
+  "ghost-video-rx-end": string;
+  "ghost-video-peer-dead": string;
 
   "tauri://drag-enter": unknown;
   "tauri://drag-over": unknown;

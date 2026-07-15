@@ -128,6 +128,15 @@ function initSettings(): void {
     localStorage.setItem("ghostlink_ice", $<HTMLInputElement>("#setIce").value.trim());
     log("Serveur vidéo enregistré (appliqué au prochain appel vidéo).");
   };
+  // Partage d'écran NATIF (expérimental) : appliqué au PROCHAIN partage.
+  $<HTMLInputElement>("#setNativeVideo").checked = localStorage.getItem("ghostlink_native_video") === "1";
+  $<HTMLInputElement>("#setNativeVideo").onchange = () => {
+    const on = $<HTMLInputElement>("#setNativeVideo").checked;
+    localStorage.setItem("ghostlink_native_video", on ? "1" : "0");
+    log(on
+      ? "🧪 Partage d'écran natif activé (appliqué au prochain partage) — sans WebRTC/STUN."
+      : "Partage d'écran natif désactivé — retour au partage WebRTC.");
+  };
   $<HTMLSelectElement>("#setStreams").value = localStorage.getItem("ghostlink_streams") ?? "4";
   $<HTMLSelectElement>("#setStreams").onchange = () => {
     const v = $<HTMLSelectElement>("#setStreams").value;

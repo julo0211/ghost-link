@@ -46,6 +46,10 @@ const GKIND_CALL: u8 = 3; // signal de début d'appel de groupe
 const GKIND_SIGNAL: u8 = 4; // signalisation WebRTC (vidéo) pair-à-pair
 const GKIND_GFILE: u8 = 5; // fichier diffusé dans le groupe (flux de contrôle)
 const GKIND_GFDATA: u8 = 6; // flux de données d'un fichier de groupe (multi-flux)
+pub const GKIND_VIDEO: u8 = 7; // partage d'écran NATIF (H.264 sur flux uni, video.rs)
+/// Taille maximale d'UNE image H.264 reçue (une keyframe 1440p à 12 Mb/s fait ~1-2 Mo) :
+/// borne les allocations pilotées par le réseau (même famille de garde que GL-1).
+const VIDEO_FRAME_MAX: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct ConnState {
@@ -57,6 +61,10 @@ pub type Slot = Arc<Mutex<ConnState>>;
 /// Maillage de groupe : code permanent du pair → (jeton unique, connexion).
 pub type Mesh = Arc<StdMutex<HashMap<String, (u64, Connection)>>>;
 static MESH_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Canal binaire vers la WebView pour la vidéo native reçue (video_receive_attach).
+/// Un seul récepteur : le dernier attach (rechargement de page) remplace le précédent.
+pub type VideoRx = Arc<StdMutex<Option<tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>>>>;
 
 /// Codes dont une connexion de maillage est EN COURS d'établissement.
 /// Évite que deux appels concurrents (invitation + open_group, ou deux groupes
@@ -204,6 +212,7 @@ pub struct Net {
     pub incoming: Incoming,
     pub mesh: Mesh,
     pub connecting: Connecting,
+    pub video_rx: VideoRx,
 }
 
 /// Identité éphémère : clé aléatoire en mémoire, remplaçable à chaud (rotation).
@@ -451,6 +460,7 @@ async fn build_endpoint(secret: SecretKey) -> anyhow::Result<Endpoint> {
 }
 
 /// Démarre le Router (protocoles fichier/chat/voix + présence) sur un endpoint.
+#[allow(clippy::too_many_arguments)]
 fn build_router(
     endpoint: &Endpoint,
     app: &AppHandle,
@@ -459,6 +469,7 @@ fn build_router(
     settings: &Settings,
     incoming: &Incoming,
     mesh: &Mesh,
+    video_rx: &VideoRx,
 ) -> Router {
     Router::builder(endpoint.clone())
         .accept(
@@ -477,6 +488,7 @@ fn build_router(
                 app: app.clone(),
                 mesh: mesh.clone(),
                 settings: settings.clone(),
+                video_rx: video_rx.clone(),
             },
         )
         .accept(PRESENCE_ALPN, Presence)
@@ -490,6 +502,7 @@ pub struct GroupHandler {
     pub app: AppHandle,
     pub mesh: Mesh,
     pub settings: Settings,
+    pub video_rx: VideoRx,
 }
 impl std::fmt::Debug for GroupHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -505,7 +518,7 @@ impl ProtocolHandler for GroupHandler {
             connection.close(0u32.into(), b"not-a-friend");
             return Ok(());
         }
-        run_mesh_conn(self.app.clone(), self.mesh.clone(), self.settings.clone(), peer, connection).await;
+        run_mesh_conn(self.app.clone(), self.mesh.clone(), self.settings.clone(), self.video_rx.clone(), peer, connection).await;
         Ok(())
     }
 }
@@ -542,8 +555,83 @@ async fn write_lp32<W: AsyncWriteExt + Unpin>(send: &mut W, s: &str) -> anyhow::
     Ok(())
 }
 
+/// Seau à jetons du relais vidéo d'UN pair (partagé entre ses flux) : (budget, dernier refill).
+type RelayBudget = Arc<StdMutex<(i64, std::time::Instant)>>;
+/// Débit de relais soutenu par pair : SOUS les ~3,5 Mo/s que la WebView sait consommer
+/// (mesure exp3), au-dessus des ~1,5 Mo/s du flux légitime le plus lourd (1440p, 12 Mb/s).
+const RELAY_RATE: i64 = 2_621_440; // 2,5 Mio/s
+const RELAY_BURST: i64 = 6 * 1024 * 1024;
+
+/// Relaie les images d'un flux vidéo natif entrant vers la WebView (canal binaire).
+/// Message poussé au JS : [u8 peer_len][peer][u8 flags][u64 frame_id][octets H.264].
+/// Sans canal attaché (UI pas prête), les images sont lues et jetées (drainage).
+///
+/// Garde-fou anti-flood (même famille que GL-1) : le canal Tauri n'a AUCUNE
+/// contre-pression — un pair qui pousse plus vite que ce que la WebView consomme
+/// ferait grossir la file du renderer sans limite. Le budget est PARTAGÉ entre les
+/// flux d'un même pair (sinon 2 flux = 2× le débit) ; une image au-dessus du budget
+/// est lue puis JETÉE, et les deltas suivantes avec elle jusqu'à la prochaine image
+/// clé (les relayer donnerait un GOP au référentiel manquant, décodé en bouillie).
+async fn recv_video_frames(
+    from: &str,
+    recv: &mut iroh::endpoint::RecvStream,
+    video_rx: &VideoRx,
+    relay_budget: &RelayBudget,
+) {
+    let peer = from.as_bytes();
+    if peer.len() > 255 {
+        return;
+    }
+    let mut wait_key = false;
+    loop {
+        // Framing émetteur : [u64 frame_id][u8 flags][u32 len][len octets].
+        let mut hdr = [0u8; 13];
+        if AsyncReadExt::read_exact(recv, &mut hdr).await.is_err() {
+            return; // fin du partage (FIN) ou connexion perdue
+        }
+        let len = u32::from_be_bytes([hdr[9], hdr[10], hdr[11], hdr[12]]) as usize;
+        if len == 0 || len > VIDEO_FRAME_MAX {
+            return; // taille aberrante : on coupe (borne anti-allocation, cf. GL-1)
+        }
+        let pl = peer.len();
+        let mut msg = vec![0u8; 1 + pl + 1 + 8 + len];
+        msg[0] = pl as u8;
+        msg[1..1 + pl].copy_from_slice(peer);
+        msg[1 + pl] = hdr[8]; // flags (bit0 = keyframe, bit1 = nouvelle session)
+        msg[2 + pl..10 + pl].copy_from_slice(&hdr[..8]); // frame_id
+        if AsyncReadExt::read_exact(recv, &mut msg[10 + pl..]).await.is_err() {
+            return;
+        }
+        let key = hdr[8] & 1 == 1;
+        if wait_key && !key {
+            continue; // GOP amputé par un rejet précédent : attendre la prochaine clé
+        }
+        let allowed = {
+            let mut b = relay_budget.lock().unwrap_or_else(|e| e.into_inner());
+            let now = std::time::Instant::now();
+            b.0 = (b.0 + (now - b.1).as_micros() as i64 * RELAY_RATE / 1_000_000).min(RELAY_BURST);
+            b.1 = now;
+            if b.0 < len as i64 {
+                false
+            } else {
+                b.0 -= len as i64;
+                true
+            }
+        };
+        if !allowed {
+            wait_key = true; // image jetée (flood ou WebView à la traîne)
+            continue;
+        }
+        wait_key = false;
+        let ch = video_rx.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(ch) = ch {
+            let _ = ch.send(tauri::ipc::InvokeResponseBody::Raw(msg));
+        }
+    }
+}
+
 /// Boucle de réception d'une connexion de maillage (un pair du groupe).
-async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, peer: String, connection: Connection) {
+async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, video_rx: VideoRx, peer: String, connection: Connection) {
     let token = MESH_SEQ.fetch_add(1, Ordering::SeqCst);
     if let Some((_, old)) = mesh
         .lock()
@@ -554,6 +642,49 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, peer: Str
     }
     let _ = app.emit("ghost-mesh-up", &peer);
     let inbounds: Inbounds = Arc::new(StdMutex::new(HashMap::new()));
+
+    // Flux UNI-directionnels entrants : vidéo native (GKIND_VIDEO). Tâche sœur de la
+    // boucle bi ci-dessous, abandonnée quand la connexion tombe (uni_task.abort()).
+    let uni_task = {
+        let conn = connection.clone();
+        let from = peer.clone();
+        let video_rx = video_rx.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            // Au plus 2 flux vidéo décodés en même temps par pair : le cas légitime
+            // en vaut 1 (+1 pour le chevauchement stop/relance) — au-delà, c'est un
+            // pair hostile qui cherche à saturer CPU/mémoire : flux ignorés. Le seau
+            // à jetons du relais est LUI AUSSI par pair (partagé entre ses flux).
+            let active = Arc::new(AtomicU64::new(0));
+            let relay_budget: RelayBudget =
+                Arc::new(StdMutex::new((RELAY_BURST, std::time::Instant::now())));
+            while let Ok(mut recv) = conn.accept_uni().await {
+                let from = from.clone();
+                let video_rx = video_rx.clone();
+                let app = app.clone();
+                let active = active.clone();
+                let relay_budget = relay_budget.clone();
+                tokio::spawn(async move {
+                    let mut kind = [0u8; 1];
+                    if AsyncReadExt::read_exact(&mut recv, &mut kind).await.is_err() {
+                        return;
+                    }
+                    if kind[0] == GKIND_VIDEO {
+                        if active.fetch_add(1, Ordering::SeqCst) >= 2 {
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            return;
+                        }
+                        recv_video_frames(&from, &mut recv, &video_rx, &relay_budget).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        // Le flux est fini (arrêt, erreur, connexion) : le dire à l'UI,
+                        // sinon la vignette resterait figée en ayant l'air vivante.
+                        let _ = app.emit("ghost-video-rx-end", &from);
+                    }
+                    // Autre type : ignoré (compat ascendante + sécurité).
+                });
+            }
+        })
+    };
 
     loop {
         match connection.accept_bi().await {
@@ -644,6 +775,7 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, peer: Str
             Err(_) => break,
         }
     }
+    uni_task.abort();
     {
         let mut m = mesh.lock().unwrap_or_else(|e| e.into_inner());
         if m.get(&peer).map(|(t, _)| *t == token).unwrap_or(false) {
@@ -697,9 +829,10 @@ async fn ensure_mesh(net: &Net, code: &str) -> anyhow::Result<Connection> {
     let app = net.app.clone();
     let mesh = net.mesh.clone();
     let settings = net.settings.clone();
+    let video_rx = net.video_rx.clone();
     let peer = code.to_string();
     let c2 = conn.clone();
-    tokio::spawn(async move { run_mesh_conn(app, mesh, settings, peer, c2).await });
+    tokio::spawn(async move { run_mesh_conn(app, mesh, settings, video_rx, peer, c2).await });
     Ok(conn)
 }
 
@@ -725,6 +858,7 @@ pub async fn open_group(net: &Net, members: Vec<String>) {
         let mesh = net.mesh.clone();
         let app = net.app.clone();
         let settings = net.settings.clone();
+        let video_rx = net.video_rx.clone();
         let connecting = net.connecting.clone();
         tokio::spawn(async move {
             let id: EndpointId = match code.parse() {
@@ -748,7 +882,7 @@ pub async fn open_group(net: &Net, members: Vec<String>) {
                 }
             };
             connecting.lock().unwrap_or_else(|e| e.into_inner()).remove(&code);
-            run_mesh_conn(app, mesh, settings, code, conn).await;
+            run_mesh_conn(app, mesh, settings, video_rx, code, conn).await;
         });
     }
 }
@@ -1122,6 +1256,7 @@ pub async fn rotate_eph(net: &Net) -> anyhow::Result<String> {
         &net.settings,
         &net.incoming,
         &net.mesh,
+        &net.video_rx,
     );
     let id = endpoint.addr().id.to_string();
     let mut g = net.eph.lock().await;
@@ -1140,14 +1275,15 @@ pub async fn start(app: AppHandle) -> anyhow::Result<Net> {
     let incoming = Incoming::default();
     let mesh: Mesh = Arc::new(StdMutex::new(HashMap::new()));
     let connecting: Connecting = Arc::new(StdMutex::new(HashSet::new()));
+    let video_rx: VideoRx = Arc::new(StdMutex::new(None));
 
     // Identité PERMANENTE : clé persistante = code ami stable.
     let perm = build_endpoint(load_or_create_secret()).await?;
-    let _perm_router = build_router(&perm, &app, &slot, &recv_cancel, &settings, &incoming, &mesh);
+    let _perm_router = build_router(&perm, &app, &slot, &recv_cancel, &settings, &incoming, &mesh, &video_rx);
 
     // Identité ÉPHÉMÈRE : clé aléatoire en mémoire, régénérée à chaque lancement.
     let eph_ep = build_endpoint(SecretKey::generate()).await?;
-    let eph_router = build_router(&eph_ep, &app, &slot, &recv_cancel, &settings, &incoming, &mesh);
+    let eph_router = build_router(&eph_ep, &app, &slot, &recv_cancel, &settings, &incoming, &mesh, &video_rx);
     let eph = Arc::new(Mutex::new(Eph {
         endpoint: eph_ep,
         _router: eph_router,
@@ -1165,7 +1301,13 @@ pub async fn start(app: AppHandle) -> anyhow::Result<Net> {
         incoming,
         mesh,
         connecting,
+        video_rx,
     })
+}
+
+/// Attache (ou remplace) le canal binaire WebView qui recevra la vidéo native.
+pub fn video_attach(net: &Net, channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) {
+    *net.video_rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(channel);
 }
 
 /// Sonde un ami par son code : tente une connexion légère (ALPN présence) avec un délai borné.

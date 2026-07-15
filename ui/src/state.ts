@@ -41,6 +41,11 @@ export function iceConfig(): RTCConfiguration {
   const v = (localStorage.getItem("ghostlink_ice") ?? "stun:stun.l.google.com:19302").trim();
   return v ? { iceServers: [{ urls: v }] } : { iceServers: [] };
 }
+/** Partage d'écran NATIF (expérimental) : capture+H.264 côté Rust, flux iroh —
+ *  pas de WebRTC/STUN pour l'écran. Réglages → case « Partage d'écran natif ». */
+export function nativeVideoWanted(): boolean {
+  return localStorage.getItem("ghostlink_native_video") === "1";
+}
 
 // Tout l'état mutable de l'app, regroupé (les modules font S.xxx).
 export const S = {
@@ -89,6 +94,8 @@ export const S = {
   localCam: null as MediaStream | null,
   localScreen: null as MediaStream | null,
   pcs: {} as Record<string, PcState>,
+  // vidéo NATIVE (video.rs) : partage d'écran en cours, sans MediaStream local.
+  localScreenNative: false,
 };
 
 export function loadFriends(): Friend[] {

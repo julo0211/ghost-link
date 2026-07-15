@@ -1,7 +1,7 @@
 // Groupes : channel multi-pairs (chat), appel de groupe (audio), vidéo (WebRTC), fichiers.
 import { invoke, listen } from "./tauri.js";
 import { $, log, fmt } from "./dom.js";
-import { S, PINV, GDECL, iceConfig, loadGroups, saveGroups, loadFriends, friendsOnly, memberName, myName, } from "./state.js";
+import { S, PINV, GDECL, iceConfig, nativeVideoWanted, loadGroups, saveGroups, loadFriends, friendsOnly, memberName, myName, } from "./state.js";
 import { showTab } from "./session.js";
 // ----- Invitations en attente (BUG-1 : fiables, ré-envoyées à la reconnexion) -----
 function loadPInv() {
@@ -411,8 +411,76 @@ function dropTile(key) {
         w.remove();
     maybeHideGrid();
 }
+// Vignette à CANVAS (vidéo native décodée par WebCodecs — pas de MediaStream).
+// Même enveloppe que showTile : plein écran au clic, bouton son du partage pour un
+// pair (le son natif SCREEN_TAG passe par le mixeur de l'appel, pas par la vignette).
+function showCanvasTile(key, label, peer) {
+    let w = document.getElementById("vidw_" + key);
+    if (!w) {
+        w = document.createElement("div");
+        w.id = "vidw_" + key;
+        w.className = "vidtile";
+        w.style.cssText = "position:relative;border-radius:12px;overflow:hidden;background:#000;cursor:pointer";
+        w.title = "Cliquer pour agrandir (plein écran)";
+        const c = document.createElement("canvas");
+        c.id = "vid_" + key;
+        c.style.cssText = "width:100%;aspect-ratio:4/3;object-fit:cover;display:block";
+        const tag = document.createElement("div");
+        tag.style.cssText = "position:absolute;bottom:4px;left:6px;font-size:11px;font-weight:700;color:#fff;text-shadow:0 1px 3px #000";
+        tag.textContent = label;
+        const max = document.createElement("button");
+        max.className = "vidmax";
+        max.type = "button";
+        max.textContent = "⛶";
+        max.title = "Plein écran";
+        const wrap = w;
+        max.onclick = (e) => {
+            e.stopPropagation();
+            toggleTileFullscreen(wrap);
+        };
+        w.onclick = () => toggleTileFullscreen(wrap);
+        w.appendChild(c);
+        w.appendChild(tag);
+        w.appendChild(max);
+        if (peer) {
+            // Ici il n'y a pas d'élément <video> : seule la voie « son système natif »
+            // (screen_audio_mute) est à couper — l'état par pair reste S.screenMuted.
+            const snd = document.createElement("button");
+            snd.className = "vidsnd";
+            snd.type = "button";
+            snd.dataset.snd = peer;
+            const muted0 = !!S.screenMuted[peer];
+            snd.textContent = muted0 ? "🔇" : "🔊";
+            snd.title = "Couper / remettre le son de ce partage";
+            snd.onclick = (e) => {
+                e.stopPropagation();
+                const on = !S.screenMuted[peer];
+                S.screenMuted[peer] = on;
+                invoke("screen_audio_mute", { peer, on }).catch(() => { });
+                document.querySelectorAll('[id^="vidw_' + peer + '_"] video').forEach((el) => {
+                    el.muted = on;
+                });
+                document.querySelectorAll('[data-snd="' + peer + '"]').forEach((b) => {
+                    b.textContent = on ? "🔇" : "🔊";
+                });
+            };
+            w.appendChild(snd);
+            if (muted0)
+                invoke("screen_audio_mute", { peer, on: true }).catch(() => { });
+        }
+        vgrid().appendChild(w);
+    }
+    vgrid().classList.remove("hidden");
+    return document.getElementById("vid_" + key);
+}
 function dropPeerTiles(peer) {
-    document.querySelectorAll('[id^="vidw_' + peer + '_"]').forEach((w) => w.remove());
+    // Nettoyage WebRTC uniquement : la vignette du partage NATIF (suffixe _natscr)
+    // partage le préfixe d'id mais vit sur le flux QUIC, indépendant des
+    // RTCPeerConnection — un échec ICE (caméra) ne doit pas la détruire.
+    document.querySelectorAll('[id^="vidw_' + peer + '_"]').forEach((w) => {
+        if (!w.id.endsWith(NATIVE_KEY))
+            w.remove();
+    });
     maybeHideGrid();
 }
 function sigSend(peer, payload) {
@@ -804,6 +872,12 @@ async function startScreen() {
         log("📞 Rejoins d'abord l'appel de groupe — comme sur Discord, l'écran se partage dans l'appel.");
         return;
     }
+    // 🧪 Chemin NATIF (Réglages) : pas de getDisplayMedia, pas de WebRTC — et pas de
+    // confirm() de confidentialité : aucune IP n'est exposée, aucun STUN contacté.
+    if (nativeVideoWanted()) {
+        await startScreenNative();
+        return;
+    }
     // Au TOUT premier usage vidéo, le confirm() de confidentialité consomme le délai
     // d'activation utilisateur (~5 s, Chromium 111+) : getDisplayMedia rejetterait
     // InvalidStateError. On s'arrête proprement et on demande un clic « frais ».
@@ -959,6 +1033,22 @@ function stopCam() {
     $("#btnGroupCam").textContent = "📹 Caméra";
 }
 function stopScreen() {
+    // Invalide toute init de partage natif encore en vol (voir nativeShareEpoch) —
+    // y compris quand S.localScreenNative n'est pas encore posé (raccrochage pendant
+    // l'init : c'est exactement la fenêtre où l'état fantôme naissait).
+    nativeShareEpoch += 1;
+    if (S.localScreenNative) {
+        S.localScreenNative = false;
+        invoke("video_share_stop").catch(() => { });
+        // Signal d'arrêt aux DESTINATAIRES du partage (mémorisés au démarrage) — pas au
+        // groupe actuellement ouvert, qui a pu changer entre-temps.
+        (nativeShareMembers || []).forEach((m) => {
+            if (S.meshOnline.has(m))
+                sigSend(m, { nativeVideo: { start: false } });
+        });
+        nativeShareMembers = null;
+        dropTile("moi" + NATIVE_KEY);
+    }
     screenUpgraded = false; // le prochain partage repart en 720p jusqu'à confirmation
     screenEncoderChecked = false;
     disarmScreenWatchdog();
@@ -987,9 +1077,345 @@ function stopVideo() {
         dropPeerTiles(peer);
         delete S.pcs[peer];
     });
+    Object.keys(nativeRx).forEach(closeNativeRx);
     vgrid().classList.add("hidden");
 }
+// ----- Vidéo NATIVE (partage d'écran sans WebRTC : video.rs) -----
+// Émission : Rust capture l'écran + encode en H.264 matériel et écrit un flux QUIC
+// par pair (aucun MediaStream local, donc pas d'aperçu). Réception : les images
+// arrivent par UN canal binaire Tauri (video_receive_attach) sous la forme
+// [u8 peer_len][peer][u8 flags bit0=key][u64 frame_id][H.264 Annex-B], décodées par
+// WebCodecs et dessinées dans une vignette à canvas. Activation : Réglages → 🧪.
+const NATIVE_KEY = "_natscr"; // suffixe de clé de vignette (préfixé par le code du pair)
+const nativeRx = {};
+const utf8 = new TextDecoder();
+// Pierre tombale anti-résurrection : après un arrêt, des images encore en vol
+// recréeraient la vignette (figée pour toujours). On les ignore quelques secondes —
+// sauf si la trame porte le bit « nouvelle session » (un partage relancé, légitime).
+const nativeTomb = {};
+// Flux déclaré INDÉCODABLE sur ce moteur (15 resyncs sans une image) : on arrête
+// d'essayer jusqu'à une VRAIE relance (bit newSession ou signal start) — sinon la
+// pierre tombale expirerait et le cycle vignette noire → fermeture repartirait.
+const nativeBroken = new Set();
+// Membres et groupe du partage natif ÉMIS en cours : le signal d'arrêt doit aller
+// aux destinataires du partage, pas aux membres du groupe actuellement OUVERT.
+let nativeShareMembers = null;
+// Époque du partage natif émis : incrémentée par TOUT arrêt (stopScreen, erreur
+// encodeur). startScreenNative la snapshote avant l'invoke et n'engage l'état
+// « partage actif » que si rien ne l'a interrompu PENDANT l'init.
+let nativeShareEpoch = 0;
+/// La vidéo native d'un pair n'est décodée/affichée QUE si on est dans l'appel du
+/// groupe dont il est membre — même règle que l'émission (« comme Discord ») ; un
+/// ami hors de ce cadre ne peut pas imposer une vignette ni brûler du CPU décodeur.
+function nativePeerAllowed(peer) {
+    if (!S.inGroupCall || !S.groupCallId)
+        return false;
+    const g = loadGroups().find((x) => x.id === S.groupCallId);
+    return !!g && g.members.includes(peer);
+}
+/// Codec WebCodecs selon la résolution annoncée (H.264 Main ; niveau ≥ résolution).
+function nativeCodecOf(w, h) {
+    const px = w * h;
+    if (px > 0 && px <= 1280 * 720)
+        return "avc1.4d401f"; // Main 3.1
+    if (px > 0 && px <= 1920 * 1080)
+        return "avc1.4d4028"; // Main 4.0
+    return "avc1.4d4033"; // Main 5.1 — couvre 1440p+ et les tailles inconnues
+}
+function ensureNativeRx(peer, w, h, fps) {
+    let st = nativeRx[peer];
+    if (!st) {
+        const canvas = showCanvasTile(peer + NATIVE_KEY, memberName(peer) + " (écran)", peer);
+        st = { dec: null, waitKey: true, fps: fps || 30, w, h, errors: 0, lastFrameAt: 0, canvas };
+        nativeRx[peer] = st;
+    }
+    else {
+        // Filet : si la vignette a été retirée du DOM par un autre chemin, la recréer —
+        // sinon on décoderait pour toujours dans un canvas détaché (partage invisible).
+        if (!st.canvas.isConnected) {
+            st.canvas = showCanvasTile(peer + NATIVE_KEY, memberName(peer) + " (écran)", peer);
+        }
+        if (w && h) {
+            st.w = w;
+            st.h = h;
+            st.fps = fps || st.fps;
+        }
+    }
+    return st;
+}
+function resetNativeDecoder(st) {
+    if (st.dec && st.dec.state !== "closed") {
+        try {
+            st.dec.close();
+        }
+        catch {
+            /* ignore */
+        }
+    }
+    st.dec = null;
+    st.waitKey = true;
+}
+function closeNativeRx(peer) {
+    const st = nativeRx[peer];
+    if (!st)
+        return;
+    resetNativeDecoder(st);
+    delete nativeRx[peer];
+    nativeTomb[peer] = Date.now();
+    dropTile(peer + NATIVE_KEY);
+}
+/// Une image reçue sur le canal binaire. Le bench exp3 a montré que les payloads
+/// arrivent en Array de nombres (pas d'ArrayBuffer) : on normalise en Uint8Array.
+function handleNativeFrame(raw) {
+    let b;
+    if (raw instanceof ArrayBuffer)
+        b = new Uint8Array(raw);
+    else if (ArrayBuffer.isView(raw))
+        b = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+    else if (Array.isArray(raw))
+        b = Uint8Array.from(raw);
+    else
+        return;
+    if (b.length < 11)
+        return;
+    const pl = b[0];
+    if (b.length <= 10 + pl)
+        return;
+    const peer = utf8.decode(b.subarray(1, 1 + pl));
+    const key = (b[1 + pl] & 1) === 1;
+    const newSession = (b[1 + pl] & 2) === 2; // 1re trame d'un (re)démarrage du partage
+    let id = 0; // u64 BE lu en Number : 2^53 trames = des millénaires à 30 fps
+    for (let i = 2 + pl; i < 10 + pl; i++)
+        id = id * 256 + b[i];
+    const data = b.subarray(10 + pl);
+    if (typeof VideoDecoder === "undefined")
+        return; // moteur sans WebCodecs
+    if (!nativePeerAllowed(peer))
+        return; // hors appel du groupe : ne rien décoder
+    // Images en vol après un arrêt : ne pas ressusciter la vignette (sauf vraie relance).
+    if (newSession) {
+        delete nativeTomb[peer];
+        nativeBroken.delete(peer);
+    }
+    else {
+        if (nativeBroken.has(peer))
+            return; // flux déclaré indécodable : attendre une relance
+        if (nativeTomb[peer] && Date.now() - nativeTomb[peer] < 3000)
+            return;
+    }
+    // Vignette/état créés au besoin : les images peuvent devancer le signal de début.
+    const st = ensureNativeRx(peer, 0, 0, 30);
+    st.lastFrameAt = Date.now();
+    if (newSession)
+        resetNativeDecoder(st); // nouveau flux = nouveaux timestamps/SPS
+    if (st.waitKey && !key)
+        return;
+    if (!st.dec || st.dec.state === "closed") {
+        if (!key) {
+            st.waitKey = true;
+            return;
+        }
+        const decoder = new VideoDecoder({
+            output: (frame) => {
+                st.errors = 0;
+                const c = st.canvas;
+                if (c.width !== frame.displayWidth || c.height !== frame.displayHeight) {
+                    c.width = frame.displayWidth;
+                    c.height = frame.displayHeight;
+                }
+                const ctx = c.getContext("2d");
+                if (ctx)
+                    ctx.drawImage(frame, 0, 0);
+                frame.close();
+            },
+            // Erreur de décodage (référence manquante, reconfiguration…) : on repart
+            // proprement sur la prochaine image clé au lieu d'afficher de la bouillie.
+            error: () => noteNativeDecodeError(peer, st),
+        });
+        try {
+            decoder.configure({ codec: nativeCodecOf(st.w, st.h), optimizeForLatency: true });
+        }
+        catch {
+            return; // codec refusé : on retentera à la prochaine clé
+        }
+        st.dec = decoder;
+    }
+    st.waitKey = false;
+    try {
+        st.dec.decode(new EncodedVideoChunk({
+            type: key ? "key" : "delta",
+            timestamp: Math.round((id * 1000000) / (st.fps || 30)),
+            data,
+        }));
+    }
+    catch {
+        noteNativeDecodeError(peer, st);
+    }
+}
+/// Erreur de décodage : visible (une fois par rafale), et si ça ne se remet JAMAIS
+/// (15 resyncs consécutifs sans une seule image sortie), on ferme au lieu de boucler
+/// en silence sur une vignette noire.
+function noteNativeDecodeError(peer, st) {
+    st.errors += 1;
+    if (st.errors === 1) {
+        log("⚠️ Décodage du partage de " + memberName(peer) + " en difficulté — resynchronisation…");
+    }
+    if (st.errors >= 15) {
+        log("⚠️ Partage de " + memberName(peer) + " indécodable sur ce moteur — vignette fermée.");
+        nativeBroken.add(peer); // ne plus réessayer avant une VRAIE relance (newSession/start)
+        closeNativeRx(peer);
+        return;
+    }
+    resetNativeDecoder(st);
+}
+/// Signal de contrôle reçu ({nativeVideo:{start,w,h,fps}} via GKIND_SIGNAL).
+/// Le reset du décodeur n'est PAS fait ici : c'est le bit « nouvelle session » porté
+/// par la première trame du flux qui s'en charge (aucune course signal/trames).
+function handleNativeSignal(peer, nv) {
+    if (nv.start) {
+        if (!nativePeerAllowed(peer)) {
+            log("🖥️ " + memberName(peer) + " partage son écran (natif) — rejoins l'appel du groupe pour le voir.");
+            return;
+        }
+        delete nativeTomb[peer];
+        nativeBroken.delete(peer);
+        ensureNativeRx(peer, nv.w || 0, nv.h || 0, nv.fps || 30);
+        log("🖥️ " + memberName(peer) + " partage son écran (natif" + (nv.w ? " " + nv.w + "×" + nv.h : "") + ").");
+    }
+    else {
+        closeNativeRx(peer);
+    }
+}
+/// Abonne cette page au flux vidéo natif entrant (une fois, au chargement).
+function initNativeVideoRx() {
+    try {
+        const ch = new window.__TAURI__.core.Channel();
+        ch.onmessage = handleNativeFrame;
+        invoke("video_receive_attach", { channel: ch }).catch((e) => {
+            log("⚠️ Réception vidéo native indisponible (" + e + ") — les partages natifs des autres ne s'afficheront pas.");
+        });
+    }
+    catch {
+        log("⚠️ Réception vidéo native indisponible sur ce moteur (pas de canal binaire).");
+    }
+}
+/// Vignette locale du partage natif : un panneau statique (pas d'aperçu — les images
+/// encodées ne repassent pas par la WebView, c'est le prix du zéro-copie local).
+function showNativePlaceholder(w, h) {
+    const c = showCanvasTile("moi" + NATIVE_KEY, "Moi (écran · natif)");
+    c.width = 320;
+    c.height = 240;
+    const ctx = c.getContext("2d");
+    if (!ctx)
+        return;
+    ctx.fillStyle = "#0b0b10";
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.fillStyle = "#8b8b9a";
+    ctx.font = "13px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("🖥️ Écran partagé en " + w + "×" + h, c.width / 2, c.height / 2 - 8);
+    ctx.fillText("(natif, sans aperçu local)", c.width / 2, c.height / 2 + 14);
+}
+async function startScreenNative() {
+    const g = loadGroups().find((x) => x.id === S.openGroupId);
+    if (!g)
+        return;
+    screenBusy = true;
+    try {
+        const epoch0 = nativeShareEpoch;
+        let info;
+        try {
+            info = await invoke("video_share_start", { members: g.members });
+        }
+        catch (e) {
+            log("🧪 Partage natif impossible : " + e + " — décoche « Partage d'écran natif » dans Réglages pour repasser en WebRTC.");
+            return;
+        }
+        // L'init a pu durer plusieurs secondes : si l'appel s'est terminé PENDANT (même
+        // s'il a été REJOINT depuis), ou si l'encodeur est déjà mort (ghost-video-ended
+        // incrémente l'époque), ne pas afficher un état « partage actif » fantôme.
+        if (!inThisCall() || nativeShareEpoch !== epoch0) {
+            invoke("video_share_stop").catch(() => { });
+            log("Partage natif annulé — interrompu pendant le démarrage.");
+            return;
+        }
+        S.localScreenNative = true;
+        nativeShareMembers = g.members.slice(); // destinataires du signal d'arrêt
+        // Annonce aux membres en ligne. Limite v1 : un membre qui arrive APRÈS le
+        // démarrage ne reçoit pas ce partage (relancer ⏹️/🖥️ pour l'inclure).
+        g.members.forEach((m) => {
+            if (S.meshOnline.has(m))
+                sigSend(m, { nativeVideo: { start: true, w: info.w, h: info.h, fps: info.fps } });
+        });
+        showNativePlaceholder(info.w, info.h);
+        $("#btnGroupScreen").textContent = "⏹️ Écran";
+        log("🖥️ Partage d'écran NATIF lancé (" + info.w + "×" + info.h + "@" + info.fps + ", H.264 matériel, sans WebRTC/STUN).");
+        // Son : le chemin natif n'a jamais d'audio navigateur — proposer directement le
+        // repli système (loopback anti-écho), comme pour une fenêtre en WebRTC.
+        const wantNative = confirm("Partager aussi le SON ?\n\nghost link peut capter le son système en natif (TOUT le son du PC). Le flux chiffré part vers les membres du groupe en ligne ; seuls ceux qui ont rejoint l'appel l'entendent.\n\nOK = capter le son système · Annuler = vidéo seule");
+        if (!wantNative || !S.localScreenNative)
+            return;
+        try {
+            await invoke("screen_audio_start", { members: g.members });
+            if (!S.localScreenNative) {
+                // Partage arrêté PENDANT l'await : ne pas laisser la capture orpheline.
+                invoke("screen_audio_stop").catch(() => { });
+                return;
+            }
+            screenAudioNative = true;
+            $("#btnGroupScreen").textContent = "⏹️ Écran · 🔴 son système";
+            log("🔊 Son système capté en natif — les voix de l'appel sont exclues du flux (pas d'écho).");
+        }
+        catch (e) {
+            log("🔇 Son système indisponible (" + e + ").");
+        }
+    }
+    finally {
+        screenBusy = false;
+    }
+}
 export function initGroups() {
+    initNativeVideoRx();
+    // L'émetteur natif s'est arrêté sur une ERREUR (encodeur, GPU…) — pas via stop().
+    // Pas de garde sur S.localScreenNative : une erreur immédiate peut arriver AVANT
+    // que le drapeau soit posé — le message doit sortir dans tous les cas.
+    listen("ghost-video-ended", (e) => {
+        const p = e.payload || {};
+        nativeShareEpoch += 1; // invalide aussi une init encore en vol (état fantôme)
+        log("⚠️ Partage natif interrompu : " + (p.reason || "erreur d'encodage"));
+        if (S.localScreenNative)
+            stopScreen();
+    });
+    // Le flux vidéo natif d'un pair s'est terminé (arrêt, erreur, connexion perdue) :
+    // fermer sa vignette au lieu de la laisser figée en ayant l'air vivante.
+    listen("ghost-video-rx-end", (e) => {
+        const peer = e.payload;
+        if (!peer || !nativeRx[peer])
+            return;
+        const bye = () => {
+            closeNativeRx(peer);
+            log("🖥️ Partage de " + memberName(peer) + " terminé.");
+        };
+        // rx-end ne porte pas d'identité de flux : la fin RETARDÉE d'un ancien flux ne
+        // doit pas fermer une session relancée qui livre activement des trames. Si des
+        // trames sont arrivées très récemment, on re-vérifie dans 2 s : toujours du flux
+        // → c'était la fin de l'ANCIEN flux, on garde ; plus rien → vraie fin, on ferme.
+        if (Date.now() - nativeRx[peer].lastFrameAt < 1500) {
+            setTimeout(() => {
+                const st = nativeRx[peer];
+                if (st && Date.now() - st.lastFrameAt >= 1800)
+                    bye();
+            }, 2000);
+            return;
+        }
+        bye();
+    });
+    // Côté émetteur : un pair ne reçoit plus le partage (file morte, connexion tombée).
+    listen("ghost-video-peer-dead", (e) => {
+        if (e.payload && S.localScreenNative) {
+            log("⚠️ " + memberName(e.payload) + " ne reçoit plus le partage d'écran (connexion interrompue).");
+        }
+    });
     $("#btnCreateGroup").onclick = () => {
         const name = $("#groupName").value.trim();
         if (!name) {
@@ -1082,7 +1508,7 @@ export function initGroups() {
             startCam();
     };
     $("#btnGroupScreen").onclick = () => {
-        if (S.localScreen)
+        if (S.localScreen || S.localScreenNative)
             stopScreen();
         else
             startScreen();
@@ -1122,12 +1548,19 @@ export function initGroups() {
                 if (g && g.members.includes(e.payload))
                     getPc(e.payload);
             }
+            // Partage NATIF : pas d'ajout dynamique en v1 — le dire plutôt que laisser
+            // l'arrivant devant un écran vide sans explication.
+            if (S.localScreenNative && nativeShareMembers && nativeShareMembers.includes(e.payload)) {
+                log("ℹ️ " + memberName(e.payload) + " vient de se connecter — relance le partage (⏹️ puis 🖥️) pour l'inclure.");
+            }
         }
         refreshGroupCounts();
     });
     listen("ghost-mesh-down", (e) => {
-        if (e.payload)
+        if (e.payload) {
             S.meshOnline.delete(e.payload);
+            closeNativeRx(e.payload); // le flux vidéo natif de ce pair est mort avec la connexion
+        }
         refreshGroupCounts();
     });
     listen("ghost-gchat", (e) => {
@@ -1173,6 +1606,12 @@ export function initGroups() {
             msg = JSON.parse(p.data);
         }
         catch {
+            return;
+        }
+        // Vidéo NATIVE : signal de contrôle pur — surtout NE PAS créer de
+        // RTCPeerConnection pour ça (getPc ouvrirait une négociation WebRTC).
+        if (msg.nativeVideo) {
+            handleNativeSignal(peer, msg.nativeVideo);
             return;
         }
         const st = getPc(peer);

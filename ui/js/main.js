@@ -135,6 +135,15 @@ function initSettings() {
         localStorage.setItem("ghostlink_ice", $("#setIce").value.trim());
         log("Serveur vidéo enregistré (appliqué au prochain appel vidéo).");
     };
+    // Partage d'écran NATIF (expérimental) : appliqué au PROCHAIN partage.
+    $("#setNativeVideo").checked = localStorage.getItem("ghostlink_native_video") === "1";
+    $("#setNativeVideo").onchange = () => {
+        const on = $("#setNativeVideo").checked;
+        localStorage.setItem("ghostlink_native_video", on ? "1" : "0");
+        log(on
+            ? "🧪 Partage d'écran natif activé (appliqué au prochain partage) — sans WebRTC/STUN."
+            : "Partage d'écran natif désactivé — retour au partage WebRTC.");
+    };
     $("#setStreams").value = localStorage.getItem("ghostlink_streams") ?? "4";
     $("#setStreams").onchange = () => {
         const v = $("#setStreams").value;
