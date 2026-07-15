@@ -1,11 +1,11 @@
 {
-  "version": "0.30.0",
-  "notes": "v0.30.0 — encodage GPU : partage 1080p30 fluide",
-  "pub_date": "2026-07-14T15:50:04.021Z",
+  "version": "0.31.0",
+  "notes": "Partage d'écran natif expérimental (sans WebRTC/STUN) — Réglages → case 🧪",
+  "pub_date": "2026-07-15T13:39:33.172Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRWJCMXFaNWpoRFFsWEUyUjFGa24wRy9iOWVMbnNKVnFXcE5NSk5IRzBMUXNrVFc0aW12VnNHWHIvSlQ2bmFVK1MvK3BhaHNRYTlTckhKdlozWnludmc0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MDQ0MjAyCWZpbGU6Z2hvc3QtbGlua18wLjMwLjBfeDY0LXNldHVwLmV4ZQo2blh1RGNiWkxxWWVVNnhvaVpsbHNhUW5KUU9DRlhjSmdBaXdpK2xCTGx6by9ZQVhtclhZYWhaVWc3VUlyNkR0VFo3SVpqek9sUDQxTitYeThZSEtBdz09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.30.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVdTNFpORXU0RS9PaGRYMWZnWEJrejBadmQ1MVVkNXVVcEJFS0Myc0ZUckhIUUpVcVpSejQrWVdIdDRPM0NQOWJGMkpyWXRJMUNCeVpmRmFqYmNQSVEwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MTIyNzcxCWZpbGU6Z2hvc3QtbGlua18wLjMxLjBfeDY0LXNldHVwLmV4ZQp0THU0bnp6RmFOaXFTN1NrK25tRXlhWmg1a3FzMnJ4QjFzUXhaY1ZLUzdQL3owSm5CcTF0a1BLOThLMXJVbHpRQ1dSK1NaT1BIVHlYODN2UTZlZ3NDdz09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.31.0_x64-setup.exe"
     }
   }
 }
