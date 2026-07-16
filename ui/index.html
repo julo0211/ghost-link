@@ -407,7 +407,7 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
           <div id="chatCard" class="fillcol hidden">
             <div class="chat" id="chatLog"></div>
             <div class="recv-region" id="recvList"><div class="hint" style="margin:0">Les fichiers reçus s'enregistrent dans ton dossier <b>Téléchargements</b>.</div></div>
-            <div class="composer"><input type="text" id="chatInput" placeholder="Écris un message…"><button class="send" id="btnChat">Envoyer</button></div>
+            <div class="composer"><button class="mini" id="btnChatImg" title="Envoyer une image">🖼️</button><input type="text" id="chatInput" placeholder="Écris un message…"><button class="send" id="btnChat">Envoyer</button></div>
           </div>
         </div>
       </section>
@@ -454,7 +454,7 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
           </div>
           <div id="groupVideos" class="hidden" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;padding:10px 14px;max-height:46vh;overflow:auto;flex:0 0 auto"></div>
           <div class="chat" id="groupChatLog"></div>
-          <div class="composer"><input type="text" id="groupChatInput" placeholder="Message au groupe…"><button class="send" id="btnGroupSend">Envoyer</button></div>
+          <div class="composer"><button class="mini" id="btnGroupChatImg" title="Envoyer une image">🖼️</button><input type="text" id="groupChatInput" placeholder="Message au groupe…"><button class="send" id="btnGroupSend">Envoyer</button></div>
         </div>
       </section>
 

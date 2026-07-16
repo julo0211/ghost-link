@@ -1,8 +1,21 @@
 // Transfert de fichiers 1-à-1 (envoi/réception + accord) + chat texte + glisser-déposer.
 
 import { invoke, listen } from "./tauri.js";
-import { $, log, fmt, etaStr, baseName } from "./dom.js";
+import { $, log, fmt, etaStr, baseName, addImgBubble } from "./dom.js";
 import { S, myName } from "./state.js";
+
+// Images/GIF inline (Task 3.4) : au-delà, pas de chemin fichier disponible pour
+// un `File` issu du picker/presse-papiers — repli documenté (log), pas d'échec silencieux.
+const MAX_INLINE_IMG = 5 * 1024 * 1024;
+/** Devine le mime à partir de l'extension (repli fichier → image reçue). */
+function guessImageMime(name: string): string | null {
+  const n = name.toLowerCase();
+  if (n.endsWith(".png")) return "image/png";
+  if (n.endsWith(".gif")) return "image/gif";
+  if (n.endsWith(".webp")) return "image/webp";
+  if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
+  return null;
+}
 
 function setFile(path: string): void {
   $<HTMLInputElement>("#filePath").value = path;
@@ -40,6 +53,33 @@ async function sendChat(): Promise<void> {
   } catch (e) {
     log("Chat : " + e);
   }
+}
+
+// Images/GIF inline 1-à-1 : uniquement pour un File issu du picker ou du
+// presse-papiers (pas de chemin fichier disponible) — le glisser-déposer garde
+// le flux fichier existant (send_file) et se rend inline côté récepteur (repli plus bas).
+async function sendImage1to1(f: File): Promise<void> {
+  if (f.size > MAX_INLINE_IMG) {
+    log("Image > 5 Mo — glisse-la sur la fenêtre pour l'envoyer en fichier.");
+    return;
+  }
+  try {
+    const buf = new Uint8Array(await f.arrayBuffer());
+    await invoke("send_img", { author: myName(), name: f.name, mime: f.type, data: Array.from(buf) });
+    addImgBubble($("#chatLog"), URL.createObjectURL(f), "me");
+  } catch (e) {
+    log("Image : " + e);
+  }
+}
+function pickAndSendImage(): void {
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "image/png,image/jpeg,image/gif,image/webp";
+  inp.onchange = () => {
+    const f = inp.files?.[0];
+    if (f) void sendImage1to1(f);
+  };
+  inp.click();
 }
 
 export function initTransfer(): void {
@@ -165,6 +205,17 @@ export function initTransfer(): void {
     (d.querySelector(".pth") as HTMLElement).textContent = path;
     $("#recvList").prepend(d);
     log("Fichier reçu : " + name);
+    // Repli : grosse image (> 5 Mo) reçue via le flux fichier classique → rendu
+    // inline dans le chat en plus de l'entrée "fichier reçu" ci-dessus.
+    const mime = guessImageMime(name);
+    if (mime) {
+      invoke("read_image_bytes", { path })
+        .then((bytes) => {
+          const url = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: mime }));
+          addImgBubble($("#chatLog"), url, "them");
+        })
+        .catch(() => {});
+    }
   });
   listen("ghost-recv-cancel", (e) => {
     $("#recvBox").classList.add("hidden");
@@ -215,6 +266,23 @@ export function initTransfer(): void {
   };
   listen("ghost-chat", (e) => {
     addMsg(e.payload.text, "them", e.payload.name);
+  });
+
+  // Images/GIF inline : bouton + coller (le glisser-déposer reste sur le flux fichier).
+  $("#btnChatImg").onclick = pickAndSendImage;
+  $("#chatInput").addEventListener("paste", (e: Event) => {
+    const it = (e as ClipboardEvent).clipboardData?.items;
+    if (!it) return;
+    for (const x of it) {
+      if (x.type.startsWith("image/")) {
+        const f = x.getAsFile();
+        if (f) void sendImage1to1(f);
+      }
+    }
+  });
+  listen("ghost-chat-img", (e) => {
+    const p = e.payload;
+    addImgBubble($("#chatLog"), `data:${p.mime};base64,${p.dataB64}`, "them", p.author);
   });
 
   // Glisser-déposer natif

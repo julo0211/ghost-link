@@ -50,3 +50,25 @@ export function shortId(id: string): string {
   id = String(id);
   return id.length > 14 ? id.slice(0, 14) + "…" : id;
 }
+
+/** Ajoute une bulle image dans un conteneur de chat (data-URI ou blob-URL).
+ *  Mirroir de la structure `.msg`/`.me`/`.them` des bulles texte (addMsg /
+ *  addGroupMsgDom), avec un <img> au lieu d'un noeud texte. */
+export function addImgBubble(box: HTMLElement, src: string, who: string, author?: string): void {
+  const m = document.createElement("div");
+  m.className = "msg " + (who === "me" ? "me" : "them");
+  if (who !== "me" && author && author.trim()) {
+    const au = document.createElement("div");
+    au.style.cssText = "font-size:11px;font-weight:700;opacity:.8;margin-bottom:2px";
+    au.textContent = author.trim();
+    m.appendChild(au);
+  }
+  const img = document.createElement("img");
+  img.src = src;
+  img.loading = "lazy";
+  img.style.cssText = "max-width:100%;max-height:320px;border-radius:8px;cursor:pointer;display:block";
+  img.onclick = () => window.open(src, "_blank");
+  m.appendChild(img);
+  box.appendChild(m);
+  box.scrollTop = box.scrollHeight;
+}

@@ -1,6 +1,6 @@
 // Groupes : channel multi-pairs (chat), appel de groupe (audio), vidéo (WebRTC), fichiers.
 import { invoke, listen } from "./tauri.js";
-import { $, log, fmt } from "./dom.js";
+import { $, log, fmt, addImgBubble } from "./dom.js";
 import { S, PINV, GDECL, iceConfig, nativeVideoWanted, loadGroups, saveGroups, loadFriends, friendsOnly, memberName, myName, } from "./state.js";
 import { showTab } from "./session.js";
 // ----- Invitations en attente (BUG-1 : fiables, ré-envoyées à la reconnexion) -----
@@ -417,6 +417,49 @@ function sendGroupMsg() {
     invoke("send_gchat", { members: g.members, gid: g.id, name: myName(), text }).catch((e) => log("Groupe : " + e));
     pushGroupMsg(g.id, myName() || "moi", text, "me");
     $("#groupChatInput").value = "";
+}
+// ----- Images/GIF inline de groupe (Task 3.4) -----
+// Même limite que le 1-à-1 : au-delà, pas de chemin fichier disponible pour un
+// File du picker/presse-papiers — le glisser-déposer garde le flux fichier
+// existant (send_gfile), sans rendu inline côté groupe (voir listener
+// ghost-grecv-done plus bas : l'événement groupe ne porte pas de `path`).
+const MAX_INLINE_GIMG = 5 * 1024 * 1024;
+async function sendImageGroup(f) {
+    if (!S.openGroupId)
+        return;
+    const g = loadGroups().find((x) => x.id === S.openGroupId);
+    if (!g)
+        return;
+    if (f.size > MAX_INLINE_GIMG) {
+        log("Image > 5 Mo — glisse-la sur la fenêtre pour l'envoyer en fichier.");
+        return;
+    }
+    try {
+        const buf = new Uint8Array(await f.arrayBuffer());
+        await invoke("send_gimg", {
+            members: g.members,
+            gid: g.id,
+            author: myName(),
+            name: f.name,
+            mime: f.type,
+            data: Array.from(buf),
+        });
+        addImgBubble($("#groupChatLog"), URL.createObjectURL(f), "me");
+    }
+    catch (e) {
+        log("Image de groupe : " + e);
+    }
+}
+function pickAndSendImageGroup() {
+    const inp = document.createElement("input");
+    inp.type = "file";
+    inp.accept = "image/png,image/jpeg,image/gif,image/webp";
+    inp.onchange = () => {
+        const f = inp.files?.[0];
+        if (f)
+            void sendImageGroup(f);
+    };
+    inp.click();
 }
 // ----- Appel de groupe (audio) -----
 function refreshGroupCallUI() {
@@ -1823,6 +1866,19 @@ export function initGroups() {
             sendGroupMsg();
         }
     };
+    $("#btnGroupChatImg").onclick = pickAndSendImageGroup;
+    $("#groupChatInput").addEventListener("paste", (e) => {
+        const it = e.clipboardData?.items;
+        if (!it)
+            return;
+        for (const x of it) {
+            if (x.type.startsWith("image/")) {
+                const f = x.getAsFile();
+                if (f)
+                    void sendImageGroup(f);
+            }
+        }
+    });
     $("#btnGroupCall").onclick = () => {
         const g = loadGroups().find((x) => x.id === S.openGroupId);
         if (!g)
@@ -1947,6 +2003,18 @@ export function initGroups() {
         if (!loadGroups().some((x) => x.id === p.group))
             return;
         pushGroupMsg(p.group, p.author || "?", p.text || "", "them");
+    });
+    listen("ghost-gchat-img", (e) => {
+        const p = e.payload || {};
+        if (!p.group || !loadGroups().some((x) => x.id === p.group))
+            return;
+        // Contrairement au texte (pushGroupMsg), les images ne sont pas conservées
+        // dans S.groupMsgs (pas d'historique par groupe) : on ne rend que si CE
+        // groupe est actuellement ouvert, sinon l'image apparaîtrait à tort dans
+        // le #groupChatLog d'un autre groupe actif à l'écran.
+        if (S.openGroupId !== p.group)
+            return;
+        addImgBubble($("#groupChatLog"), `data:${p.mime};base64,${p.dataB64}`, "them", p.author);
     });
     listen("ghost-ginvite", (e) => {
         const p = e.payload || {};
@@ -2094,6 +2162,12 @@ export function initGroups() {
     listen("ghost-grecv-done", (e) => {
         const p = e.payload || {};
         log("✅ Reçu (groupe) : " + (p.name || ""));
+        // LIMITATION (Task 3.4) : contrairement au 1-à-1 (ghost-recv-done), l'événement
+        // groupe ne porte pas de `path` (voir tauri.ts, Events["ghost-grecv-done"] =
+        // { name?: string }) — impossible d'appeler read_image_bytes ici sans fabriquer
+        // un chemin. Une grosse image (> 5 Mo) envoyée en groupe reste donc une entrée
+        // fichier normale, sans rendu inline à la réception. L'inline groupe ≤ 5 Mo
+        // (ghost-gchat-img, envoyé via send_gimg) fonctionne normalement.
     });
     listen("ghost-grecv-offer", (e) => {
         const p = e.payload || {};
