@@ -50,6 +50,7 @@ const GKIND_GFDATA: u8 = 6; // flux de données d'un fichier de groupe (multi-fl
 pub const GKIND_VIDEO: u8 = 7; // partage d'écran NATIF (H.264 sur flux uni, video.rs)
 const GKIND_GMEMBERS: u8 = 8; // sync de roster de groupe (ajout de membres → union)
 const GKIND_KICK: u8 = 9; // un vote d'exclusion (vote-kick décentralisé)
+const GKIND_VOICE: u8 = 10; // beacon de présence vocale de groupe
 const GKIND_GIMG: u8 = 11; // image inline de groupe (octets)
 /// Taille maximale d'UNE image H.264 reçue (une keyframe 1440p à 12 Mb/s fait ~1-2 Mo) :
 /// borne les allocations pilotées par le réseau (même famille de garde que GL-1).
@@ -765,6 +766,14 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, video_rx:
                         ) {
                             let _ = a.emit("ghost-kick", serde_json::json!({ "group": gid, "target": target, "voter": voter, "from": from }));
                         }
+                    } else if kind[0] == GKIND_VOICE {
+                        // [u16 gid][u8 inCall] — présence dans le vocal du groupe.
+                        if let Ok(gid) = read_lp16(&mut recv).await {
+                            let mut f = [0u8; 1];
+                            if AsyncReadExt::read_exact(&mut recv, &mut f).await.is_ok() {
+                                let _ = a.emit("ghost-voice-presence", serde_json::json!({ "group": gid, "code": from, "inCall": f[0] == 1 }));
+                            }
+                        }
                     } else if kind[0] == GKIND_GIMG {
                         let parsed: anyhow::Result<(String, String, String, String, Vec<u8>)> = async {
                             let gid = read_lp16(&mut recv).await?;
@@ -1100,6 +1109,23 @@ pub async fn send_gcall(net: &Net, members: Vec<String>, gid: &str) -> anyhow::R
         if let Ok((mut send, _recv)) = conn.open_bi().await {
             let _ = send.write_all(&[GKIND_CALL]).await;
             let _ = write_lp16(&mut send, gid).await;
+            let _ = send.finish();
+        }
+    }
+    Ok(())
+}
+
+/// Diffuse ma présence (ou absence) dans le vocal du groupe aux membres en ligne.
+pub async fn send_voice_presence(net: &Net, members: Vec<String>, gid: &str, in_call: bool) -> anyhow::Result<()> {
+    let targets: Vec<Connection> = {
+        let m = net.mesh.lock().unwrap_or_else(|e| e.into_inner());
+        members.iter().filter_map(|c| m.get(c.trim()).map(|(_, c)| c.clone())).collect()
+    };
+    for conn in targets {
+        if let Ok((mut send, _r)) = conn.open_bi().await {
+            let _ = send.write_all(&[GKIND_VOICE]).await;
+            let _ = write_lp16(&mut send, gid).await;
+            let _ = send.write_all(&[if in_call { 1 } else { 0 }]).await;
             let _ = send.finish();
         }
     }

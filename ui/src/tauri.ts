@@ -77,6 +77,7 @@ export interface Commands {
   group_call_stop: { args: void; ret: void };
   group_call_mute: { args: { on: boolean }; ret: void };
   group_call_volume: { args: { peer: string; vol: number }; ret: void };
+  voice_presence: { args: { members: string[]; gid: string; inCall: boolean }; ret: void };
   screen_audio_start: { args: { members: string[]; pid: number | null }; ret: void };
   screen_audio_stop: { args: void; ret: void };
   screen_audio_mute: { args: { peer: string; on: boolean }; ret: void };
@@ -140,6 +141,7 @@ export interface Events {
   "ghost-gmembers": { group: string; name?: string; members?: string; from?: string };
   "ghost-kick": { group: string; target: string; voter: string; from?: string };
   "ghost-gcall": { group: string };
+  "ghost-voice-presence": { group: string; code: string; inCall: boolean };
   "ghost-signal": { from?: string; data: string };
   "ghost-grecv-start": { name?: string; from?: string };
   "ghost-grecv-done": { name?: string };

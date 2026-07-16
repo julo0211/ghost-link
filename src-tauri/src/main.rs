@@ -254,6 +254,14 @@ fn group_call_volume(call: State<'_, audio::GroupCall>, peer: String, vol: f64) 
     call.set_gain(&peer, vol as f32);
 }
 
+// Beacon de présence vocale de groupe (~1 Hz, piloté par la TS) : diffuse à tous les
+// membres du groupe (en ligne, même hors appel) que je suis (ou ne suis plus) dans le
+// vocal, pour afficher une pastille "en appel" sans que chacun rejoigne l'appel.
+#[tauri::command]
+async fn voice_presence(state: State<'_, Net>, members: Vec<String>, gid: String, in_call: bool) -> Result<(), String> {
+    net::send_voice_presence(state.inner(), members, &gid, in_call).await.map_err(|e| e.to_string())
+}
+
 // Son système du partage d'écran (repli natif quand WebView2 ne fournit pas de piste
 // audio — partage d'une fenêtre) : loopback WASAPI → Opus → datagrammes du maillage.
 #[tauri::command]
@@ -503,7 +511,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             perm_code, eph_code, rotate_eph_code, probe, connect, send_file, send_chat, send_freq, send_faccept, open_group, send_gchat, send_ginvite, send_gmembers, send_kick, send_img, send_gimg, read_image_bytes,
-            group_call_start, group_call_stop, group_call_mute, group_call_volume, screen_audio_start, screen_audio_stop, screen_audio_mute, screen_audio_gain, send_signal, send_gfile,
+            group_call_start, group_call_stop, group_call_mute, group_call_volume, voice_presence, screen_audio_start, screen_audio_stop, screen_audio_mute, screen_audio_gain, send_signal, send_gfile,
             video_share_start, video_share_stop, video_receive_attach, video_list_monitors, video_list_windows,
             fingerprint, app_version, check_update, install_update, set_download_dir,
             get_download_dir, set_only_friends, set_friends, voice_test_start, voice_test_stop,
