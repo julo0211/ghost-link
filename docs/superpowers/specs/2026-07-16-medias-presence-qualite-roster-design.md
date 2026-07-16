@@ -149,6 +149,13 @@ tout le dossier de téléchargement au WebView (confidentialité).
 
 ## Item 3 — Qualité/FPS du partage natif (préréglages + Auto)
 
+> **Mise à jour 2026-07-16 (livraison) — FPS-ONLY.** La downscale de résolution demande un étage
+> de mise à l'échelle absent du pipeline natif (`bgra_to_nv12` rogne/letterboxe 1:1). Sur décision
+> utilisateur, la **résolution reste native** et **seul le plafond de fps est livré** dans ce lot ;
+> la downscale (2K/1080p/720p) est reportée. Le sélecteur devient donc un choix de **fps** (ex.
+> « Auto/60 » ou « 30 »). Le tableau de préréglages de résolution ci-dessous reste la cible d'un
+> lot futur.
+
 ### État actuel
 - `FPS: u32 = 30` constant (`video.rs:24`) ; capture à la **résolution native** ; échelle adaptative
   `LEVELS = [(30,100),(20,66),(12,40),(8,25)]` (`video.rs:34`) qui **part de (30,100 %) et ne fait
