@@ -203,6 +203,13 @@ tout le dossier de téléchargement au WebView (confidentialité).
 
 ## Item 4 — Convergence du roster (gossip pragmatique)
 
+> **Révision 2026-07-16 (revue de sécurité).** Gossiper les *tombstones* de kick (2P-Set) laisse un
+> seul membre forcer une exclusion sans vote (contourne le quorum) — inacceptable. **Correctif
+> retenu :** convergence des AJOUTS par re-diffusion multi-saut (inchangé), et pour les KICKS,
+> re-gossip des **VOTES authentifiés** (`GKIND_KICK`, `from == voter`) à la reconnexion — chaque
+> client re-vérifie le quorum. Les tombstones restent locaux (jamais transmis). La ré-admission
+> reste advisory (via ré-invitation ; les votes obsolètes expirent / sont retirés au ré-ajout).
+
 ### État actuel (bugs)
 - **Ajout** : `addMembersToGroup` n'envoie `send_gmembers` qu'aux **membres en ligne à l'instant**
   (`groups.ts:300`) ; le rattrapage `ghost-mesh-up` ne renvoie le roster **qu'au pair qui revient**
