@@ -65,7 +65,12 @@ export const S = {
     // Votes d'exclusion en cours : clé "gid|cible" → { codeVotant: horodatage }.
     kickVotes: {},
     // Qui est en vocal / parle en ce moment (event ghost-voice-activity), par code.
+    // Portée : uniquement l'appel où JE suis (pilote `.incall`/`.speaking`).
     voiceAct: {},
+    // Présence vocale PAR GROUPE, diffusée à TOUT le groupe (event ghost-voice-presence,
+    // beacon ~1 Hz) — même hors appel. gid → (code → lastSeenMs). Pilote `.inbooth`
+    // (pastille statique), SÉPARÉE de `.incall`/`.speaking` ci-dessus.
+    voicePresence: {},
     gfileOfferId: null,
     // vidéo (WebRTC)
     localCam: null,

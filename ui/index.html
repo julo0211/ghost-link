@@ -227,6 +227,11 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 .mem.incall .dot{background:var(--accent)}
 .mem.speaking .dot{background:var(--good);box-shadow:0 0 0 0 var(--good);animation:memspk 1s ease-out infinite}
 @keyframes memspk{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--good) 70%,transparent)}100%{box-shadow:0 0 0 7px transparent}}
+/* Présence vocale groupe (Task 4.3) : pastille STATIQUE « dans le vocal », diffusée à
+   TOUT le groupe même hors appel — volontairement DISTINCTE de l'anneau animé
+   « parle » (.speaking, ci-dessus) qui ne concerne que les participants de MON appel.
+   Petit marqueur 🔊 fixe après le nom, pas d'animation. */
+.mem.inbooth .grow::after{content:"🔊";margin-left:6px;font-size:11px;opacity:.85}
 .mem:hover{background:var(--hover)}
 
 /* ---------- Modale réglages ---------- */
@@ -431,7 +436,7 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
         <div id="groupChannelCard" class="fillcol hidden">
           <div class="chead">
             <span class="av">👪</span>
-            <div style="flex:1;min-width:0"><div class="nm" id="groupChannelName">Groupe</div><div class="meta" id="groupMembersLine"></div></div>
+            <div style="flex:1;min-width:0"><div class="nm" id="groupChannelName">Groupe</div><div class="meta" style="display:flex;gap:10px;align-items:center"><span id="groupMembersLine"></span><span id="groupVoiceCount"></span></div></div>
             <button class="pill" id="btnCloseGroup">Fermer</button>
           </div>
           <div class="actions">

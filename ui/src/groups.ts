@@ -126,6 +126,25 @@ function renderGroupMembers(g: Group): void {
   };
   box.appendChild(chip("moi", "Moi", true, true));
   g.members.forEach((code) => box.appendChild(chip(code, memberName(code), S.meshOnline.has(code), false)));
+  paintVoicePresence(); // ré-applique la pastille « dans le vocal » après le re-render des chips
+}
+// Présence vocale groupe (Task 4.3) : pastille STATIQUE « dans le vocal » (.inbooth),
+// diffusée à TOUT le groupe via le beacon ~1 Hz (startGroupCall/stopGroupCall) + TTL
+// côté récepteur (initGroups, ghost-voice-presence). Visible même hors appel — à ne
+// PAS confondre avec `.incall`/`.speaking` (ghost-voice-activity), qui ne concernent
+// que les participants de MON appel. Les deux classes coexistent sur un même chip.
+function paintVoicePresence(): void {
+  const gid = S.openGroupId || "";
+  const present = S.voicePresence[gid] || {};
+  let n = 0;
+  document.querySelectorAll(".mem[data-code]").forEach((el) => {
+    const code = (el as HTMLElement).dataset.code || "";
+    const on = code === "me" ? !!(S.inGroupCall && S.groupCallId === gid) : !!present[code];
+    el.classList.toggle("inbooth", on);
+    if (on) n++;
+  });
+  const hdr = $("#groupVoiceCount");
+  if (hdr) hdr.textContent = n ? "🔊 " + n + " dans le vocal" : "";
 }
 function refreshGroupCounts(): void {
   const g = loadGroups().find((x) => x.id === S.openGroupId);
@@ -447,6 +466,10 @@ function pickAndSendImageGroup(): void {
 }
 
 // ----- Appel de groupe (audio) -----
+// Beacon de présence vocale (Task 4.3) : tant que JE suis en appel de groupe, annonce
+// ~1 Hz "je suis dans le vocal de ce groupe" à TOUT le groupe (pas seulement les
+// participants de l'appel) — voir S.voicePresence / paintVoicePresence / ghost-voice-presence.
+let voiceBeacon = 0;
 function refreshGroupCallUI(): void {
   const active = S.inGroupCall && S.groupCallId === S.openGroupId;
   const b = $<HTMLButtonElement>("#btnGroupCall");
@@ -472,6 +495,11 @@ async function startGroupCall(g: Group, announce: boolean): Promise<void> {
     S.inGroupCall = true;
     S.groupCallId = g.id;
     S.groupMuted = false;
+    if (voiceBeacon) clearInterval(voiceBeacon);
+    voiceBeacon = window.setInterval(() => {
+      const gg = loadGroups().find((x) => x.id === S.groupCallId);
+      if (gg) invoke("voice_presence", { members: gg.members, gid: gg.id, inCall: true }).catch(() => {});
+    }, 1000);
     refreshGroupCallUI();
     log("📞 Appel de groupe " + (announce ? "lancé" : "rejoint") + ".");
   } catch (e) {
@@ -484,6 +512,15 @@ async function startGroupCall(g: Group, announce: boolean): Promise<void> {
 }
 function stopGroupCall(): void {
   invoke("group_call_stop").catch(() => {});
+  if (voiceBeacon) {
+    clearInterval(voiceBeacon);
+    voiceBeacon = 0;
+  }
+  // Beacon final "je quitte le vocal" — AVANT de remettre S.groupCallId à null, sinon
+  // on ne saurait plus quel groupe/quels membres notifier (les autres pairs attendraient
+  // sinon la péremption TTL de 4 s pour éteindre ma pastille).
+  const gg = loadGroups().find((x) => x.id === S.groupCallId);
+  if (gg) invoke("voice_presence", { members: gg.members, gid: gg.id, inCall: false }).catch(() => {});
   S.inGroupCall = false;
   S.groupCallId = null;
   refreshGroupCallUI();
@@ -2009,6 +2046,34 @@ export function initGroups(): void {
       el.classList.toggle("speaking", !!a?.speaking);
     });
   });
+  // Présence vocale groupe (Task 4.3) : pastille « dans le vocal » (.inbooth), visible
+  // par TOUT le groupe même hors appel — indépendante de ghost-voice-activity ci-dessus.
+  // `code` = pair authentifié (remote_id côté Rust, voir net.rs), pas une donnée
+  // auto-déclarée dans le payload.
+  listen("ghost-voice-presence", (e) => {
+    const p = e.payload || ({} as { group?: string; code?: string; inCall?: boolean });
+    if (!p.group || !p.code) return;
+    const g = (S.voicePresence[p.group] = S.voicePresence[p.group] || {});
+    if (p.inCall) g[p.code] = Date.now();
+    else delete g[p.code];
+    paintVoicePresence();
+  });
+  // Balayage TTL : une présence sans beacon depuis > 4 s (beacon ~1 Hz) est périmée —
+  // couvre un pair qui disparaît sans envoyer son beacon final inCall:false (crash,
+  // perte réseau, fermeture brutale de l'appli).
+  setInterval(() => {
+    const now = Date.now();
+    let changed = false;
+    for (const gid of Object.keys(S.voicePresence)) {
+      for (const code of Object.keys(S.voicePresence[gid])) {
+        if (now - S.voicePresence[gid][code] > 4000) {
+          delete S.voicePresence[gid][code];
+          changed = true;
+        }
+      }
+    }
+    if (changed) paintVoicePresence();
+  }, 2000);
   // Un vote d'exclusion reçu : tallie et applique au quorum (60 % des en-ligne).
   listen("ghost-kick", (e) => {
     const p = e.payload || ({} as { group?: string; target?: string; voter?: string; from?: string });
