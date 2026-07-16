@@ -67,7 +67,7 @@ export interface Commands {
 
   open_group: { args: { members: string[] }; ret: void };
   send_ginvite: { args: { member: string; gid: string; name: string; members: string }; ret: void };
-  send_gmembers: { args: { members: string[]; gid: string; name: string; roster: string; kicked: string; unkick: string }; ret: void };
+  send_gmembers: { args: { members: string[]; gid: string; name: string; roster: string }; ret: void };
   send_kick: { args: { members: string[]; gid: string; target: string; voter: string }; ret: void };
   send_gchat: { args: { members: string[]; gid: string; name: string; text: string }; ret: void };
   send_img: { args: { author: string; name: string; mime: string; data: number[] }; ret: void };
@@ -138,7 +138,7 @@ export interface Events {
   "ghost-gchat": { group: string; author?: string; text?: string };
   "ghost-gchat-img": { group: string; author?: string; name?: string; mime: string; dataB64: string; from?: string };
   "ghost-ginvite": { id: string; name?: string; members?: string };
-  "ghost-gmembers": { group: string; name?: string; members?: string; kicked?: string; unkick?: string; from?: string };
+  "ghost-gmembers": { group: string; name?: string; members?: string; from?: string };
   "ghost-kick": { group: string; target: string; voter: string; from?: string };
   "ghost-gcall": { group: string };
   "ghost-voice-presence": { group: string; code: string; inCall: boolean };

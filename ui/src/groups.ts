@@ -207,16 +207,38 @@ function saveKicked(gid: string, codes: Set<string>): void {
   else delete m[gid];
   localStorage.setItem("ghostlink_kicked", JSON.stringify(m));
 }
-// Diffuse mon état local du roster (membres + tombstones de kick) — 2P-Set gossipé.
-// `unkick` = codes explicitement ré-admis (lève leur tombstone chez le récepteur).
-// `to` = destinataires (défaut : tous les membres du groupe).
-function broadcastRoster(g: { id: string; name: string; members: string[] }, unkick: string[] = [], to?: string[]): void {
+// Diffuse MON set de membres pour ce groupe (union côté récepteur). `to` = destinataires
+// (défaut : tous les membres du groupe). Les tombstones de kick (kickedSet) restent LOCAUX
+// et ne partent JAMAIS sur le fil : la convergence des exclusions passe par le re-gossip
+// de votes authentifiés (voir myVotes / ghost-mesh-up), pas par des tombstones.
+function broadcastRoster(g: { id: string; name: string; members: string[] }, to?: string[]): void {
   const roster = [S.myCode, ...g.members].join(",");
-  const kicked = Array.from(kickedSet(g.id)).join(",");
-  invoke("send_gmembers", {
-    members: to ?? g.members, gid: g.id, name: g.name,
-    roster, kicked, unkick: unkick.join(","),
-  }).catch(() => {});
+  invoke("send_gmembers", { members: to ?? g.members, gid: g.id, name: g.name, roster }).catch(() => {});
+}
+// Mes votes de kick persistés par groupe : localStorage["ghostlink_myvotes"] = { gid: [cibles] }.
+// Uniquement MES propres votes — re-gossipés (authentifiés, voter = S.myCode) à un pair qui
+// (re)vient en ligne pour que sa tally atteigne le quorum même s'il a manqué le vote initial.
+function myVotes(gid: string): string[] {
+  try {
+    const m = JSON.parse(localStorage.getItem("ghostlink_myvotes") || "{}") as Record<string, string[]>;
+    return m[gid] || [];
+  } catch {
+    return [];
+  }
+}
+function saveMyVote(gid: string, target: string, on: boolean): void {
+  let m: Record<string, string[]> = {};
+  try {
+    m = JSON.parse(localStorage.getItem("ghostlink_myvotes") || "{}") as Record<string, string[]>;
+  } catch {
+    /* repart d'un objet vide */
+  }
+  const s = new Set(m[gid] || []);
+  if (on) s.add(target);
+  else s.delete(target);
+  if (s.size) m[gid] = Array.from(s);
+  else delete m[gid];
+  localStorage.setItem("ghostlink_myvotes", JSON.stringify(m));
 }
 function onlineMemberCount(g: Group): number {
   return 1 + g.members.filter((c) => S.meshOnline.has(c)).length; // + moi
@@ -245,7 +267,8 @@ function applyKick(g: Group, target: string): void {
   delete S.kickVotes[kickKey(g.id, target)];
   renderGroups();
   if (S.openGroupId === g.id) refreshGroupCounts();
-  broadcastRoster(g); // gossiper le nouveau tombstone (multi-saut, pour les hors-ligne/late-joiners)
+  // Tombstone LOCAL uniquement : PAS de gossip du tombstone (invariant de sécurité). La
+  // convergence chez les pairs hors-ligne/late-joiners se fait par re-gossip de MES votes.
   log("🚫 " + memberName(target) + " exclu du groupe « " + g.name + " » (vote atteint).");
 }
 function tallyKick(g: Group, target: string): void {
@@ -278,6 +301,7 @@ function castKick(g: Group, target: string): void {
   if (!confirm("Voter pour exclure " + memberName(target) + " du groupe « " + g.name + " » ?")) return;
   recordKickVote(g.id, target, S.myCode);
   invoke("send_kick", { members: g.members, gid: g.id, target, voter: S.myCode }).catch(() => {});
+  saveMyVote(g.id, target, true); // mémoriser MON vote → re-gossip aux pairs qui reviennent en ligne
   tallyKick(g, target);
 }
 
@@ -315,9 +339,14 @@ function addMembersToGroup(g: Group, newCodes: string[]): void {
   const groups = loadGroups();
   const gi = groups.find((x) => x.id === g.id);
   if (!gi) return;
-  // Ré-ajout explicite : lever la liste noire pour ces personnes (ré-invitation).
+  // Ré-ajout explicite : lever la liste noire LOCALE pour ces personnes (ré-invitation) ET
+  // cesser de re-gossiper mon vote contre elles (sinon je les kickerais à nouveau chez les
+  // autres). Advisory : les votes obsolètes des autres expirent (TTL) ou tombent au ré-ajout.
   const kset = kickedSet(g.id);
-  newCodes.forEach((c) => kset.delete(c));
+  newCodes.forEach((c) => {
+    kset.delete(c);
+    saveMyVote(g.id, c, false);
+  });
   saveKicked(g.id, kset);
   gi.members = Array.from(new Set([...gi.members, ...newCodes])).filter((c) => c && c !== S.myCode);
   saveGroups(groups);
@@ -327,9 +356,8 @@ function addMembersToGroup(g: Group, newCodes: string[]): void {
     addPInv(code, g.id, g.name, rosterCsv);
     invoke("send_ginvite", { member: code, gid: g.id, name: g.name, members: rosterCsv }).catch(() => {});
   });
-  // Les membres DÉJÀ présents : sync du roster (ils font l'union) + unkick (ré-admission
-  // explicite lève le tombstone de kick chez tout le monde, pour newCodes).
-  broadcastRoster(gi, newCodes);
+  // Les membres DÉJÀ présents : sync du roster (ils font l'union des membres).
+  broadcastRoster(gi);
   invoke("open_group", { members: friendsOnly(gi.members) }).catch(() => {});
   renderGroups();
   refreshGroupCounts();
@@ -367,6 +395,7 @@ export function renderGroups(): void {
       a.splice(i, 1);
       saveGroups(a);
       clearPInvGroup(g.id);
+      myVotes(g.id).forEach((t) => saveMyVote(g.id, t, false)); // ne plus re-gossiper mes votes d'un groupe quitté
       renderGroups();
       if (S.openGroupId === g.id) closeGroup();
     };
@@ -1969,14 +1998,18 @@ export function initGroups(): void {
       if (S.localScreenNative && nativeShareMembers && nativeShareMembers.includes(e.payload)) {
         log("ℹ️ " + memberName(e.payload) + " vient de se connecter — relance le partage (⏹️ puis 🖥️) pour l'inclure.");
       }
-      // Convergence de roster : envoyer MA vue des groupes qu'on partage (membres +
-      // tombstones de kick) à ce pair qui (re)vient en ligne — rattrape les ajouts/kicks
-      // manqués pendant qu'il était hors ligne (send_gmembers ne touche que les en-ligne
-      // au moment de l'événement).
+      // Convergence de roster : à ce pair qui (re)vient en ligne, envoyer (1) MON set de
+      // membres — rattrape les ajouts manqués pendant qu'il était hors ligne — et (2) MES
+      // votes de kick, via le chemin GKIND_KICK authentifié (voter = S.myCode, inforgeable) :
+      // le pair les tallie avec son propre handler ghost-kick et n'applique un retrait qu'au
+      // quorum. Aucun tombstone ne circule ; un seul vote forgé ne peut jamais faire quorum.
       const peer = e.payload;
       loadGroups().forEach((g) => {
         if (!g.members.includes(peer)) return;
-        broadcastRoster(g, [], [peer]);
+        broadcastRoster(g, [peer]); // membres → pair qui (re)vient
+        myVotes(g.id).forEach((target) => {
+          invoke("send_kick", { members: [peer], gid: g.id, target, voter: S.myCode }).catch(() => {});
+        });
       });
     }
     refreshGroupCounts();
@@ -2017,36 +2050,35 @@ export function initGroups(): void {
       '👪 Invitation au groupe « ' + (p.name || "?") + " » (" + full.length + " membres).";
     $("#groupInviteBanner").classList.remove("hidden");
   });
-  // Sync de roster (2P-Set) : union des membres ET des tombstones de kick reçus, moins
-  // les ré-admissions explicites (unkick) — puis re-diffusion multi-saut si mon état a
-  // réellement changé (convergence même sans lien direct avec tous les membres).
+  // Sync de roster : union des MEMBRES reçus (jamais de tombstones sur le fil) — puis
+  // re-diffusion multi-saut si mon set de membres a réellement changé (convergence des
+  // ajouts même sans lien direct avec tous les membres). Les exclusions convergent par un
+  // canal distinct (re-gossip de votes authentifiés), pas ici.
   listen("ghost-gmembers", (e) => {
-    const p = e.payload || ({} as { group?: string; members?: string; kicked?: string; unkick?: string; from?: string });
+    const p = e.payload || ({} as { group?: string; members?: string; from?: string });
     const groups = loadGroups();
     const g = groups.find((x) => x.id === p.group);
     if (!g) return; // pas (encore) dans ce groupe → les nouveaux reçoivent une invite
     // SÉCURITÉ : n'accepter une sync de roster QUE d'un membre déjà connu (p.from =
     // remote_id authentifié) — sinon n'importe quel ami connaissant le gid pourrait
-    // injecter des membres/tombstones arbitraires dans le roster local des autres.
+    // injecter des membres arbitraires dans le roster local des autres.
     if (!p.from || (!g.members.includes(p.from) && p.from !== S.myCode)) return;
-    const csv = (s?: string) => (s || "").split(",").map((x) => x.trim()).filter(Boolean);
-    const incMembers = csv(p.members), incKicked = csv(p.kicked), incUnkick = csv(p.unkick);
-    // tombstones : union, moins les ré-admissions explicites
-    const kset = kickedSet(g.id);
-    incKicked.forEach((c) => kset.add(c));
-    incUnkick.forEach((c) => kset.delete(c));
-    // membres : union, moins les tombstones ; jamais moi
-    const merged = Array.from(new Set([...g.members, ...incMembers])).filter((c) => c && c !== S.myCode && !kset.has(c));
-    const kickedChanged = JSON.stringify(Array.from(kickedSet(g.id)).sort()) !== JSON.stringify(Array.from(kset).sort());
-    const membersChanged = merged.length !== g.members.length || merged.some((c) => !g.members.includes(c));
-    if (!kickedChanged && !membersChanged) return; // rien de neuf → pas de re-diffusion (anti-tempête)
-    saveKicked(g.id, kset);
+    const kset = kickedSet(g.id); // tombstones LOCAUX (jamais reçus du fil) : ne pas ré-admettre un exclu
+    const incoming = (p.members || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const merged = Array.from(new Set([...g.members, ...incoming])).filter(
+      (c) => c && c !== S.myCode && !kset.has(c),
+    );
+    const changed = merged.length !== g.members.length || merged.some((c) => !g.members.includes(c));
+    if (!changed) return; // anti-tempête : aucune re-diffusion sur un no-op
     g.members = merged;
     saveGroups(groups);
     renderGroups();
     if (S.openGroupId === g.id) refreshGroupCounts();
     invoke("open_group", { members: friendsOnly(merged) }).catch(() => {});
-    broadcastRoster(g); // multi-saut : re-diffuser MON nouvel état aux membres en ligne
+    broadcastRoster(g); // multi-saut : propager le nouveau set de membres aux en-ligne
     log("👥 Roster du groupe « " + g.name + " » mis à jour.");
   });
   // Activité vocale (~10 Hz) : qui est en appel / qui parle. On bascule des classes

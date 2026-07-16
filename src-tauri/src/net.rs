@@ -749,16 +749,13 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, video_rx:
                             let _ = a.emit("ghost-signal", serde_json::json!({ "from": from, "data": data }));
                         }
                     } else if kind[0] == GKIND_GMEMBERS {
-                        // Sync de roster (2P-Set) : union des membres ET des tombstones de
-                        // kick, moins les ré-admissions explicites. L'UI fait la fusion.
-                        if let (Ok(gid), Ok(name), Ok(members), Ok(kicked), Ok(unkick)) = (
+                        // Sync de roster : un membre a ajouté des gens → l'UI fait l'union.
+                        if let (Ok(gid), Ok(name), Ok(members)) = (
                             read_lp16(&mut recv).await,
                             read_lp16(&mut recv).await,
-                            read_lp32(&mut recv).await,
-                            read_lp32(&mut recv).await,
                             read_lp32(&mut recv).await,
                         ) {
-                            let _ = a.emit("ghost-gmembers", serde_json::json!({ "group": gid, "name": name, "members": members, "kicked": kicked, "unkick": unkick, "from": from }));
+                            let _ = a.emit("ghost-gmembers", serde_json::json!({ "group": gid, "name": name, "members": members, "from": from }));
                         }
                     } else if kind[0] == GKIND_KICK {
                         // Un vote d'exclusion : [gid][cible][votant]. L'UI tallie et applique.
@@ -1008,18 +1005,14 @@ pub async fn send_gimg(net: &Net, members: Vec<String>, gid: &str, author: &str,
 }
 
 /// Diffuse le roster à jour d'un groupe aux membres présents (ajout de membres → ils
-/// font l'union). `roster` = CSV de TOUS les membres (le nouvel état). `kicked` = CSV
-/// des tombstones de kick connus localement (union côté récepteur) ; `unkick` = CSV des
-/// codes explicitement ré-admis (lève le tombstone côté récepteur). Best-effort : un
-/// membre hors ligne rattrapera à une rediffusion ultérieure (2P-Set : convergent).
+/// font l'union). `roster` = CSV de TOUS les membres (le nouvel état). Best-effort :
+/// un membre hors ligne rattrapera à une rediffusion ultérieure.
 pub async fn send_gmembers(
     net: &Net,
     members: Vec<String>,
     gid: &str,
     name: &str,
     roster: &str,
-    kicked: &str,
-    unkick: &str,
 ) -> anyhow::Result<()> {
     let targets: Vec<Connection> = {
         let m = net.mesh.lock().unwrap_or_else(|e| e.into_inner());
@@ -1034,8 +1027,6 @@ pub async fn send_gmembers(
             let _ = write_lp16(&mut send, gid).await;
             let _ = write_lp16(&mut send, name).await;
             let _ = write_lp32(&mut send, roster).await;
-            let _ = write_lp32(&mut send, kicked).await;
-            let _ = write_lp32(&mut send, unkick).await;
             let _ = send.finish();
         }
     }

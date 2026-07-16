@@ -87,8 +87,8 @@ async fn send_ginvite(state: State<'_, Net>, member: String, gid: String, name: 
 }
 
 #[tauri::command]
-async fn send_gmembers(state: State<'_, Net>, members: Vec<String>, gid: String, name: String, roster: String, kicked: String, unkick: String) -> Result<(), String> {
-    net::send_gmembers(state.inner(), members, &gid, &name, &roster, &kicked, &unkick).await.map_err(|e| e.to_string())
+async fn send_gmembers(state: State<'_, Net>, members: Vec<String>, gid: String, name: String, roster: String) -> Result<(), String> {
+    net::send_gmembers(state.inner(), members, &gid, &name, &roster).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
