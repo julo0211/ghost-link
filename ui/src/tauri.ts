@@ -85,7 +85,7 @@ export interface Commands {
 
   // Partage d'écran NATIF (sans WebRTC/STUN) — video.rs.
   video_share_start: {
-    args: { members: string[]; monitor: string | null; window: string | null };
+    args: { members: string[]; monitor: string | null; window: string | null; maxFps: number };
     ret: { w: number; h: number; fps: number; monitor: string; monitorFound: boolean };
   };
   video_share_stop: { args: void; ret: void };

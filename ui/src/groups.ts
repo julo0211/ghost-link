@@ -1507,6 +1507,18 @@ interface ShareTarget {
 }
 let nativeSharePid: number | null = null;
 
+// Item 3 (fps-only) : plafond de cadence choisi par l'utilisateur (l'adaptatif peut descendre en
+// dessous si le réseau sature). La résolution reste native (downscale reportée).
+type FpsPreset = { key: string; label: string; fps: number };
+const FPS_PRESETS: FpsPreset[] = [
+  { key: "60", label: "60 fps (max)", fps: 60 },
+  { key: "30", label: "30 fps (moins de bande passante)", fps: 30 },
+];
+function currentFps(): FpsPreset {
+  const k = localStorage.getItem("ghostlink_stream_quality") || "60";
+  return FPS_PRESETS.find((q) => q.key === k) || FPS_PRESETS[0];
+}
+
 // ----- Picker de partage natif (écran OU fenêtre), au clic sur 🖥️ -----
 function closeNativePicker(): void {
   $("#nativePickerWrap").classList.add("hidden");
@@ -1525,6 +1537,15 @@ async function openNativePicker(g: Group): Promise<void> {
   const winsBox = $("#nativePickerWindows");
   screensBox.replaceChildren();
   winsBox.replaceChildren();
+  const qSel = $<HTMLSelectElement>("#nativePickerQuality");
+  qSel.replaceChildren();
+  FPS_PRESETS.forEach((q) => {
+    const o = document.createElement("option");
+    o.value = q.key; o.textContent = q.label;
+    if (q.key === currentFps().key) o.selected = true;
+    qSel.appendChild(o);
+  });
+  qSel.onchange = () => localStorage.setItem("ghostlink_stream_quality", qSel.value);
   const start = (t: ShareTarget) => {
     closeNativePicker();
     void startScreenNative(g, t);
@@ -1575,8 +1596,8 @@ async function startScreenNative(g: Group, target: ShareTarget): Promise<void> {
     // Écran = szDevice STABLE (Rust replie sur le principal si absent, monitorFound) ;
     // Fenêtre = HWND.
     const args = isWindow
-      ? { members: g.members, monitor: null, window: target.id }
-      : { members: g.members, monitor: target.id || null, window: null };
+      ? { members: g.members, monitor: null, window: target.id, maxFps: currentFps().fps }
+      : { members: g.members, monitor: target.id || null, window: null, maxFps: currentFps().fps };
     let info: { w: number; h: number; fps: number; monitor: string; monitorFound: boolean };
     try {
       info = await invoke("video_share_start", args);
