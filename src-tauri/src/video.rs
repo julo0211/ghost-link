@@ -60,15 +60,13 @@ pub enum ShareTarget {
     Window(isize),
 }
 
-/// Plafond de qualité choisi par l'utilisateur (0 = illimité/natif).
+/// Plafond de qualité choisi par l'utilisateur.
 #[derive(Clone, Copy)]
 pub struct Quality {
     pub fps: u32,
-    pub max_w: u32,
-    pub max_h: u32,
 }
 impl Default for Quality {
-    fn default() -> Self { Quality { fps: FPS_DEFAULT, max_w: 0, max_h: 0 } }
+    fn default() -> Self { Quality { fps: FPS_DEFAULT } }
 }
 
 impl VideoShare {
@@ -292,19 +290,6 @@ mod tests {
     }
 
     #[test]
-    fn clamp_dims_never_upscales_and_keeps_ratio() {
-        // écran 3840x2160, plafond 2560x1440 → 2560x1440
-        assert_eq!(super::win::clamp_dims(3840, 2160, 2560, 1440), (2560, 1440));
-        // écran 1920x1080, plafond 2560x1440 → pas d'upscale → natif
-        assert_eq!(super::win::clamp_dims(1920, 1080, 2560, 1440), (1920, 1080));
-        // plafond 0,0 = illimité → natif
-        assert_eq!(super::win::clamp_dims(1920, 1080, 0, 0), (1920, 1080));
-        // dimensions paires (NV12 exige des dimensions paires)
-        let (w, h) = super::win::clamp_dims(1366, 768, 1280, 720);
-        assert_eq!((w % 2, h % 2), (0, 0));
-    }
-
-    #[test]
     fn levels_for_scales_relative_to_target() {
         assert_eq!(super::win::levels_for(60)[0].0, 60);
         assert_eq!(super::win::levels_for(30)[0].0, 30);
@@ -400,18 +385,6 @@ mod win {
         } else {
             base
         }
-    }
-
-    /// Dimensions d'encodage : plafonne au ratio, JAMAIS d'upscale, force la parité (NV12).
-    /// (0,0) en plafond = illimité → résolution native.
-    pub(super) fn clamp_dims(nw: u32, nh: u32, mw: u32, mh: u32) -> (u32, u32) {
-        let (mut w, mut h) = (nw, nh);
-        if mw > 0 && mh > 0 && (nw > mw || nh > mh) {
-            let scale = f64::min(mw as f64 / nw as f64, mh as f64 / nh as f64);
-            w = (nw as f64 * scale).round() as u32;
-            h = (nh as f64 * scale).round() as u32;
-        }
-        (w & !1, h & !1) // parité
     }
 
     /// Échelle d'adaptation (étape 3), relative à la cadence cible choisie (niveau 0 =
@@ -957,7 +930,7 @@ mod win {
                 let _ = ready.send(Err(format!("Media Foundation indisponible: {e}")));
                 return;
             }
-            let run = (|| -> anyhow::Result<(Capture, Encoder, ID3D11Device, u32, u32)> {
+            let run = (|| -> anyhow::Result<(Capture, Encoder, ID3D11Device)> {
                 let mut device: Option<ID3D11Device> = None;
                 D3D11CreateDevice(
                     None,
@@ -975,11 +948,13 @@ mod win {
                 let mt: ID3D10Multithread = device.cast()?;
                 let _ = mt.SetMultithreadProtected(true);
                 let cap = build_capture(&device, &target)?;
-                let (enc_w, enc_h) = clamp_dims(cap.w, cap.h, quality.max_w, quality.max_h);
-                let enc = build_encoder(&device, enc_w, enc_h, quality.fps.max(1))?;
-                Ok((cap, enc, device, enc_w, enc_h))
+                // Résolution NATIVE pour l'instant — la downscale (choix 720p/1080p/2K) est
+                // reportée : elle exige un redimensionnement de l'étage BGRA→NV12 (voir spec).
+                // Ici on ne plafonne QUE le fps.
+                let enc = build_encoder(&device, cap.w, cap.h, quality.fps.max(1))?;
+                Ok((cap, enc, device))
             })();
-            let (cap, enc, _device, enc_w, enc_h) = match run {
+            let (cap, enc, _device) = match run {
                 Ok(v) => v,
                 Err(e) => {
                     let _ = ready.send(Err(e.to_string()));
@@ -987,9 +962,9 @@ mod win {
                     return;
                 }
             };
-            // Dimensions ENCODÉES (pas la capture brute) : l'UI doit afficher la vraie
-            // résolution diffusée, pas la résolution native de l'écran/fenêtre capturée.
-            let _ = ready.send(Ok((enc_w, enc_h, cap.label.clone(), cap.found)));
+            // Dimensions ENCODÉES = dimensions natives (pas de downscale pour l'instant) :
+            // l'UI affiche la vraie résolution diffusée.
+            let _ = ready.send(Ok((cap.w, cap.h, cap.label.clone(), cap.found)));
 
             // Un flux QUIC par pair, alimenté par une file bornée (contre-pression).
             let mut peers: Vec<PeerOut> = conns
