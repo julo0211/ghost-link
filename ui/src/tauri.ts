@@ -70,6 +70,9 @@ export interface Commands {
   send_gmembers: { args: { members: string[]; gid: string; name: string; roster: string }; ret: void };
   send_kick: { args: { members: string[]; gid: string; target: string; voter: string }; ret: void };
   send_gchat: { args: { members: string[]; gid: string; name: string; text: string }; ret: void };
+  send_img: { args: { author: string; name: string; mime: string; data: number[] }; ret: void };
+  send_gimg: { args: { members: string[]; gid: string; author: string; name: string; mime: string; data: number[] }; ret: void };
+  read_image_bytes: { args: { path: string }; ret: number[] };
   group_call_start: { args: { members: string[]; gid: string; announce: boolean }; ret: void };
   group_call_stop: { args: void; ret: void };
   group_call_mute: { args: { on: boolean }; ret: void };
@@ -117,6 +120,7 @@ export interface Events {
   "ghost-recv-nospace": { name?: string; size?: number; free?: number; from?: string };
 
   "ghost-chat": { text: string; name: string };
+  "ghost-chat-img": { author?: string; name?: string; mime: string; dataB64: string };
   "ghost-freq": { name?: string; code?: string };
   "ghost-faccept": { name?: string; code?: string };
 
@@ -131,6 +135,7 @@ export interface Events {
   "ghost-mesh-up": string;
   "ghost-mesh-down": string;
   "ghost-gchat": { group: string; author?: string; text?: string };
+  "ghost-gchat-img": { group: string; author?: string; name?: string; mime: string; dataB64: string; from?: string };
   "ghost-ginvite": { id: string; name?: string; members?: string };
   "ghost-gmembers": { group: string; name?: string; members?: string; from?: string };
   "ghost-kick": { group: string; target: string; voter: string; from?: string };

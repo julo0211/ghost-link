@@ -33,6 +33,7 @@ lopdf = "0.34"
 # deflate-flate2-zlib-rs et non la méta-feature "deflate" : celle-ci embarque aussi
 # zopfli (+bumpalo), inutile pour écrire quelques petites entrées XML de remplacement.
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+base64 = "0.22.1"
 
 # Chiffrement de la clé d'identité au repos (DPAPI) — Windows uniquement.
 [target.'cfg(windows)'.dependencies]

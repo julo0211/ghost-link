@@ -1792,6 +1792,7 @@ version = "0.33.0"
 dependencies = [
  "anyhow",
  "audiopus",
+ "base64 0.22.1",
  "bytes",
  "cpal",
  "dirs",

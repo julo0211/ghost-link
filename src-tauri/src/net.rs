@@ -29,6 +29,7 @@ const KIND_CALL_START: u8 = 5; // début d'appel vocal
 const KIND_CALL_STOP: u8 = 6; // fin d'appel vocal
 const KIND_HELLO: u8 = 7; // poignée de main applicative : l'initiateur n'est « connecté » qu'après l'ack du pair
 const KIND_FDATA: u8 = 8; // flux de données d'un transfert (multi-flux parallèles)
+const KIND_IMG: u8 = 9; // image inline 1-à-1 (octets)
 const NSTREAMS: u64 = 4; // nombre de flux parallèles par fichier
 static FILE_SEQ: AtomicU64 = AtomicU64::new(1); // identifiants de transfert
 static STREAMS: AtomicU64 = AtomicU64::new(NSTREAMS); // nb de flux parallèles, réglable à chaud (1..=8)
@@ -49,9 +50,12 @@ const GKIND_GFDATA: u8 = 6; // flux de données d'un fichier de groupe (multi-fl
 pub const GKIND_VIDEO: u8 = 7; // partage d'écran NATIF (H.264 sur flux uni, video.rs)
 const GKIND_GMEMBERS: u8 = 8; // sync de roster de groupe (ajout de membres → union)
 const GKIND_KICK: u8 = 9; // un vote d'exclusion (vote-kick décentralisé)
+const GKIND_GIMG: u8 = 11; // image inline de groupe (octets)
 /// Taille maximale d'UNE image H.264 reçue (une keyframe 1440p à 12 Mb/s fait ~1-2 Mo) :
 /// borne les allocations pilotées par le réseau (même famille de garde que GL-1).
 const VIDEO_FRAME_MAX: usize = 8 * 1024 * 1024;
+/// Borne dure d'allocation pour une image inline reçue (spec : inline ≤ 5 Mo côté UI).
+const MAX_IMG_WIRE: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct ConnState {
@@ -556,6 +560,25 @@ async fn write_lp32<W: AsyncWriteExt + Unpin>(send: &mut W, s: &str) -> anyhow::
     send.write_all(b).await?;
     Ok(())
 }
+async fn write_lp32_bytes<W: AsyncWriteExt + Unpin>(send: &mut W, b: &[u8]) -> anyhow::Result<()> {
+    send.write_all(&(b.len() as u32).to_be_bytes()).await?;
+    send.write_all(b).await?;
+    Ok(())
+}
+async fn read_lp32_bytes<R: AsyncReadExt + Unpin>(recv: &mut R, max: usize) -> anyhow::Result<Vec<u8>> {
+    let mut l = [0u8; 4];
+    recv.read_exact(&mut l).await?;
+    let n = u32::from_be_bytes(l) as usize;
+    if n == 0 || n > max {
+        anyhow::bail!("image trop grande"); // borne AVANT alloc
+    }
+    let mut b = vec![0u8; n];
+    recv.read_exact(&mut b).await?;
+    Ok(b)
+}
+fn mime_ok(m: &str) -> bool {
+    matches!(m, "image/png" | "image/jpeg" | "image/gif" | "image/webp")
+}
 
 /// Seau à jetons du relais vidéo d'UN pair (partagé entre ses flux) : (budget, dernier refill).
 type RelayBudget = Arc<StdMutex<(i64, std::time::Instant)>>;
@@ -741,6 +764,24 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, video_rx:
                             read_lp16(&mut recv).await,
                         ) {
                             let _ = a.emit("ghost-kick", serde_json::json!({ "group": gid, "target": target, "voter": voter, "from": from }));
+                        }
+                    } else if kind[0] == GKIND_GIMG {
+                        let parsed: anyhow::Result<(String, String, String, String, Vec<u8>)> = async {
+                            let gid = read_lp16(&mut recv).await?;
+                            let author = read_lp16(&mut recv).await?;
+                            let name = read_lp16(&mut recv).await?;
+                            let mime = read_lp16(&mut recv).await?;
+                            if !mime_ok(&mime) {
+                                anyhow::bail!("mime refusé");
+                            }
+                            let data = read_lp32_bytes(&mut recv, MAX_IMG_WIRE).await?;
+                            Ok((gid, author, name, mime, data))
+                        }
+                        .await;
+                        if let Ok((gid, author, name, mime, data)) = parsed {
+                            use base64::Engine;
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                            let _ = a.emit("ghost-gchat-img", serde_json::json!({ "group": gid, "author": author, "name": name, "mime": mime, "dataB64": b64, "from": from }));
                         }
                     } else if kind[0] == GKIND_GFILE {
                         let _ = recv_gfile(&a, &settings, &from, &mut send, &mut recv, &inbounds).await;
@@ -928,6 +969,26 @@ pub async fn send_gchat(
             let _ = write_lp16(&mut send, gid).await;
             let _ = write_lp16(&mut send, author).await;
             let _ = write_lp32(&mut send, text).await;
+            let _ = send.finish();
+        }
+    }
+    Ok(())
+}
+
+/// Diffuse une image inline (octets) aux membres du groupe présents.
+pub async fn send_gimg(net: &Net, members: Vec<String>, gid: &str, author: &str, name: &str, mime: &str, data: &[u8]) -> anyhow::Result<()> {
+    let targets: Vec<Connection> = {
+        let m = net.mesh.lock().unwrap_or_else(|e| e.into_inner());
+        members.iter().filter_map(|c| m.get(c.trim()).map(|(_, c)| c.clone())).collect()
+    };
+    for conn in targets {
+        if let Ok((mut send, _r)) = conn.open_bi().await {
+            let _ = send.write_all(&[GKIND_GIMG]).await;
+            let _ = write_lp16(&mut send, gid).await;
+            let _ = write_lp16(&mut send, author).await;
+            let _ = write_lp16(&mut send, name).await;
+            let _ = write_lp16(&mut send, mime).await;
+            let _ = write_lp32_bytes(&mut send, data).await;
             let _ = send.finish();
         }
     }
@@ -1571,6 +1632,26 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                         }
                         return;
                     }
+                    if kind[0] == KIND_IMG {
+                        // [u16 author][u16 name][u16 mime][u32 data]
+                        let parsed: anyhow::Result<(String, String, String, Vec<u8>)> = async {
+                            let author = read_lp16(&mut recv).await?;
+                            let name = read_lp16(&mut recv).await?;
+                            let mime = read_lp16(&mut recv).await?;
+                            if !mime_ok(&mime) {
+                                anyhow::bail!("mime refusé");
+                            }
+                            let data = read_lp32_bytes(&mut recv, MAX_IMG_WIRE).await?;
+                            Ok((author, name, mime, data))
+                        }
+                        .await;
+                        if let Ok((author, name, mime, data)) = parsed {
+                            use base64::Engine;
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                            let _ = a.emit("ghost-chat-img", serde_json::json!({ "author": author, "name": name, "mime": mime, "dataB64": b64 }));
+                        }
+                        return;
+                    }
                     if kind[0] == KIND_FREQ || kind[0] == KIND_FACCEPT {
                         // [u16 nom_len][nom] puis (depuis 0.14.1) [u16 code_len][code permanent]
                         let (name, code) = async {
@@ -2026,6 +2107,19 @@ pub async fn send_chat(slot: &Slot, name: &str, text: &str) -> anyhow::Result<()
     AsyncWriteExt::write_all(&mut send, tb)
         .await
         .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
+    send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+    Ok(())
+}
+
+/// Envoie une image inline (octets) sur la connexion 1-à-1 ouverte.
+pub async fn send_img(slot: &Slot, author: &str, name: &str, mime: &str, data: &[u8]) -> anyhow::Result<()> {
+    let conn = current(slot).await.ok_or_else(|| anyhow::anyhow!("pas connecté"))?;
+    let (mut send, _r) = conn.open_bi().await.map_err(|e| anyhow::anyhow!("flux: {e}"))?;
+    send.write_all(&[KIND_IMG]).await?;
+    write_lp16(&mut send, author).await?;
+    write_lp16(&mut send, name).await?;
+    write_lp16(&mut send, mime).await?;
+    write_lp32_bytes(&mut send, data).await?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
     Ok(())
 }

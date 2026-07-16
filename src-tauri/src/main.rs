@@ -97,6 +97,27 @@ async fn send_kick(state: State<'_, Net>, members: Vec<String>, gid: String, tar
 }
 
 #[tauri::command]
+async fn send_img(state: State<'_, Net>, author: String, name: String, mime: String, data: Vec<u8>) -> Result<(), String> {
+    let slot = state.slot.clone();
+    net::send_img(&slot, &author, &name, &mime, &data).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn send_gimg(state: State<'_, Net>, members: Vec<String>, gid: String, author: String, name: String, mime: String, data: Vec<u8>) -> Result<(), String> {
+    net::send_gimg(state.inner(), members, &gid, &author, &name, &mime, &data).await.map_err(|e| e.to_string())
+}
+
+/// Repli grosse image : lire les octets d'un fichier reçu (borné) pour rendu inline via blob.
+#[tauri::command]
+async fn read_image_bytes(path: String) -> Result<Vec<u8>, String> {
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    if meta.len() > 32 * 1024 * 1024 {
+        return Err("image trop grande".into()); // borne
+    }
+    std::fs::read(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn set_download_dir(state: State<'_, Net>, path: String) {
     net::set_download_dir(&state.settings, &path);
 }
@@ -481,7 +502,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            perm_code, eph_code, rotate_eph_code, probe, connect, send_file, send_chat, send_freq, send_faccept, open_group, send_gchat, send_ginvite, send_gmembers, send_kick,
+            perm_code, eph_code, rotate_eph_code, probe, connect, send_file, send_chat, send_freq, send_faccept, open_group, send_gchat, send_ginvite, send_gmembers, send_kick, send_img, send_gimg, read_image_bytes,
             group_call_start, group_call_stop, group_call_mute, group_call_volume, screen_audio_start, screen_audio_stop, screen_audio_mute, screen_audio_gain, send_signal, send_gfile,
             video_share_start, video_share_stop, video_receive_attach, video_list_monitors, video_list_windows,
             fingerprint, app_version, check_update, install_update, set_download_dir,
