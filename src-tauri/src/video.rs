@@ -20,18 +20,13 @@ use std::sync::{Arc, Mutex};
 use iroh::endpoint::Connection;
 use tauri::AppHandle;
 
-/// Cadence cible du partage (trames dupliquées si l'écran ne change pas).
-const FPS: u32 = 30;
+/// Cadence par défaut (Auto) : plafond 60 fps (l'adaptatif descend si le réseau sature).
+const FPS_DEFAULT: u32 = 60;
 /// Intervalle d'images clés (secondes) — borne le temps de « prise » d'un pair qui
 /// rejoint ou qui a sauté des trames.
 const KEYFRAME_SECS: u32 = 2;
 /// Profondeur de la file d'envoi par pair (~2 s de vidéo) avant de sauter des trames.
 const PEER_QUEUE: usize = 64;
-/// Échelle d'adaptation (étape 3) : (fps, % du débit de base). Niveau 0 = qualité
-/// max ; on descend d'un cran quand les files des pairs débordent (réseau saturé),
-/// on remonte d'un cran après 12 s de calme. Le débit NVENC est reconfiguré À CHAUD
-/// (ICodecAPI) — validé sur cette machine par le smoke test matériel.
-const LEVELS: [(u32, u32); 4] = [(30, 100), (20, 66), (12, 40), (8, 25)];
 
 /// Une image encodée, partagée entre tous les pairs (clone = comptage de références).
 #[derive(Clone)]
@@ -65,6 +60,17 @@ pub enum ShareTarget {
     Window(isize),
 }
 
+/// Plafond de qualité choisi par l'utilisateur (0 = illimité/natif).
+#[derive(Clone, Copy)]
+pub struct Quality {
+    pub fps: u32,
+    pub max_w: u32,
+    pub max_h: u32,
+}
+impl Default for Quality {
+    fn default() -> Self { Quality { fps: FPS_DEFAULT, max_w: 0, max_h: 0 } }
+}
+
 impl VideoShare {
     /// Démarre (ou redémarre) le partage vers les connexions de maillage données.
     /// `monitor` : szDevice stable renvoyé par `list_monitors` (None = écran principal ;
@@ -76,6 +82,7 @@ impl VideoShare {
         conns: Vec<(String, Connection)>,
         rt: tokio::runtime::Handle,
         target: ShareTarget,
+        quality: Quality,
     ) -> anyhow::Result<StartInfo> {
         self.stop();
         let stop = Arc::new(AtomicBool::new(false));
@@ -87,12 +94,14 @@ impl VideoShare {
         {
             let stop = stop.clone();
             std::thread::spawn(move || {
-                win::capture_encode_thread(app, conns, rt, stop, ready_tx, target);
+                win::capture_encode_thread(app, conns, rt, stop, ready_tx, target, quality);
             });
         }
         // Init WGC + NVENC : rapide en pratique ; 10 s couvre un GPU occupé.
         match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(Ok((w, h, monitor, monitor_found))) => Ok(StartInfo { w, h, fps: FPS, monitor, monitor_found }),
+            Ok(Ok((w, h, monitor, monitor_found))) => {
+                Ok(StartInfo { w, h, fps: quality.fps.max(1), monitor, monitor_found })
+            }
             Ok(Err(e)) => {
                 stop.store(true, Ordering::SeqCst);
                 self.clear_if(&stop);
@@ -123,6 +132,7 @@ impl VideoShare {
         _conns: Vec<(String, Connection)>,
         _rt: tokio::runtime::Handle,
         _target: ShareTarget,
+        _quality: Quality,
     ) -> anyhow::Result<StartInfo> {
         Err(anyhow::anyhow!("partage d'écran natif non disponible sur cette plateforme"))
     }
@@ -280,11 +290,36 @@ mod tests {
         let o = dispatch(&mut peers, &f(2, true));
         assert!(o.newly_dead.is_empty() && !o.congested);
     }
+
+    #[test]
+    fn clamp_dims_never_upscales_and_keeps_ratio() {
+        // écran 3840x2160, plafond 2560x1440 → 2560x1440
+        assert_eq!(super::win::clamp_dims(3840, 2160, 2560, 1440), (2560, 1440));
+        // écran 1920x1080, plafond 2560x1440 → pas d'upscale → natif
+        assert_eq!(super::win::clamp_dims(1920, 1080, 2560, 1440), (1920, 1080));
+        // plafond 0,0 = illimité → natif
+        assert_eq!(super::win::clamp_dims(1920, 1080, 0, 0), (1920, 1080));
+        // dimensions paires (NV12 exige des dimensions paires)
+        let (w, h) = super::win::clamp_dims(1366, 768, 1280, 720);
+        assert_eq!((w % 2, h % 2), (0, 0));
+    }
+
+    #[test]
+    fn levels_for_scales_relative_to_target() {
+        assert_eq!(super::win::levels_for(60)[0].0, 60);
+        assert_eq!(super::win::levels_for(30)[0].0, 30);
+        // le niveau 0 est toujours 100 % du débit
+        assert_eq!(super::win::levels_for(60)[0].1, 100);
+        // les crans inférieurs descendent
+        assert!(super::win::levels_for(60)[3].0 < 60);
+    }
 }
 
 #[cfg(windows)]
 mod win {
-    use super::{dispatch, peer_writer, Frame, PeerOut, FPS, KEYFRAME_SECS, LEVELS, PEER_QUEUE};
+    use super::{dispatch, peer_writer, Frame, PeerOut, KEYFRAME_SECS, PEER_QUEUE};
+    #[cfg(test)]
+    use super::FPS_DEFAULT;
     use std::mem::ManuallyDrop;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -339,16 +374,59 @@ mod win {
     use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
     use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 
-    /// Débit cible selon la résolution (plan : 8 Mb/s @1080p, 12 Mb/s @1440p).
+    /// Débit cible selon la résolution (plan : 8 Mb/s @1080p, 12 Mb/s @1440p), à 30 fps.
+    /// Conservée pour tout appel existant ; préférer `bitrate_for_fps` (tient compte du
+    /// plafond de cadence choisi).
+    #[allow(dead_code)]
     fn bitrate_for(w: u32, h: u32) -> u32 {
-        let px = w * h;
-        if px > 1920 * 1080 {
-            12_000_000
-        } else if px > 1280 * 720 {
-            8_000_000
+        bitrate_for_fps(w, h, 30)
+    }
+
+    /// Débit cible selon la résolution ET la cadence (au-delà de 50 fps, plus de
+    /// mouvement à encoder par seconde → ~×1.5 pour ne pas sous-bitrater du 60 fps).
+    fn bitrate_for_fps(w: u32, h: u32, fps: u32) -> u32 {
+        let base = {
+            let px = w * h;
+            if px > 1920 * 1080 {
+                12_000_000
+            } else if px > 1280 * 720 {
+                8_000_000
+            } else {
+                5_000_000
+            }
+        };
+        if fps >= 50 {
+            base * 3 / 2
         } else {
-            5_000_000
+            base
         }
+    }
+
+    /// Dimensions d'encodage : plafonne au ratio, JAMAIS d'upscale, force la parité (NV12).
+    /// (0,0) en plafond = illimité → résolution native.
+    pub(super) fn clamp_dims(nw: u32, nh: u32, mw: u32, mh: u32) -> (u32, u32) {
+        let (mut w, mut h) = (nw, nh);
+        if mw > 0 && mh > 0 && (nw > mw || nh > mh) {
+            let scale = f64::min(mw as f64 / nw as f64, mh as f64 / nh as f64);
+            w = (nw as f64 * scale).round() as u32;
+            h = (nh as f64 * scale).round() as u32;
+        }
+        (w & !1, h & !1) // parité
+    }
+
+    /// Échelle d'adaptation (étape 3), relative à la cadence cible choisie (niveau 0 =
+    /// cible/100 % du débit). Niveau 0 = qualité max ; on descend d'un cran quand les
+    /// files des pairs débordent (réseau saturé), on remonte d'un cran après 12 s de
+    /// calme. Le débit NVENC est reconfiguré À CHAUD (ICodecAPI) — validé sur cette
+    /// machine par le smoke test matériel.
+    pub(super) fn levels_for(fps: u32) -> [(u32, u32); 4] {
+        let f = fps.max(1);
+        [
+            (f, 100),
+            ((f * 2 / 3).max(1), 66),
+            ((f * 2 / 5).max(1), 40),
+            ((f / 4).max(1), 25),
+        ]
     }
 
     /// Poignées des moniteurs, dans l'ordre d'énumération Windows.
@@ -616,10 +694,13 @@ mod win {
     }
 
     /// Active le premier encodeur H.264 MATÉRIEL et le configure (voir pièges exp2).
+    /// `fps` : cadence cible (plafond choisi par l'utilisateur) — pilote la cadence
+    /// annoncée à l'encodeur, le GOP initial et le facteur du débit de base.
     unsafe fn build_encoder(
         device: &ID3D11Device,
         w: u32,
         h: u32,
+        fps: u32,
     ) -> anyhow::Result<Encoder> {
         let reg = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
@@ -668,9 +749,9 @@ mod win {
         let out_ty = MFCreateMediaType()?;
         out_ty.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         out_ty.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
-        out_ty.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_for(w, h))?;
+        out_ty.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_for_fps(w, h, fps))?;
         out_ty.SetUINT64(&MF_MT_FRAME_SIZE, ((w as u64) << 32) | h as u64)?;
-        out_ty.SetUINT64(&MF_MT_FRAME_RATE, ((FPS as u64) << 32) | 1)?;
+        out_ty.SetUINT64(&MF_MT_FRAME_RATE, ((fps as u64) << 32) | 1)?;
         out_ty.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         out_ty.SetUINT32(&MF_MT_MPEG2_PROFILE, 77)?; // H.264 Main
         transform
@@ -690,7 +771,7 @@ mod win {
         }
         let in_ty = in_ty.ok_or_else(|| anyhow::anyhow!("l'encodeur ne propose pas NV12"))?;
         in_ty.SetUINT64(&MF_MT_FRAME_SIZE, ((w as u64) << 32) | h as u64)?;
-        in_ty.SetUINT64(&MF_MT_FRAME_RATE, ((FPS as u64) << 32) | 1)?;
+        in_ty.SetUINT64(&MF_MT_FRAME_RATE, ((fps as u64) << 32) | 1)?;
         in_ty.SetUINT32(&MF_MT_DEFAULT_STRIDE, w)?;
         transform
             .SetInputType(0, &in_ty, 0)
@@ -700,7 +781,7 @@ mod win {
         // (best-effort : tous les encodeurs ne l'exposent pas).
         let codec_api = transform.cast::<ICodecAPI>().ok();
         if let Some(ca) = &codec_api {
-            let gop = windows::core::VARIANT::from(FPS * KEYFRAME_SECS);
+            let gop = windows::core::VARIANT::from(fps * KEYFRAME_SECS);
             let _ = ca.SetValue(&CODECAPI_AVEncMPVGOPSize, &gop);
         }
 
@@ -867,6 +948,7 @@ mod win {
         stop: Arc<AtomicBool>,
         ready: std::sync::mpsc::Sender<Result<(u32, u32, String, bool), String>>,
         target: super::ShareTarget,
+        quality: super::Quality,
     ) {
         unsafe {
             // Apartment WinRT multithread pour WGC ; toléré s'il est déjà initialisé.
@@ -875,7 +957,7 @@ mod win {
                 let _ = ready.send(Err(format!("Media Foundation indisponible: {e}")));
                 return;
             }
-            let run = (|| -> anyhow::Result<(Capture, Encoder, ID3D11Device)> {
+            let run = (|| -> anyhow::Result<(Capture, Encoder, ID3D11Device, u32, u32)> {
                 let mut device: Option<ID3D11Device> = None;
                 D3D11CreateDevice(
                     None,
@@ -893,10 +975,11 @@ mod win {
                 let mt: ID3D10Multithread = device.cast()?;
                 let _ = mt.SetMultithreadProtected(true);
                 let cap = build_capture(&device, &target)?;
-                let enc = build_encoder(&device, cap.w, cap.h)?;
-                Ok((cap, enc, device))
+                let (enc_w, enc_h) = clamp_dims(cap.w, cap.h, quality.max_w, quality.max_h);
+                let enc = build_encoder(&device, enc_w, enc_h, quality.fps.max(1))?;
+                Ok((cap, enc, device, enc_w, enc_h))
             })();
-            let (cap, enc, _device) = match run {
+            let (cap, enc, _device, enc_w, enc_h) = match run {
                 Ok(v) => v,
                 Err(e) => {
                     let _ = ready.send(Err(e.to_string()));
@@ -904,7 +987,9 @@ mod win {
                     return;
                 }
             };
-            let _ = ready.send(Ok((cap.w, cap.h, cap.label.clone(), cap.found)));
+            // Dimensions ENCODÉES (pas la capture brute) : l'UI doit afficher la vraie
+            // résolution diffusée, pas la résolution native de l'écran/fenêtre capturée.
+            let _ = ready.send(Ok((enc_w, enc_h, cap.label.clone(), cap.found)));
 
             // Un flux QUIC par pair, alimenté par une file bornée (contre-pression).
             let mut peers: Vec<PeerOut> = conns
@@ -916,7 +1001,7 @@ mod win {
                 })
                 .collect();
 
-            let reason = encode_loop(&app, &cap, &enc, &stop, &mut peers);
+            let reason = encode_loop(&app, &cap, &enc, &stop, &mut peers, quality);
             // Fin propre : prévenir l'UI si on s'arrête sur une ERREUR (et non stop()).
             if let Err(e) = reason {
                 if !stop.load(Ordering::SeqCst) {
@@ -942,23 +1027,25 @@ mod win {
 
     /// Boucle NeedInput/HaveOutput avec duplication de trame, cadence ADAPTATIVE
     /// (étape 3 : les débordements des files par pair font descendre l'échelle
-    /// LEVELS — fps ET débit NVENC à chaud — ; 12 s de calme la font remonter) et
-    /// stats émises chaque seconde vers l'UI (ghost-video-stats).
+    /// `levels_for(quality.fps)` — fps ET débit NVENC à chaud — ; 12 s de calme la
+    /// font remonter) et stats émises chaque seconde vers l'UI (ghost-video-stats).
     unsafe fn encode_loop(
         app: &AppHandle,
         cap: &Capture,
         enc: &Encoder,
         stop: &AtomicBool,
         peers: &mut [PeerOut],
+        quality: super::Quality,
     ) -> anyhow::Result<()> {
         let (w, h) = (cap.w as usize, cap.h as usize);
         let mut nv12 = vec![0u8; w * h * 3 / 2]; // noir NV12 = Y=0/UV=0 acceptable au 1er tick
         for uv in nv12[w * h..].iter_mut() {
             *uv = 128;
         }
-        let base_bitrate = bitrate_for(cap.w, cap.h);
+        let base_bitrate = bitrate_for_fps(cap.w, cap.h, quality.fps);
         let mut level: usize = 0;
-        let mut frame_interval = Duration::from_nanos(1_000_000_000 / LEVELS[level].0 as u64);
+        let mut frame_interval =
+            Duration::from_nanos(1_000_000_000 / levels_for(quality.fps)[level].0 as u64);
         // « dyn » = le débit est-il RÉELLEMENT reconfigurable à chaud ? Optimiste tant
         // qu'aucune baisse n'a été tentée ; corrigé au 1er set_bitrate (un encodeur peut
         // exposer ICodecAPI mais rejeter AVEncCommonMeanBitRate en cours de flux). Sinon
@@ -1010,7 +1097,7 @@ mod win {
                 grab_latest(cap, &mut nv12, &mut grab_fails)?;
                 // Trois secondes d'échecs de copie consécutifs (device D3D perdu…) :
                 // arrêter avec une raison visible plutôt que diffuser une image figée.
-                if grab_fails > FPS * 3 {
+                if grab_fails > quality.fps.max(1) * 3 {
                     anyhow::bail!("copie de l'écran en échec répété (GPU/pilote)");
                 }
                 let mb = MFCreateMemoryBuffer(nv12.len() as u32)?;
@@ -1070,7 +1157,8 @@ mod win {
             }
             let since_change = last_level_change.elapsed();
             let calm = last_congestion.map(|t| t.elapsed() >= Duration::from_secs(12)).unwrap_or(true);
-            let new_level = if congested && level + 1 < LEVELS.len() && since_change >= Duration::from_secs(2) {
+            let levels = levels_for(quality.fps);
+            let new_level = if congested && level + 1 < levels.len() && since_change >= Duration::from_secs(2) {
                 level + 1
             } else if !congested && calm && level > 0 && since_change >= Duration::from_secs(12) {
                 level - 1
@@ -1080,7 +1168,7 @@ mod win {
             if new_level != level {
                 level = new_level;
                 last_level_change = Instant::now();
-                let (fps_l, pct) = LEVELS[level];
+                let (fps_l, pct) = levels[level];
                 frame_interval = Duration::from_nanos(1_000_000_000 / fps_l as u64);
                 // Débit + GOP à chaud (best-effort : sans reconfiguration réelle, seul
                 // le fps bouge — ça soulage l'encodeur mais pas le réseau, le saut de
@@ -1101,7 +1189,7 @@ mod win {
                     "peers": alive,
                     "peersOk": ok,
                     "level": level,
-                    "pct": LEVELS[level].1,
+                    "pct": levels_for(quality.fps)[level].1,
                     "dyn": dynamic_ok,
                     "w": cap.w,
                     "h": cap.h,
@@ -1241,10 +1329,10 @@ mod win {
                 let _ = mt.SetMultithreadProtected(true);
                 let cap = build_capture(&device, &crate::video::ShareTarget::Window(hwnd))
                     .expect("capture de fenêtre");
-                let enc = build_encoder(&device, cap.w, cap.h).expect("encodeur");
+                let enc = build_encoder(&device, cap.w, cap.h, FPS_DEFAULT).expect("encodeur");
                 let (w, h) = (cap.w as usize, cap.h as usize);
                 let mut nv12 = vec![0u8; w * h * 3 / 2];
-                let frame_dur: i64 = 10_000_000 / FPS as i64;
+                let frame_dur: i64 = 10_000_000 / FPS_DEFAULT as i64;
                 let mut fed = 0u64;
                 let mut got = 0u64;
                 let deadline = Instant::now() + Duration::from_secs(10);
@@ -1342,10 +1430,10 @@ mod win {
                 let mt: ID3D10Multithread = device.cast().unwrap();
                 let _ = mt.SetMultithreadProtected(true);
                 let cap = build_capture(&device, &crate::video::ShareTarget::Monitor(None)).expect("capture WGC");
-                let enc = build_encoder(&device, cap.w, cap.h).expect("encodeur matériel");
+                let enc = build_encoder(&device, cap.w, cap.h, FPS_DEFAULT).expect("encodeur matériel");
                 let (w, h) = (cap.w as usize, cap.h as usize);
                 let mut nv12 = vec![0u8; w * h * 3 / 2];
-                let frame_dur: i64 = 10_000_000 / FPS as i64;
+                let frame_dur: i64 = 10_000_000 / FPS_DEFAULT as i64;
                 let mut fed: u64 = 0;
                 let mut outs: Vec<(bool, usize)> = Vec::new();
                 // Étape 3 : valider le débit À CHAUD — 60 trames à débit de base,
@@ -1358,7 +1446,7 @@ mod win {
                     if outs.len() >= 60 && !lowered {
                         lowered = true;
                         dyn_ok = enc.set_bitrate(1_000_000);
-                        let _ = enc.set_gop(FPS * KEYFRAME_SECS);
+                        let _ = enc.set_gop(FPS_DEFAULT * KEYFRAME_SECS);
                     }
                     let ev = match enc.gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
                         Ok(e) => e,

@@ -305,7 +305,9 @@ async fn video_share_start(
     };
     let v = vs.inner().clone();
     let rt = tokio::runtime::Handle::current();
-    let info = tokio::task::spawn_blocking(move || v.start(app, conns, rt, target))
+    // TODO(U3) : Quality::default() est un shim temporaire — U3 branchera les
+    // vrais args (plafond fps/résolution choisis dans l'UI) sur cette commande.
+    let info = tokio::task::spawn_blocking(move || v.start(app, conns, rt, target, video::Quality::default()))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
