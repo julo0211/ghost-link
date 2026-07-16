@@ -1291,6 +1291,9 @@ const nativeTomb = {};
 // d'essayer jusqu'à une VRAIE relance (bit newSession ou signal start) — sinon la
 // pierre tombale expirerait et le cycle vignette noire → fermeture repartirait.
 const nativeBroken = new Set();
+// Item 5 : gid du partage natif ANNONCÉ par chaque pair — n'afficher sa vignette que si
+// ce gid == le groupe de MON appel courant (un partage destiné à A ne fuit pas dans B).
+const nativeShareGid = {};
 // Membres et groupe du partage natif ÉMIS en cours : le signal d'arrêt doit aller
 // aux destinataires du partage, pas aux membres du groupe actuellement OUVERT.
 let nativeShareMembers = null;
@@ -1390,8 +1393,13 @@ function handleNativeFrame(raw) {
     const data = b.subarray(10 + pl);
     if (typeof VideoDecoder === "undefined")
         return; // moteur sans WebCodecs
+    // Item 5 : une trame ne s'affiche que si on connaît le gid du partage de ce pair ET
+    // que ce gid est celui de mon appel courant. Trame arrivée avant le signal → ignorée
+    // (le signal start, envoyé au démarrage, arrive normalement en tête ; sinon on attend).
     if (!nativePeerAllowed(peer))
-        return; // hors appel du groupe : ne rien décoder
+        return;
+    if (nativeShareGid[peer] !== S.groupCallId)
+        return;
     // Images en vol après un arrêt : ne pas ressusciter la vignette (sauf vraie relance).
     if (newSession) {
         delete nativeTomb[peer];
@@ -1473,16 +1481,20 @@ function noteNativeDecodeError(peer, st) {
 /// par la première trame du flux qui s'en charge (aucune course signal/trames).
 function handleNativeSignal(peer, nv) {
     if (nv.start) {
-        if (!nativePeerAllowed(peer)) {
-            log("🖥️ " + memberName(peer) + " partage son écran (natif) — rejoins l'appel du groupe pour le voir.");
+        // Item 5 : n'accepter que si le partage vise le groupe de mon appel courant.
+        if (!nv.gid || !S.inGroupCall || S.groupCallId !== nv.gid) {
+            if (nv.gid)
+                log("🖥️ " + memberName(peer) + " partage son écran dans un autre groupe — rejoins CET appel pour le voir.");
             return;
         }
+        nativeShareGid[peer] = nv.gid;
         delete nativeTomb[peer];
         nativeBroken.delete(peer);
         ensureNativeRx(peer, nv.w || 0, nv.h || 0, nv.fps || 30);
         log("🖥️ " + memberName(peer) + " partage son écran (natif" + (nv.w ? " " + nv.w + "×" + nv.h : "") + ").");
     }
     else {
+        delete nativeShareGid[peer];
         closeNativeRx(peer);
     }
 }
