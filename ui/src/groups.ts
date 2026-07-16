@@ -1181,9 +1181,10 @@ function stopScreen(): void {
     // Signal d'arrêt aux DESTINATAIRES du partage (mémorisés au démarrage) — pas au
     // groupe actuellement ouvert, qui a pu changer entre-temps.
     (nativeShareMembers || []).forEach((m) => {
-      if (S.meshOnline.has(m)) sigSend(m, { nativeVideo: { start: false } });
+      if (S.meshOnline.has(m)) sigSend(m, { nativeVideo: { start: false, gid: nativeShareGidLocal || "" } });
     });
     nativeShareMembers = null;
+    nativeShareGidLocal = null;
     nativeShareName = "";
     nativeSharePid = null;
     dropTile("moi" + NATIVE_KEY);
@@ -1249,6 +1250,10 @@ const nativeBroken = new Set<string>();
 // Membres et groupe du partage natif ÉMIS en cours : le signal d'arrêt doit aller
 // aux destinataires du partage, pas aux membres du groupe actuellement OUVERT.
 let nativeShareMembers: string[] | null = null;
+// gid du groupe dont le partage natif est ÉMIS en cours (posé au démarrage, remis à
+// null à l'arrêt) : porté par le signal d'arrêt pour que le récepteur sache quel
+// partage cesser, même si le groupe actuellement OUVERT a changé entre-temps.
+let nativeShareGidLocal: string | null = null;
 // Nom de l'écran RÉELLEMENT capturé (repli inclus) — affiché dans la vignette d'état.
 let nativeShareName = "";
 // Époque du partage natif émis : incrémentée par TOUT arrêt (stopScreen, erreur
@@ -1581,11 +1586,12 @@ async function startScreenNative(g: Group, target: ShareTarget): Promise<void> {
     lastNativeLevel = 0; // chaque partage repart à qualité max
     nativeShareName = info.monitor; // nom réel de l'écran/fenêtre capturé (vignette + logs)
     nativeShareMembers = g.members.slice(); // destinataires du signal d'arrêt
+    nativeShareGidLocal = g.id; // gid du partage émis, porté par le signal d'arrêt
     nativeSharePid = isWindow ? target.pid ?? null : null; // pour le son de la fenêtre
     // Annonce aux membres en ligne. Limite v1 : un membre qui arrive APRÈS le
     // démarrage ne reçoit pas ce partage (relancer ⏹️/🖥️ pour l'inclure).
     g.members.forEach((m) => {
-      if (S.meshOnline.has(m)) sigSend(m, { nativeVideo: { start: true, w: info.w, h: info.h, fps: info.fps } });
+      if (S.meshOnline.has(m)) sigSend(m, { nativeVideo: { start: true, w: info.w, h: info.h, fps: info.fps, gid: g.id } });
     });
     showNativePlaceholder(info.w, info.h);
     $("#btnGroupScreen").textContent = "⏹️ Écran";
