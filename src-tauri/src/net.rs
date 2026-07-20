@@ -715,6 +715,7 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, video_rx:
         })
     };
 
+    #[allow(clippy::while_let_loop)]
     loop {
         match connection.accept_bi().await {
             Ok((mut send, mut recv)) => {
@@ -1341,7 +1342,7 @@ async fn send_one_gfile(conn: &Connection, path: &str, name: &str, size: u64, ha
         anyhow::bail!("refusé par le pair");
     }
     // Découper en NSTREAMS tranches contiguës, une par flux parallèle.
-    let part = if size == 0 { 0 } else { (size + nstreams - 1) / nstreams };
+    let part = size.div_ceil(nstreams);
     let mut tasks = Vec::new();
     for i in 0..nstreams {
         let offset = i * part;
@@ -1629,6 +1630,7 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
     let _ = app.emit("ghost-connected", &peer);
     let inbounds: Inbounds = Arc::new(StdMutex::new(HashMap::new()));
 
+    #[allow(clippy::while_let_loop)]
     loop {
         match connection.accept_bi().await {
             Ok((mut send, mut recv)) => {
@@ -2003,7 +2005,7 @@ pub async fn send_file(
     let _ = app.emit("ghost-send-progress", serde_json::json!({ "name": name, "sent": 0u64, "size": size }));
 
     // Découper le fichier en NSTREAMS tranches contiguës, une par flux parallèle.
-    let part = if size == 0 { 0 } else { (size + nstreams - 1) / nstreams };
+    let part = size.div_ceil(nstreams);
     let sent = Arc::new(AtomicU64::new(0));
     let mut tasks = Vec::new();
     for i in 0..nstreams {

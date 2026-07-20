@@ -964,6 +964,7 @@ fn start_group_capture_mix(
 /// remplit son tampon de mixage. Deux flux Opus indépendants arrivent sur la même
 /// connexion (micro = VOICE_TAG, écran = SCREEN_TAG) : chacun a SON décodeur — les
 /// mélanger dans un seul corromprait l'état interne d'Opus.
+#[allow(clippy::too_many_arguments)]
 async fn receive_group_voice(
     conn: Connection,
     stop: Arc<AtomicBool>,
