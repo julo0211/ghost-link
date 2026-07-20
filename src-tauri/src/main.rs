@@ -290,13 +290,6 @@ fn screen_audio_stop(sa: State<'_, audio::ScreenAudio>) {
     sa.stop();
 }
 
-// Coupe/rétablit LOCALEMENT le son d'écran partagé par un pair (mixage de l'appel de
-// groupe) — indépendant du volume de sa voix. N'affecte que ma propre lecture.
-#[tauri::command]
-fn screen_audio_mute(call: State<'_, audio::GroupCall>, peer: String, on: bool) {
-    call.set_screen_mute(&peer, on);
-}
-
 // Volume LOCAL du son d'écran d'un pair (le « stream qu'on regarde ») : 0.0..=2.0.
 #[tauri::command]
 fn screen_audio_gain(call: State<'_, audio::GroupCall>, peer: String, vol: f64) {
@@ -455,7 +448,7 @@ async fn install_update(
     let update = pending.0.lock().unwrap_or_else(|e| e.into_inner()).take();
     let update = update.ok_or_else(|| "aucune mise à jour en attente".to_string())?;
     let app2 = app.clone();
-    update
+    if let Err(e) = update
         .download_and_install(
             move |chunk, total| {
                 let _ = app2.emit(
@@ -466,7 +459,12 @@ async fn install_update(
             || {},
         )
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        // Échec (ex. coupure réseau) : remettre la mise à jour en attente pour qu'un
+        // second clic « installer » la retrouve, au lieu d'un « aucune mise à jour ».
+        *pending.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(update);
+        return Err(e.to_string());
+    }
     app.restart();
     #[allow(unreachable_code)]
     Ok(())
@@ -511,7 +509,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             perm_code, eph_code, rotate_eph_code, probe, connect, send_file, send_chat, send_freq, send_faccept, open_group, send_gchat, send_ginvite, send_gmembers, send_kick, send_img, send_gimg, read_image_bytes,
-            group_call_start, group_call_stop, group_call_mute, group_call_volume, voice_presence, screen_audio_start, screen_audio_stop, screen_audio_mute, screen_audio_gain, send_signal, send_gfile,
+            group_call_start, group_call_stop, group_call_mute, group_call_volume, voice_presence, screen_audio_start, screen_audio_stop, screen_audio_gain, send_signal, send_gfile,
             video_share_start, video_share_stop, video_receive_attach, video_list_monitors, video_list_windows,
             fingerprint, app_version, check_update, install_update, set_download_dir,
             get_download_dir, set_only_friends, set_friends, voice_test_start, voice_test_stop,
@@ -526,11 +524,24 @@ fn main() {
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 if let Some(net) = app_handle.try_state::<Net>() {
                     let slot = net.slot.clone();
+                    // Cloner (hors du lock) les connexions du mesh de groupe pour les
+                    // fermer aussi : sinon les pairs de groupe voient l'utilisateur
+                    // « en ligne » / « en appel » jusqu'au timeout QUIC/CALL_PING.
+                    let group_conns: Vec<_> = net
+                        .mesh
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .values()
+                        .map(|(_, c)| c.clone())
+                        .collect();
                     tauri::async_runtime::block_on(async move {
                         if let Some(c) = net::current(&slot).await {
                             c.close(0u32.into(), b"bye");
                         }
-                        // laisser le temps à la trame de fermeture de partir avant l'arrêt
+                        for c in &group_conns {
+                            c.close(0u32.into(), b"bye");
+                        }
+                        // laisser le temps aux trames de fermeture de partir avant l'arrêt
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     });
                 }

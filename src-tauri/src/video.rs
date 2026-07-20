@@ -359,14 +359,6 @@ mod win {
     use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
     use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 
-    /// Débit cible selon la résolution (plan : 8 Mb/s @1080p, 12 Mb/s @1440p), à 30 fps.
-    /// Conservée pour tout appel existant ; préférer `bitrate_for_fps` (tient compte du
-    /// plafond de cadence choisi).
-    #[allow(dead_code)]
-    fn bitrate_for(w: u32, h: u32) -> u32 {
-        bitrate_for_fps(w, h, 30)
-    }
-
     /// Débit cible selon la résolution ET la cadence (au-delà de 50 fps, plus de
     /// mouvement à encoder par seconde → ~×1.5 pour ne pas sous-bitrater du 60 fps).
     fn bitrate_for_fps(w: u32, h: u32, fps: u32) -> u32 {
@@ -848,10 +840,12 @@ mod win {
 
     /// S'il y a une (ou plusieurs) nouvelle(s) trame(s) WGC, copie la plus récente dans
     /// `staging` et la convertit en NV12 dans `nv12`. Renvoie Ok(true) si `nv12` a
-    /// changé. Err = condition fatale pour CE partage (ex. résolution d'écran modifiée :
-    /// staging et encodeur sont configurés à l'ancienne taille — on s'arrête proprement
-    /// plutôt que de diffuser une image gelée en silence). `fails` compte les échecs de
-    /// copie CONSÉCUTIFS (transitoires tolérés, persistants remontés par l'appelant).
+    /// changé, Ok(false) si aucune nouvelle trame. Ne renvoie JAMAIS d'Err fatal : un
+    /// changement de taille de la source (fenêtre redimensionnée, résolution d'écran
+    /// modifiée) est absorbé par letterbox/crop dans le tampon FIXE de l'encodeur
+    /// (cap.w×cap.h) — rétréci → bords noirs, agrandi → rogné — sans arrêt ni
+    /// reconfiguration NVENC. `fails` compte les échecs de copie CONSÉCUTIFS
+    /// (transitoires tolérés, persistants remontés par l'appelant via le seuil de bail).
     unsafe fn grab_latest(cap: &Capture, nv12: &mut [u8], fails: &mut u32) -> anyhow::Result<bool> {
         // Drainer : ne garder que la trame la plus récente (les autres sont refermées).
         let mut latest = None;
@@ -1072,7 +1066,9 @@ mod win {
                 grab_latest(cap, &mut nv12, &mut grab_fails)?;
                 // Trois secondes d'échecs de copie consécutifs (device D3D perdu…) :
                 // arrêter avec une raison visible plutôt que diffuser une image figée.
-                if grab_fails > quality.fps.max(1) * 3 {
+                // Seuil sur la cadence COURANTE (adaptée) et non la cible : sinon, à bas
+                // niveau, atteindre « fps_cible×3 » échecs prendrait bien plus de 3 s.
+                if grab_fails > levels_for(quality.fps)[level].0 * 3 {
                     anyhow::bail!("copie de l'écran en échec répété (GPU/pilote)");
                 }
                 let mb = MFCreateMemoryBuffer(nv12.len() as u32)?;
@@ -1116,6 +1112,13 @@ mod win {
                 for code in outcome.newly_dead {
                     // L'UI de l'émetteur doit savoir qu'un pair ne reçoit plus rien.
                     let _ = app.emit("ghost-video-peer-dead", &code);
+                }
+                // Plus AUCUN destinataire vivant : inutile de continuer capture +
+                // conversion NV12 + NVENC à plein régime pour personne (les pairs sont
+                // figés au démarrage, aucun ne peut réapparaître). On sort — le chemin
+                // ghost-video-ended de l'appelant en informe l'UI.
+                if !peers.is_empty() && peers.iter().all(|p| p.dead) {
+                    anyhow::bail!("plus aucun destinataire du partage");
                 }
             }
 

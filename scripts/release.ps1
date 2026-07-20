@@ -38,6 +38,14 @@ Write-Host "==> Release ghost link v$Version  (depot: $Repo)" -ForegroundColor C
 $cargoVer = (Select-String -Path "src-tauri\Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
 if ($cargoVer -ne $Version) { throw "Versions incohérentes : Cargo.toml=$cargoVer, tauri.conf.json=$Version. Aligne-les avant de publier." }
 
+# Cohérence package.json / ui/src/main.ts (UI_BUILD)
+$pkgVer = (Get-Content "package.json" -Raw | ConvertFrom-Json).version
+if ($pkgVer -ne $Version) { throw "Versions incohérentes : package.json=$pkgVer, tauri.conf.json=$Version. Aligne-les avant de publier." }
+$uiBuildMatch = Select-String -Path "ui\src\main.ts" -Pattern 'UI_BUILD\s*=\s*"([^"]+)"'
+if (-not $uiBuildMatch) { throw "Impossible de trouver UI_BUILD dans ui\src\main.ts" }
+$uiBuildVer = $uiBuildMatch.Matches[0].Groups[1].Value
+if ($uiBuildVer -ne $Version) { throw "Versions incohérentes : ui\src\main.ts UI_BUILD=$uiBuildVer, tauri.conf.json=$Version. Aligne-les avant de publier." }
+
 # --- 0) Compiler le frontend TypeScript -> ui/js ---
 Write-Host "`n[0/5] Compilation du frontend TypeScript (tsc)..." -ForegroundColor Yellow
 if (Test-Path "package.json") {
@@ -54,11 +62,16 @@ if (Test-Path "package.json") {
 
 # --- 1) Build signé ---
 Write-Host "`n[1/5] Build signé (cargo tauri build)..." -ForegroundColor Yellow
-$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content $KeyPath -Raw
-$sec = Read-Host "Mot de passe de la cle de signature" -AsSecureString
-$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = [System.Net.NetworkCredential]::new("", $sec).Password
-cargo tauri build
-if ($LASTEXITCODE -ne 0) { throw "cargo tauri build a échoué." }
+try {
+  $env:TAURI_SIGNING_PRIVATE_KEY = Get-Content $KeyPath -Raw
+  $sec = Read-Host "Mot de passe de la cle de signature" -AsSecureString
+  $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = [System.Net.NetworkCredential]::new("", $sec).Password
+  cargo tauri build
+  if ($LASTEXITCODE -ne 0) { throw "cargo tauri build a échoué." }
+} finally {
+  Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+  Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
+}
 
 # --- 2) Localiser l'installeur + sa signature ---
 Write-Host "`n[2/5] Recherche de l'installeur..." -ForegroundColor Yellow
@@ -78,7 +91,14 @@ Write-Host "`n[4/5] Commit + push..." -ForegroundColor Yellow
 git config user.name  $Name
 git config user.email $Email
 git add -A
-git commit -m "ghost link v$Version" 2>$null | Out-Null
+$commitOutput = git commit -m "ghost link v$Version" 2>&1
+if ($LASTEXITCODE -ne 0) {
+  # "nothing to commit" n'est pas une erreur : rien à publier n'empêche pas le push.
+  if ($commitOutput -notmatch "nothing to commit") {
+    throw "git commit a échoué : $commitOutput"
+  }
+  Write-Host "    Rien à committer (arbre propre)." -ForegroundColor DarkYellow
+}
 git push origin main
 if ($LASTEXITCODE -ne 0) { throw "git push a échoué (clé SSH / accès dépôt ?)." }
 

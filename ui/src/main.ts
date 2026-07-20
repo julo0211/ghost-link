@@ -137,7 +137,13 @@ function initSettings(): void {
       ? "🧪 Partage d'écran natif activé (appliqué au prochain partage) — sans WebRTC/STUN."
       : "Partage d'écran natif désactivé — retour au partage WebRTC.");
   };
-  $<HTMLSelectElement>("#setStreams").value = localStorage.getItem("ghostlink_streams") ?? "4";
+  const storedStreams = localStorage.getItem("ghostlink_streams") ?? "4";
+  $<HTMLSelectElement>("#setStreams").value = storedStreams;
+  // #14 : le backend repart toujours de NSTREAMS=4 au démarrage — réappliquer la valeur
+  // persistée pour que le réglage soit effectivement en vigueur, pas seulement affiché.
+  if (Number(storedStreams) !== 4) {
+    invoke("set_streams", { n: Number(storedStreams) }).catch(() => {});
+  }
   $<HTMLSelectElement>("#setStreams").onchange = () => {
     const v = $<HTMLSelectElement>("#setStreams").value;
     localStorage.setItem("ghostlink_streams", v);

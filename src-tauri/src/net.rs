@@ -158,6 +158,9 @@ impl ProtocolHandler for Ghost {
                     return Ok(());
                 }
             }
+            // Borner la HashMap : purger les entrées hors fenêtre (2 s) à l'insertion,
+            // sinon un pair changeant d'identité éphémère la fait croître sans limite.
+            r.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(2));
             r.insert(peer.clone(), now);
         }
         // Filtre « amis uniquement » : on refuse les pairs inconnus avant tout.
@@ -1239,7 +1242,7 @@ async fn recv_gfile<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
         let mut f = inb.file.lock().await;
         let _ = AsyncWriteExt::flush(&mut *f).await;
     }
-    let ok_hash = done && sha256_file(&dest).await.map(|h| h == hash).unwrap_or(false);
+    let ok_hash = done && sha256_file(&dest, None).await.map(|h| h == hash).unwrap_or(false);
     if ok_hash {
         let _ = app.emit("ghost-grecv-done", serde_json::json!({ "name": name, "from": from, "path": dest.to_string_lossy() }));
     } else {
@@ -1268,15 +1271,16 @@ pub async fn send_gfile(net: &Net, members: Vec<String>, path: &str) -> anyhow::
         .await
         .map_err(|e| anyhow::anyhow!("fichier introuvable: {e}"))?
         .len();
-    let app = net.app.clone();
-    for (peer, conn) in conns {
-        let app = app.clone();
+    // Le hash est identique pour tous les destinataires : le calculer UNE fois ici
+    // (une seule lecture du fichier) plutôt qu'une fois par tâche send_one_gfile.
+    let hash = sha256_file(Path::new(&read_path), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("hash: {e}"))?;
+    for (_peer, conn) in conns {
         let name = name.clone();
         let path = read_path.clone();
         tokio::spawn(async move {
-            if send_one_gfile(&conn, &path, &name, size).await.is_ok() {
-                let _ = app.emit("ghost-gsent", serde_json::json!({ "name": name, "to": peer }));
-            }
+            let _ = send_one_gfile(&conn, &path, &name, size, hash).await;
         });
     }
     Ok(())
@@ -1309,9 +1313,9 @@ async fn prepare_meta(app: &AppHandle, path: &str, name: &str) -> String {
     }
 }
 
-async fn send_one_gfile(conn: &Connection, path: &str, name: &str, size: u64) -> anyhow::Result<()> {
+async fn send_one_gfile(conn: &Connection, path: &str, name: &str, size: u64, hash: [u8; 32]) -> anyhow::Result<()> {
     // Flux de CONTRÔLE : entête + accord. Les octets passent par N flux GKIND_GFDATA parallèles.
-    let hash = sha256_file(Path::new(path)).await.map_err(|e| anyhow::anyhow!("hash: {e}"))?;
+    // Le hash est calculé une seule fois par l'appelant (send_gfile) et partagé.
     let id = FILE_SEQ.fetch_add(1, Ordering::SeqCst);
     let nstreams = STREAMS.load(Ordering::SeqCst).clamp(1, 8);
     let (mut send, mut recv) = conn
@@ -1586,12 +1590,19 @@ struct Inbound {
 type Inbounds = Arc<StdMutex<HashMap<u64, Arc<Inbound>>>>;
 
 /// SHA-256 d'un fichier (vérification d'intégrité après réassemblage multi-flux).
-async fn sha256_file(path: &Path) -> anyhow::Result<[u8; 32]> {
+async fn sha256_file(path: &Path, cancel: Option<&Arc<AtomicBool>>) -> anyhow::Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
     let mut f = tokio::fs::File::open(path).await?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
+        // Annulation réactive : sortir tôt si l'utilisateur annule pendant le hash
+        // (vérifié toutes les ~1 MiB, avant chaque lecture).
+        if let Some(c) = cancel {
+            if c.load(Ordering::SeqCst) {
+                anyhow::bail!("annulé");
+            }
+        }
         let n = AsyncReadExt::read(&mut f, &mut buf).await?;
         if n == 0 {
             break;
@@ -1896,7 +1907,7 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                         let mut f = inb.file.lock().await;
                         let _ = AsyncWriteExt::flush(&mut *f).await;
                     }
-                    let ok_hash = done && sha256_file(&dest).await.map(|h| h == hash).unwrap_or(false);
+                    let ok_hash = done && sha256_file(&dest, None).await.map(|h| h == hash).unwrap_or(false);
                     if ok_hash {
                         let _ = AsyncWriteExt::write_all(&mut send, b"ok").await;
                         let _ = send.finish();
@@ -1945,8 +1956,12 @@ pub async fn send_file(
         .map_err(|e| anyhow::anyhow!("fichier introuvable: {e}"))?
         .len();
 
+    // Prévenir l'UI AVANT le hash : sur un gros fichier, sha256_file peut durer et
+    // l'UI ne doit pas afficher un 0 % figé pendant ce temps. L'annulation reste
+    // réactive : send_cancel est vérifié périodiquement au fil de la lecture.
+    let _ = app.emit("ghost-send-await", serde_json::json!({ "name": name }));
     // Empreinte SHA-256 du fichier : le pair vérifiera l'intégrité après réassemblage.
-    let hash = sha256_file(p)
+    let hash = sha256_file(p, Some(send_cancel))
         .await
         .map_err(|e| anyhow::anyhow!("lecture (hash): {e}"))?;
     let id = FILE_SEQ.fetch_add(1, Ordering::SeqCst);
@@ -1972,7 +1987,6 @@ pub async fn send_file(
         .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
 
     // Attendre que le pair accepte (ou refuse) le fichier avant d'envoyer les octets.
-    let _ = app.emit("ghost-send-await", serde_json::json!({ "name": name }));
     let mut decision = [0u8; 1];
     AsyncReadExt::read_exact(&mut recv, &mut decision)
         .await

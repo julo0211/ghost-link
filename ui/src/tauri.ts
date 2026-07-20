@@ -80,7 +80,6 @@ export interface Commands {
   voice_presence: { args: { members: string[]; gid: string; inCall: boolean }; ret: void };
   screen_audio_start: { args: { members: string[]; pid: number | null }; ret: void };
   screen_audio_stop: { args: void; ret: void };
-  screen_audio_mute: { args: { peer: string; on: boolean }; ret: void };
   screen_audio_gain: { args: { peer: string; vol: number }; ret: void };
   send_signal: { args: { peer: string; data: string }; ret: void };
   send_gfile: { args: { members: string[]; path: string }; ret: void };
@@ -105,7 +104,6 @@ export interface Commands {
 export interface Events {
   "ghost-connected": string;
   "ghost-disconnected": null;
-  "ghost-error": string;
   "ghost-refused": string;
 
   "ghost-send-await": null;

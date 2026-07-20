@@ -74,6 +74,8 @@ function setDisconnected() {
     $("#sendBox").classList.add("hidden");
     $("#recvBox").classList.add("hidden");
     $("#freqBanner").classList.add("hidden");
+    $("#fileOfferBanner").classList.add("hidden");
+    S.fileOfferId = null;
     hideCallOffer();
     if (S.inCall) {
         invoke("call_stop", { signal: false }).catch(() => { });
@@ -148,6 +150,5 @@ export function initSession() {
         log("Déconnecté.");
         setDisconnected();
     });
-    listen("ghost-error", (e) => log("⚠️ " + e.payload));
     listen("ghost-refused", (e) => log("⛔ Connexion refusée (pair pas dans tes amis) : " + shortId(e.payload)));
 }

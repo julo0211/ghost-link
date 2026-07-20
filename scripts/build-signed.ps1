@@ -12,8 +12,13 @@ $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $PSScriptRoot)
 if (-not (Test-Path $KeyPath)) { throw "Clé privée introuvable : $KeyPath" }
 
-$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content $KeyPath -Raw
-$sec = Read-Host "Mot de passe de la cle de signature" -AsSecureString
-$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = [System.Net.NetworkCredential]::new("", $sec).Password
+try {
+  $env:TAURI_SIGNING_PRIVATE_KEY = Get-Content $KeyPath -Raw
+  $sec = Read-Host "Mot de passe de la cle de signature" -AsSecureString
+  $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = [System.Net.NetworkCredential]::new("", $sec).Password
 
-cargo tauri build
+  cargo tauri build
+} finally {
+  Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+  Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
+}

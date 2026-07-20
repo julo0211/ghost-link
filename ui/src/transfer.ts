@@ -292,6 +292,11 @@ export function initTransfer(): void {
   listen("tauri://drag-drop", (e) => {
     $("#drop").classList.remove("over");
     const paths = e.payload && e.payload.paths;
-    if (paths && paths.length) setFile(paths[0]);
+    if (paths && paths.length) {
+      if (paths.length > 1) {
+        log("Un seul fichier à la fois — « " + baseName(paths[0]) + " » sélectionné, " + (paths.length - 1) + " ignoré(s).");
+      }
+      setFile(paths[0]);
+    }
   });
 }

@@ -20,7 +20,6 @@
   --rail:#2b2d31;     /* liste (groupes/DM/amis) + membres */
   --chat:#313338;     /* zone centrale */
   --dark:#1e1f22;     /* en-tête, champs sombres, fonds creux */
-  --float:#111214;    /* survols profonds */
   --hover:#35373c;    /* survol d'item */
   --active:#404249;   /* item sélectionné */
   --input:#383a40;    /* champs de saisie, boutons toolbar */
@@ -36,36 +35,35 @@
   --warn:#f0b132;
   --bad:#da373c;      /* danger / retirer */
   --hair:#26282c;     /* séparateurs */
-  --radius:8px;
   --scroll:#1a1b1e;
 }
 /* ====== Thèmes d'identité (data-skin) — défaut spectral ====== */
 [data-skin="spectral"]{
-  --rail:#161829;--chat:#0d0e1a;--dark:#0e0f1c;--float:#0a0b14;--hover:rgba(169,155,255,.07);--active:rgba(127,140,220,.20);--input:#1b1e30;--btn2:#21243a;--btn2-h:#2b2f4d;
+  --rail:#161829;--chat:#0d0e1a;--dark:#0e0f1c;--hover:rgba(169,155,255,.07);--active:rgba(127,140,220,.20);--input:#1b1e30;--btn2:#21243a;--btn2-h:#2b2f4d;
   --text:#dfe2f2;--head:#f3f3ff;--muted:#8b8fb4;--faint:#6a6e93;
   --accent:#a99bff;--accent-h:#8f7ef0;--good:#4be1e1;--hair:rgba(169,155,255,.12);--scroll:rgba(169,155,255,.18);
   --grad:linear-gradient(135deg,#a99bff,#4be1e1);--glow:rgba(169,155,255,.34);
 }
 [data-skin="operateur"]{
-  --rail:#0e1013;--chat:#0a0b0d;--dark:#121417;--float:#060708;--hover:#16191d;--active:#1c2a25;--input:#15181c;--btn2:#1c2024;--btn2-h:#262b30;
+  --rail:#0e1013;--chat:#0a0b0d;--dark:#121417;--hover:#16191d;--active:#1c2a25;--input:#15181c;--btn2:#1c2024;--btn2-h:#262b30;
   --text:#c7ccd1;--head:#e6ebf0;--muted:#7d858d;--faint:#5a626a;
   --accent:#3ad6a6;--accent-h:#2bb88c;--good:#3ad6a6;--hair:#23262b;--scroll:#23262b;
   --grad:#3ad6a6;--glow:transparent;
 }
 [data-skin="neon"]{
-  --rail:#120c1a;--chat:#0b0710;--dark:#0e0814;--float:#080510;--hover:rgba(255,61,240,.08);--active:rgba(255,61,240,.16);--input:#1a1326;--btn2:#231832;--btn2-h:#2e2042;
+  --rail:#120c1a;--chat:#0b0710;--dark:#0e0814;--hover:rgba(255,61,240,.08);--active:rgba(255,61,240,.16);--input:#1a1326;--btn2:#231832;--btn2-h:#2e2042;
   --text:#e9def7;--head:#ffffff;--muted:#9d8ab5;--faint:#6f5e85;
   --accent:#ff3df0;--accent-h:#d92fce;--good:#00e5ff;--hair:rgba(255,61,240,.18);--scroll:rgba(255,61,240,.25);
   --grad:linear-gradient(135deg,#ff3df0,#00e5ff);--glow:rgba(255,61,240,.5);
 }
 [data-skin="humain"]{
-  --rail:#211f27;--chat:#1c1b20;--dark:#19181d;--float:#141318;--hover:#2c2a33;--active:#332f40;--input:#2c2a33;--btn2:#332f40;--btn2-h:#3e3a4d;
+  --rail:#211f27;--chat:#1c1b20;--dark:#19181d;--hover:#2c2a33;--active:#332f40;--input:#2c2a33;--btn2:#332f40;--btn2-h:#3e3a4d;
   --text:#e9e6ef;--head:#f7f5fb;--muted:#a39db5;--faint:#7d7790;
-  --accent:#8b7fe8;--accent-h:#7a6ee0;--good:#7bd88f;--hair:#322f3a;--scroll:#3a3645;--radius:14px;
+  --accent:#8b7fe8;--accent-h:#7a6ee0;--good:#7bd88f;--hair:#322f3a;--scroll:#3a3645;
   --grad:#8b7fe8;--glow:transparent;
 }
 [data-theme="light"]{
-  --rail:#f2f3f5; --chat:#ffffff; --dark:#e3e5e8; --float:#ffffff;
+  --rail:#f2f3f5; --chat:#ffffff; --dark:#e3e5e8;
   --hover:#e9eaed; --active:#dbdde1; --input:#e3e5e8; --btn2:#e3e5e8; --btn2-h:#d4d7dc;
   --text:#313338; --head:#060607; --muted:#5c5e66; --faint:#80848e;
   --good:#1a8d4f; --hair:#e3e5e8; --scroll:#c7ccd1;
@@ -85,7 +83,6 @@ body{font-family:'gg sans','Segoe UI',system-ui,-apple-system,sans-serif;backgro
 .topbar{display:flex;align-items:center;gap:11px;padding:0 16px;height:50px;background:var(--dark);flex:0 0 auto;box-shadow:0 1px 0 rgba(0,0,0,.2);z-index:2}
 .ghost{width:26px;height:26px;flex:0 0 auto}
 h1{font-size:17px;margin:0;font-weight:700;color:var(--head);letter-spacing:.2px}
-.tagline{display:none}
 .sp{flex:1}
 .icbtn{width:32px;height:32px;border-radius:50%;border:none;background:transparent;color:var(--muted);font-size:15px;cursor:pointer;display:grid;place-items:center;transition:.13s}
 .icbtn:hover{background:var(--hover);color:var(--head)}
@@ -178,7 +175,6 @@ section[data-view]{flex:1 1 auto;min-height:0}
 .xfer-chip{display:flex;align-items:center;gap:11px;background:var(--dark);border-radius:8px;padding:10px 13px;font-size:13px}
 .xfer-chip .meta{flex:1;min-width:0}
 .xfer-chip .nm{font-weight:600;color:var(--head);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.xfer-chip .pth{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .bar{height:6px;background:var(--hair);border-radius:6px;overflow:hidden;margin-top:6px}
 .bar>i{display:block;height:100%;width:0;border-radius:6px;background:var(--accent);transition:width .12s}
 .pct{font-size:12px;color:var(--muted);min-width:90px;text-align:right;font-weight:600;font-variant-numeric:tabular-nums;flex:0 0 auto}
@@ -264,7 +260,6 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 /* ---------- Utilitaires d'état (toggle par le JS — NE PAS renommer) ---------- */
 .hidden{display:none!important}
 .view-hidden{display:none!important}
-.pane-hidden{display:none!important}
 .members.view-hidden{display:none!important}
 
 /* ---------- Responsive ---------- */
@@ -305,7 +300,6 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
   <div class="topbar">
     <svg class="ghost" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a99bff"/><stop offset="1" stop-color="#4be1e1"/></linearGradient></defs><path d="M32 6C20 6 12 15 12 27v25c0 2.6 3 4 4.8 2.1L21 50l4.4 4.4a3 3 0 0 0 4.3 0L34 50l4.4 4.4a3 3 0 0 0 4.3 0L47 50l4.2 4.1c1.8 1.9 4.8.5 4.8-2.1V27C56 15 44 6 32 6Z" fill="url(#g)"/><circle cx="25" cy="28" r="3.4" fill="#0a0a14"/><circle cx="39" cy="28" r="3.4" fill="#0a0a14"/></svg>
     <h1>ghost link</h1>
-    <div class="tagline">de toi à lui, directement</div>
     <span class="sp"></span>
     <button class="icbtn" id="btnSettings" type="button" title="Réglages">⚙️</button>
     <button class="icbtn" id="themeToggle" type="button" aria-label="Jour / Nuit" title="Bascule jour / nuit">🌙</button>

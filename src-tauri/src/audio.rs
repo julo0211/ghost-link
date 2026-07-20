@@ -143,9 +143,11 @@ fn build_input(
     in_buf: Arc<Mutex<VecDeque<f32>>>,
     ch: usize,
     in_cap: usize,
+    dev_lost: Arc<AtomicBool>,
 ) -> anyhow::Result<cpal::Stream> {
     macro_rules! build {
-        ($t:ty, $conv:path) => {
+        ($t:ty, $conv:path) => {{
+            let dev_lost = dev_lost.clone();
             device.build_input_stream(
                 config,
                 move |data: &[$t], _: &cpal::InputCallbackInfo| {
@@ -159,10 +161,16 @@ fn build_input(
                         }
                     }
                 },
-                |e| eprintln!("erreur flux micro: {e}"),
+                // Erreur cpal (périphérique débranché, défaut pilote) : lever un drapeau
+                // que la boucle de traitement observe (sinon l'appel devient un zombie
+                // silencieux — flux mort mais boucle qui tourne).
+                move |e| {
+                    eprintln!("erreur flux micro: {e}");
+                    dev_lost.store(true, Ordering::SeqCst);
+                },
                 None,
             )
-        };
+        }};
     }
     let stream = match fmt {
         SampleFormat::F32 => build!(f32, f32_in),
@@ -181,9 +189,11 @@ fn build_output(
     fmt: SampleFormat,
     out_buf: Arc<Mutex<VecDeque<f32>>>,
     ch: usize,
+    dev_lost: Arc<AtomicBool>,
 ) -> anyhow::Result<cpal::Stream> {
     macro_rules! build {
-        ($t:ty, $conv:path) => {
+        ($t:ty, $conv:path) => {{
+            let dev_lost = dev_lost.clone();
             device.build_output_stream(
                 config,
                 move |data: &mut [$t], _: &cpal::OutputCallbackInfo| {
@@ -201,10 +211,15 @@ fn build_output(
                         }
                     }
                 },
-                |e| eprintln!("erreur flux sortie: {e}"),
+                // Voir build_input : périphérique de sortie perdu → drapeau observé par
+                // la boucle de traitement.
+                move |e| {
+                    eprintln!("erreur flux sortie: {e}");
+                    dev_lost.store(true, Ordering::SeqCst);
+                },
                 None,
             )
-        };
+        }};
     }
     let stream = match fmt {
         SampleFormat::F32 => build!(f32, f32_out),
@@ -223,6 +238,7 @@ fn build_output(
 fn open_input_stream(
     device: &cpal::Device,
     in_buf: Arc<Mutex<VecDeque<f32>>>,
+    dev_lost: Arc<AtomicBool>,
 ) -> anyhow::Result<(cpal::Stream, u32)> {
     let mut candidates: Vec<cpal::SupportedStreamConfig> = Vec::new();
     if let Ok(def) = device.default_input_config() {
@@ -245,7 +261,7 @@ fn open_input_stream(
         let ch = (config.channels as usize).max(1);
         let rate = config.sample_rate.0;
         let in_cap = (rate as usize / 50) * 50;
-        match build_input(device, &config, fmt, in_buf.clone(), ch, in_cap) {
+        match build_input(device, &config, fmt, in_buf.clone(), ch, in_cap, dev_lost.clone()) {
             Ok(s) => return Ok((s, rate)),
             Err(e) => last = e,
         }
@@ -257,6 +273,7 @@ fn open_input_stream(
 fn open_output_stream(
     device: &cpal::Device,
     out_buf: Arc<Mutex<VecDeque<f32>>>,
+    dev_lost: Arc<AtomicBool>,
 ) -> anyhow::Result<(cpal::Stream, u32)> {
     let mut candidates: Vec<cpal::SupportedStreamConfig> = Vec::new();
     if let Ok(def) = device.default_output_config() {
@@ -278,7 +295,7 @@ fn open_output_stream(
         let config: cpal::StreamConfig = sup.into();
         let ch = (config.channels as usize).max(1);
         let rate = config.sample_rate.0;
-        match build_output(device, &config, fmt, out_buf.clone(), ch) {
+        match build_output(device, &config, fmt, out_buf.clone(), ch, dev_lost.clone()) {
             Ok(s) => return Ok((s, rate)),
             Err(e) => last = e,
         }
@@ -351,6 +368,8 @@ fn start_loopback(cfg: AudioCfg) -> anyhow::Result<Arc<AtomicBool>> {
             audiopus::coder::Encoder,
             audiopus::coder::Decoder,
         );
+        // Levé par le callback d'erreur cpal (périphérique perdu) → coupe la boucle.
+        let dev_lost = Arc::new(AtomicBool::new(false));
         let setup = (|| -> anyhow::Result<Setup> {
             let host = cpal::default_host();
             let input = pick_input(&host, &cfg.input_name())
@@ -361,8 +380,8 @@ fn start_loopback(cfg: AudioCfg) -> anyhow::Result<Arc<AtomicBool>> {
             let in_buf: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
             let out_buf: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
 
-            let (input_stream, in_rate) = open_input_stream(&input, in_buf.clone())?;
-            let (output_stream, out_rate) = open_output_stream(&output, out_buf.clone())?;
+            let (input_stream, in_rate) = open_input_stream(&input, in_buf.clone(), dev_lost.clone())?;
+            let (output_stream, out_rate) = open_output_stream(&output, out_buf.clone(), dev_lost.clone())?;
 
             let in_frame = (in_rate as usize) / 50; // 20 ms @ in_rate
             let out_frame = (out_rate as usize) / 50; // 20 ms @ out_rate
@@ -397,6 +416,9 @@ fn start_loopback(cfg: AudioCfg) -> anyhow::Result<Arc<AtomicBool>> {
                 let mut framebuf = vec![0f32; in_frame];
                 let mut decoded = vec![0f32; OPUS_FRAME];
                 while !stop_thread.load(Ordering::SeqCst) {
+                    if dev_lost.load(Ordering::SeqCst) {
+                        break; // périphérique perdu : inutile de tourner à vide
+                    }
                     let got = if let Ok(mut q) = in_buf.lock() {
                         if q.len() >= in_frame {
                             for x in framebuf.iter_mut() {
@@ -511,6 +533,9 @@ fn start_capture_send(
             usize, // trame d'entrée (échantillons @ in_rate)
             audiopus::coder::Encoder,
         );
+        // Levé par le callback d'erreur cpal (micro/sortie débranché en plein appel) →
+        // couper la capture au lieu de laisser un appel zombie qui tourne à vide.
+        let dev_lost = Arc::new(AtomicBool::new(false));
         let setup = (|| -> anyhow::Result<(S, u32)> {
             let host = cpal::default_host();
             let input = pick_input(&host, &cfg.input_name())
@@ -519,8 +544,8 @@ fn start_capture_send(
                 .ok_or_else(|| anyhow::anyhow!("aucune sortie audio détectée"))?;
 
             let in_buf: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
-            let (input_stream, in_rate) = open_input_stream(&input, in_buf.clone())?;
-            let (output_stream, out_rate) = open_output_stream(&output, out_buf.clone())?;
+            let (input_stream, in_rate) = open_input_stream(&input, in_buf.clone(), dev_lost.clone())?;
+            let (output_stream, out_rate) = open_output_stream(&output, out_buf.clone(), dev_lost.clone())?;
 
             let in_frame = (in_rate as usize) / 50;
 
@@ -537,6 +562,9 @@ fn start_capture_send(
                 let mut packet = vec![0u8; 4000];
                 let mut framebuf = vec![0f32; in_frame];
                 while !stop.load(Ordering::SeqCst) {
+                    if dev_lost.load(Ordering::SeqCst) {
+                        break; // périphérique perdu : couper la capture (plus de zombie)
+                    }
                     let got = if let Ok(mut q) = in_buf.lock() {
                         if q.len() >= in_frame {
                             for x in framebuf.iter_mut() {
@@ -591,6 +619,11 @@ async fn receive_voice(
     };
     let out_frame = (out_rate as usize) / 50;
     let out_cap = out_frame * 50;
+    // Coussin anti-gigue (~60 ms) : le tampon de sortie démarre plein de silence pour
+    // absorber la première gigue réseau au lieu de sous-alimenter la sortie (crépitements).
+    if let Ok(mut q) = out_buf.lock() {
+        q.extend(std::iter::repeat_n(0.0f32, out_frame * 3));
+    }
     let mut decoded = vec![0f32; OPUS_FRAME];
     while !stop.load(Ordering::SeqCst) {
         tokio::select! {
@@ -603,6 +636,14 @@ async fn receive_voice(
                                 if let Ok(mut q) = out_buf.lock() {
                                     for &s in play.iter() {
                                         q.push_back(s);
+                                    }
+                                    // Résorption active de la latence : au-delà de ~240 ms
+                                    // (dérive d'horloge / rafale après gigue), jeter une trame
+                                    // de 20 ms au lieu d'attendre le plafond de 1 s.
+                                    if q.len() > out_frame * 12 {
+                                        for _ in 0..out_frame {
+                                            q.pop_front();
+                                        }
                                     }
                                     while q.len() > out_cap {
                                         q.pop_front();
@@ -664,6 +705,7 @@ impl GroupCall {
         let conn_list: Vec<Connection> = conns.iter().map(|(_, c)| c.clone()).collect();
         // Capture micro → diffusion à tous + sortie mixée. Renvoie le taux de sortie.
         let out_rate = start_group_capture_mix(
+            app.clone(),
             conn_list,
             stop.clone(),
             peers.clone(),
@@ -671,34 +713,40 @@ impl GroupCall {
             self.muted.clone(),
             act.clone(),
         )?;
+        // Génération de CET appel : calculée AVANT de lancer les tâches de réception,
+        // pour que chacune ne nettoie l'état d'un pair en sortant QUE si l'appel courant
+        // est toujours le sien (sinon une tâche d'un appel précédent effacerait l'entrée
+        // tout juste recréée par le nouvel appel — gain perdu, tampon jeté).
+        let my_gen = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
         // Une tâche de réception par pair → décodage → tampon du pair (mixé à la lecture).
         for (peer, conn) in conns {
-            rt.spawn(receive_group_voice(conn, stop.clone(), peers.clone(), peer, out_rate, act.clone()));
+            rt.spawn(receive_group_voice(
+                conn,
+                stop.clone(),
+                peers.clone(),
+                peer,
+                out_rate,
+                act.clone(),
+                self.gen.clone(),
+                my_gen,
+            ));
         }
         // Émetteur d'activité : pousse ~10 Hz à l'UI qui est en appel et qui parle.
-        let my_gen = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
         rt.spawn(emit_voice_activity(app, stop.clone(), act, self.gen.clone(), my_gen));
         *self.flag.lock().unwrap_or_else(|e| e.into_inner()) = Some(stop);
         Ok(())
     }
     /// Règle le volume (gain) de la VOIX d'un pair. 1.0 = normal, 0 = muet, 2.0 = ×2.
-    /// Le son d'écran de ce pair a son propre contrôle (`set_screen_mute`) : le curseur
+    /// Le son d'écran de ce pair a son propre contrôle (`set_screen_gain`) : le curseur
     /// de volume ne coupe donc pas le partage, et couper le partage ne coupe pas la voix.
     pub fn set_gain(&self, code: &str, gain: f32) {
         if let Ok(mut p) = self.peers.lock() {
             p.entry(code.to_string()).or_insert((1.0, VecDeque::new())).0 = gain;
         }
     }
-    /// Coupe (ou rétablit) le SON D'ÉCRAN partagé par un pair, indépendamment de sa voix.
-    pub fn set_screen_mute(&self, code: &str, muted: bool) {
-        if let Ok(mut p) = self.peers.lock() {
-            p.entry(screen_mix_key(code)).or_insert((1.0, VecDeque::new())).0 =
-                if muted { 0.0 } else { 1.0 };
-        }
-    }
     /// Règle le VOLUME du son d'écran partagé par un pair (le « stream qu'on regarde »).
-    /// 1.0 = normal, 0 = muet, 2.0 = ×2. Même clé que set_screen_mute → cohérent avec
-    /// le bouton 🔇 (qui reste un raccourci mute).
+    /// 1.0 = normal, 0 = muet (raccourci 🔇 = gain 0), 2.0 = ×2. Clé distincte de la voix
+    /// (`screen_mix_key`) : régler ce volume ne touche pas la voix du pair.
     pub fn set_screen_gain(&self, code: &str, gain: f32) {
         if let Ok(mut p) = self.peers.lock() {
             p.entry(screen_mix_key(code)).or_insert((1.0, VecDeque::new())).0 = gain.max(0.0);
@@ -721,9 +769,11 @@ fn build_group_output(
     fmt: SampleFormat,
     peers: Peers,
     ch: usize,
+    dev_lost: Arc<AtomicBool>,
 ) -> anyhow::Result<cpal::Stream> {
     macro_rules! build {
-        ($t:ty, $conv:path) => {
+        ($t:ty, $conv:path) => {{
+            let dev_lost = dev_lost.clone();
             device.build_output_stream(
                 config,
                 move |data: &mut [$t], _: &cpal::OutputCallbackInfo| {
@@ -745,10 +795,15 @@ fn build_group_output(
                         }
                     }
                 },
-                |e| eprintln!("erreur flux sortie groupe: {e}"),
+                // Voir build_input : sortie du mixeur perdue → drapeau observé par la
+                // boucle de capture/diffusion de l'appel de groupe.
+                move |e| {
+                    eprintln!("erreur flux sortie groupe: {e}");
+                    dev_lost.store(true, Ordering::SeqCst);
+                },
                 None,
             )
-        };
+        }};
     }
     let stream = match fmt {
         SampleFormat::F32 => build!(f32, f32_out),
@@ -763,6 +818,7 @@ fn build_group_output(
 fn open_group_output(
     device: &cpal::Device,
     peers: Peers,
+    dev_lost: Arc<AtomicBool>,
 ) -> anyhow::Result<(cpal::Stream, u32)> {
     let mut candidates: Vec<cpal::SupportedStreamConfig> = Vec::new();
     if let Ok(def) = device.default_output_config() {
@@ -784,7 +840,7 @@ fn open_group_output(
         let config: cpal::StreamConfig = sup.into();
         let ch = (config.channels as usize).max(1);
         let rate = config.sample_rate.0;
-        match build_group_output(device, &config, fmt, peers.clone(), ch) {
+        match build_group_output(device, &config, fmt, peers.clone(), ch, dev_lost.clone()) {
             Ok(s) => return Ok((s, rate)),
             Err(e) => last = e,
         }
@@ -793,7 +849,9 @@ fn open_group_output(
 }
 
 /// Capture micro → 48 kHz → Opus → diffusion en datagramme à TOUS les pairs ; sortie mixée.
+/// `app` sert à prévenir l'UI (ghost-audio-error) si un périphérique est perdu en appel.
 fn start_group_capture_mix(
+    app: AppHandle,
     conns: Vec<Connection>,
     stop: Arc<AtomicBool>,
     peers: Peers,
@@ -810,6 +868,8 @@ fn start_group_capture_mix(
             usize,
             audiopus::coder::Encoder,
         );
+        // Levé par le callback d'erreur cpal (micro/sortie débranché) → on prévient l'UI.
+        let dev_lost = Arc::new(AtomicBool::new(false));
         let setup = (|| -> anyhow::Result<(S, u32)> {
             let host = cpal::default_host();
             let input = pick_input(&host, &cfg.input_name())
@@ -817,8 +877,8 @@ fn start_group_capture_mix(
             let output = pick_output(&host, &cfg.output_name())
                 .ok_or_else(|| anyhow::anyhow!("aucune sortie audio détectée"))?;
             let in_buf: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
-            let (input_stream, in_rate) = open_input_stream(&input, in_buf.clone())?;
-            let (output_stream, out_rate) = open_group_output(&output, peers.clone())?;
+            let (input_stream, in_rate) = open_input_stream(&input, in_buf.clone(), dev_lost.clone())?;
+            let (output_stream, out_rate) = open_group_output(&output, peers.clone(), dev_lost.clone())?;
             let in_frame = (in_rate as usize) / 50;
             let encoder = new_encoder()?;
             input_stream.play()?;
@@ -830,8 +890,17 @@ fn start_group_capture_mix(
                 let _ = tx.send(Ok(out_rate));
                 let mut packet = vec![0u8; 4000];
                 let mut framebuf = vec![0f32; in_frame];
-                let mut ping_ctr = 0u32; // ~50 trames de 20 ms = 1 s → une balise CALL_PING
+                // Balise CALL_PING cadencée sur L'HORLOGE (pas sur l'arrivée des trames
+                // micro) : émise même sans trame (micro en underrun) pour que les autres
+                // ne voient pas le participant « sortir » de l'appel au bout de 3 s.
+                let mut last_ping = Instant::now();
                 while !stop.load(Ordering::SeqCst) {
+                    // Périphérique perdu (débranché en plein appel) : prévenir l'UI et
+                    // arrêter la capture au lieu de laisser un appel zombie tourner à vide.
+                    if dev_lost.load(Ordering::SeqCst) {
+                        let _ = app.emit("ghost-audio-error", "périphérique audio perdu");
+                        break;
+                    }
                     let got = if let Ok(mut q) = in_buf.lock() {
                         if q.len() >= in_frame {
                             for x in framebuf.iter_mut() {
@@ -863,18 +932,18 @@ fn start_group_capture_mix(
                                 }
                             }
                         }
-                        // Balise « je suis dans l'appel » ~1 Hz, ÉMISE MÊME SI MUET (les
-                        // autres doivent voir un participant muet comme présent).
-                        ping_ctr += 1;
-                        if ping_ctr >= 50 {
-                            ping_ctr = 0;
-                            let dg = bytes::Bytes::copy_from_slice(&[CALL_PING]);
-                            for c in &conns {
-                                let _ = c.send_datagram(dg.clone());
-                            }
-                        }
                     } else {
                         std::thread::sleep(std::time::Duration::from_millis(3));
+                    }
+                    // Balise « je suis dans l'appel » ~1 Hz sur l'horloge, ÉMISE MÊME SI
+                    // MUET et MÊME sans trame micro (les autres doivent voir un participant
+                    // muet ou en underrun comme présent).
+                    if last_ping.elapsed() >= std::time::Duration::from_secs(1) {
+                        last_ping = Instant::now();
+                        let dg = bytes::Bytes::copy_from_slice(&[CALL_PING]);
+                        for c in &conns {
+                            let _ = c.send_datagram(dg.clone());
+                        }
                     }
                 }
                 // streams (_in_s, _out_s) droppés ici → capture/lecture arrêtées.
@@ -902,6 +971,8 @@ async fn receive_group_voice(
     peer: String,
     out_rate: u32,
     act: VoiceAct,
+    gen: Arc<AtomicU64>,
+    my_gen: u64,
 ) {
     let mut voice_dec = match new_decoder() {
         Ok(d) => d,
@@ -914,6 +985,13 @@ async fn receive_group_voice(
     let skey = screen_mix_key(&peer);
     let out_frame = (out_rate as usize) / 50;
     let out_cap = out_frame * 50;
+    // Coussin anti-gigue (~60 ms) pour la VOIX de ce pair : le tampon démarre plein de
+    // silence pour absorber la première gigue réseau au lieu de sous-alimenter le mixeur
+    // (crépitements). Le son d'écran, moins sensible à la latence, démarre vide.
+    if let Ok(mut m) = peers.lock() {
+        let e = m.entry(peer.clone()).or_insert((1.0, VecDeque::new()));
+        e.1.extend(std::iter::repeat_n(0.0f32, out_frame * 3));
+    }
     let mut decoded = vec![0f32; OPUS_FRAME];
     while !stop.load(Ordering::SeqCst) {
         tokio::select! {
@@ -945,6 +1023,15 @@ async fn receive_group_voice(
                                     for &s in play.iter() {
                                         e.1.push_back(s);
                                     }
+                                    // Résorption active de la latence : au-delà de ~240 ms
+                                    // (dérive d'horloge / rafale après un pic de gigue), on
+                                    // jette une trame de 20 ms pour ne pas laisser la latence
+                                    // monter jusqu'au plafond de 1 s et y rester.
+                                    if e.1.len() > out_frame * 12 {
+                                        for _ in 0..out_frame {
+                                            e.1.pop_front();
+                                        }
+                                    }
                                     while e.1.len() > out_cap {
                                         e.1.pop_front();
                                     }
@@ -958,12 +1045,18 @@ async fn receive_group_voice(
             _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
         }
     }
-    if let Ok(mut m) = peers.lock() {
-        m.remove(&peer);
-        m.remove(&skey);
-    }
-    if let Ok(mut a) = act.lock() {
-        a.remove(&peer);
+    // Nettoyage final UNIQUEMENT si l'appel courant est toujours le nôtre : une tâche
+    // d'un appel précédent (qui peut survivre ~200 ms) ne doit pas supprimer l'entrée
+    // d'un pair commun tout juste recréée par le nouvel appel (gain remis à 1.0, tampon
+    // jeté). Même garde que emit_voice_activity.
+    if gen.load(Ordering::SeqCst) == my_gen {
+        if let Ok(mut m) = peers.lock() {
+            m.remove(&peer);
+            m.remove(&skey);
+        }
+        if let Ok(mut a) = act.lock() {
+            a.remove(&peer);
+        }
     }
 }
 

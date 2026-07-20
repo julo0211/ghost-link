@@ -150,6 +150,32 @@ function saveMutual(code: string, name?: string): void {
   pushFriendsToBackend();
 }
 
+// #48 : trace des demandes d'ami SORTANTES en attente (codes) — pour que ghost-faccept
+// (déclenché par un pair qui accepte MA demande) ne puisse pas être détourné en FACCEPT
+// non sollicité forçant un ajout/écrasement d'ami. Persisté (une réponse peut arriver
+// après un redémarrage de l'app).
+const PENDING_FREQ_OUT = "ghostlink_pending_freq_out";
+function loadPendingFreqOut(): Set<string> {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(PENDING_FREQ_OUT) || "[]") as string[]);
+  } catch {
+    return new Set();
+  }
+}
+function savePendingFreqOut(s: Set<string>): void {
+  localStorage.setItem(PENDING_FREQ_OUT, JSON.stringify([...s]));
+}
+function markFreqSent(code: string): void {
+  if (!code) return;
+  const s = loadPendingFreqOut();
+  s.add(code);
+  // Borne la croissance : ne garder que les ~64 demandes les plus récentes (un Set
+  // JS conserve l'ordre d'insertion) — évite une accumulation illimitée de demandes
+  // jamais acceptées à travers les sessions.
+  const arr = [...s];
+  savePendingFreqOut(new Set(arr.slice(-64)));
+}
+
 export function initFriends(): void {
   $("#btnAddFriend").onclick = () => {
     if (addFriend($<HTMLInputElement>("#friendName").value, $<HTMLInputElement>("#friendCode").value)) {
@@ -163,6 +189,7 @@ export function initFriends(): void {
   $("#btnFreq").onclick = async () => {
     try {
       await invoke("send_freq", { name: myName() });
+      if (S.currentPeer) markFreqSent(S.currentPeer);
       log("Demande d'ami envoyée.");
     } catch (e) {
       log("Demande : " + e);
@@ -207,6 +234,19 @@ export function initFriends(): void {
     if (!S.currentPeer) return;
     const nm = e.payload && e.payload.name ? e.payload.name : "";
     const code = e.payload && e.payload.code ? e.payload.code : S.currentPeer;
+    // #48 (défensif) : un FACCEPT n'est légitime que si J'avais une demande d'ami
+    // sortante en attente sur CETTE connexion. On valide par S.currentPeer (le remote_id
+    // AUTHENTIFIÉ de la connexion, = la clé posée par markFreqSent), PAS par `code` : le
+    // code permanent auto-déclaré du payload diffère du remote_id éphémère d'un pas-encore-
+    // ami, donc tester pending.has(code) rejetterait une acceptation légitime. On stocke
+    // ensuite l'ami par son code permanent (`code`).
+    const pending = loadPendingFreqOut();
+    if (!pending.has(S.currentPeer)) {
+      log("⚠️ Acceptation d'ami reçue sans demande en attente — ignorée.");
+      return;
+    }
+    pending.delete(S.currentPeer);
+    savePendingFreqOut(pending);
     saveMutual(code, nm);
     log("Ami ajouté (mutuel) ✓" + (nm ? " — " + nm : ""));
   });

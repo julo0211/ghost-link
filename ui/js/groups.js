@@ -29,8 +29,13 @@ function flushPInv(member) {
     const mine = loadPInv().filter((x) => x.member === member);
     if (!mine.length)
         return;
-    mine.forEach((x) => invoke("send_ginvite", { member: x.member, gid: x.gid, name: x.name, members: x.csv }).catch(() => { }));
-    savePInv(loadPInv().filter((x) => x.member !== member));
+    // Ne retirer chaque entrée QU'APRÈS le succès de son propre envoi : si l'invoke échoue
+    // (pair redevenu injoignable pendant le flap), l'entrée reste pour le réessai 60 s —
+    // sinon l'invitation « fiable » serait définitivement perdue. L'anti-doublon côté
+    // récepteur ignore un groupe déjà rejoint/refusé, donc un double-envoi est inoffensif.
+    mine.forEach((x) => invoke("send_ginvite", { member: x.member, gid: x.gid, name: x.name, members: x.csv })
+        .then(() => savePInv(loadPInv().filter((y) => !(y.member === x.member && y.gid === x.gid))))
+        .catch(() => { }));
 }
 function declinedGroups() {
     try {
@@ -404,11 +409,18 @@ export function renderGroups() {
             e.stopPropagation();
             if (!confirm('Supprimer / quitter le groupe « ' + g.name + " » ?"))
                 return;
+            // Si un appel de CE groupe est en cours (même s'il n'est pas le groupe OUVERT),
+            // raccrocher AVANT de le supprimer : sinon micro/partage continueraient d'émettre
+            // vers un groupe disparu et aucun bouton ne permettrait plus de raccrocher.
+            if (S.inGroupCall && S.groupCallId === g.id)
+                stopGroupCall();
             const a = loadGroups();
             a.splice(i, 1);
             saveGroups(a);
             clearPInvGroup(g.id);
             myVotes(g.id).forEach((t) => saveMyVote(g.id, t, false)); // ne plus re-gossiper mes votes d'un groupe quitté
+            delete S.groupMsgs[g.id]; // purge de l'historique de chat du groupe supprimé
+            delete S.voicePresence[g.id]; // purge des pastilles « dans le vocal » de ce groupe
             renderGroups();
             if (S.openGroupId === g.id)
                 closeGroup();
@@ -438,9 +450,11 @@ function openGroup(id, skipDial) {
     refreshGroupCallUI();
 }
 function closeGroup() {
+    // Ne couper la vidéo QUE si l'appel en cours est celui du groupe fermé — stopGroupCall
+    // appelle déjà stopVideo. Fermer le panneau d'un AUTRE groupe pendant que je suis en
+    // appel ailleurs ne doit PAS tuer la vidéo/les partages de cet appel actif.
     if (S.inGroupCall && S.groupCallId === S.openGroupId)
         stopGroupCall();
-    stopVideo();
     S.openGroupId = null;
     $("#groupChannelCard").classList.add("hidden");
     showTab("connect");
@@ -513,7 +527,18 @@ async function sendImageGroup(f) {
             mime: f.type,
             data: Array.from(buf),
         });
-        addImgBubble($("#groupChatLog"), URL.createObjectURL(f), "me");
+        // L'utilisateur a pu ouvrir un AUTRE groupe pendant les await (arrayBuffer + invoke) :
+        // ne pas écrire ma bulle dans le #groupChatLog d'un groupe différent de celui d'envoi.
+        if (S.openGroupId !== g.id)
+            return;
+        const box = $("#groupChatLog");
+        const u = URL.createObjectURL(f);
+        addImgBubble(box, u, "me");
+        // Révoquer le blob une fois l'image affichée (sinon fuite mémoire cumulative : une bulle
+        // effacée par un changement de groupe garderait son objet URL jusqu'à la fermeture).
+        const img = box.lastElementChild?.querySelector("img");
+        if (img)
+            img.onload = () => URL.revokeObjectURL(u);
     }
     catch (e) {
         log("Image de groupe : " + e);
@@ -617,6 +642,10 @@ let retryVideoOnly = false;
 // donc sans ce drapeau un double-clic sur 🖥️ Écran lancerait deux sélecteurs et le
 // premier flux fuirait (diffusé aux pairs, inarrêtable depuis l'UI).
 let screenBusy = false;
+// Même verrou de réentrance pour la caméra : S.localCam n'est posé qu'APRÈS l'await
+// getUserMedia — sans ce drapeau un double-clic sur 📹 Caméra lancerait deux captures et
+// le premier flux fuirait (diffusé aux pairs, inarrêtable depuis l'UI).
+let camBusy = false;
 // L'encodeur MATÉRIEL H.264 est confirmé actif → le partage a été remonté en 1080p.
 // Jamais posé sur encodeur logiciel (le 1080p logiciel ramènerait le plancher 3 fps).
 let screenUpgraded = false;
@@ -954,50 +983,62 @@ function maybeUpgradeScreen(attempt = 0) {
     if (!track)
         return;
     screenCheckBusy = true;
-    setTimeout(async () => {
-        try {
-            if (screenUpgraded || screenEncoderChecked || !S.localScreen || !S.localScreen.getVideoTracks().includes(track))
-                return;
-            const pcs = Object.values(S.pcs)
-                .map((st) => st.pc)
-                .filter((pc) => screenVideoSenderOf(pc));
-            if (!pcs.length)
-                return; // pas encore de sender écran : un prochain « stable » relancera
-            const impls = await Promise.all(pcs.map(screenEncoderImpl));
-            if (impls.some((i) => !i || /unknown/i.test(i))) {
-                screenCheckBusy = false;
-                maybeUpgradeScreen(attempt + 1); // au moins un pair n'a pas encore de stats
-                return;
-            }
-            const soft = impls.find((i) => !HW_ENCODER.test(i));
-            if (soft !== undefined) {
-                screenEncoderChecked = true; // verdict pour CE partage : ne plus re-vérifier ni re-logger
-                log("ℹ️ Encodeur logiciel détecté (" + soft + ") — le partage reste en 720p30.");
-                return;
-            }
-            // Re-vérification de vie APRÈS les await : le partage a pu s'arrêter entre-temps.
-            if (screenUpgraded || !S.localScreen || !S.localScreen.getVideoTracks().includes(track))
-                return;
-            screenUpgraded = true;
+    // Le verrou screenCheckBusy est tenu par TOUTE la chaîne de retries (une seule chaîne à
+    // la fois). On ne le relâche qu'à la fin : soit on a replanifié un retry (verrou gardé,
+    // la planification interne réutilise le même verrou au lieu de repasser par le guard),
+    // soit la chaîne se termine (verrou relâché). Ne PAS relâcher/reprendre entre deux
+    // essais éviterait la course où le finally du parent rouvrait la porte à une 2e chaîne.
+    const attemptCheck = (n) => {
+        setTimeout(async () => {
+            let replanned = false;
             try {
-                await track.applyConstraints({
-                    width: { max: 1920 },
-                    height: { max: 1080 },
-                    frameRate: { ideal: 30, max: 30 },
-                });
+                if (screenUpgraded || screenEncoderChecked || !S.localScreen || !S.localScreen.getVideoTracks().includes(track))
+                    return;
+                const pcs = Object.values(S.pcs)
+                    .map((st) => st.pc)
+                    .filter((pc) => screenVideoSenderOf(pc));
+                if (!pcs.length)
+                    return; // pas encore de sender écran : un prochain « stable » relancera
+                const impls = await Promise.all(pcs.map(screenEncoderImpl));
+                if (impls.some((i) => !i || /unknown/i.test(i))) {
+                    if (n < 3) {
+                        replanned = true; // au moins un pair n'a pas encore de stats — garder le verrou
+                        attemptCheck(n + 1);
+                    }
+                    return;
+                }
+                const soft = impls.find((i) => !HW_ENCODER.test(i));
+                if (soft !== undefined) {
+                    screenEncoderChecked = true; // verdict pour CE partage : ne plus re-vérifier ni re-logger
+                    log("ℹ️ Encodeur logiciel détecté (" + soft + ") — le partage reste en 720p30.");
+                    return;
+                }
+                // Re-vérification de vie APRÈS les await : le partage a pu s'arrêter entre-temps.
+                if (screenUpgraded || !S.localScreen || !S.localScreen.getVideoTracks().includes(track))
+                    return;
+                screenUpgraded = true;
+                try {
+                    await track.applyConstraints({
+                        width: { max: 1920 },
+                        height: { max: 1080 },
+                        frameRate: { ideal: 30, max: 30 },
+                    });
+                }
+                catch {
+                    screenUpgraded = false;
+                    return;
+                }
+                applyScreenBitrate(4500000);
+                log("🎮 Encodeur matériel confirmé sur tous les pairs — partage remonté en 1080p30.");
+                armScreenWatchdog(track);
             }
-            catch {
-                screenUpgraded = false;
-                return;
+            finally {
+                if (!replanned)
+                    screenCheckBusy = false;
             }
-            applyScreenBitrate(4500000);
-            log("🎮 Encodeur matériel confirmé sur tous les pairs — partage remonté en 1080p30.");
-            armScreenWatchdog(track);
-        }
-        finally {
-            screenCheckBusy = false;
-        }
-    }, 2500 + attempt * 3000);
+        }, 2500 + n * 3000);
+    };
+    attemptCheck(attempt);
 }
 // Après l'upgrade : re-vérification périodique. libwebrtc peut retomber en LOGICIEL
 // en cours de flux (échec Media Foundation, sessions GPU épuisées — y compris à cause
@@ -1092,8 +1133,21 @@ function getPc(peer) {
     pc.onconnectionstatechange = () => {
         // VID-2 : `disconnected` est souvent transitoire (il peut repasser `connected`).
         // On ne nettoie que sur un état réellement terminal.
-        if (["failed", "closed"].includes(pc.connectionState))
+        if (["failed", "closed"].includes(pc.connectionState)) {
             dropPeerTiles(peer);
+            // Fermer ET retirer le pc mort de S.pcs : sinon la garde `!S.pcs[peer]` (ghost-mesh-up
+            // VID-1) court-circuiterait la nouvelle offre quand ce pair revient (il ne recevrait
+            // plus jamais le flux), et un sender écran fantôme fausserait maybeUpgradeScreen/
+            // armScreenWatchdog. Ne supprimer que si l'entrée pointe encore CE pc (pas un remplaçant).
+            try {
+                pc.close();
+            }
+            catch {
+                /* ignore */
+            }
+            if (S.pcs[peer] && S.pcs[peer].pc === pc)
+                delete S.pcs[peer];
+        }
     };
     return st;
 }
@@ -1145,6 +1199,8 @@ function inThisCall() {
     return S.inGroupCall && S.groupCallId === S.openGroupId;
 }
 async function startCam() {
+    if (camBusy)
+        return; // capture déjà en cours de démarrage (double-clic)
     if (!loadGroups().some((x) => x.id === S.openGroupId)) {
         log("Ouvre un groupe d'abord.");
         return;
@@ -1163,23 +1219,29 @@ async function startCam() {
         log("Confidentialité acceptée ✔ — re-clique sur 📹 Caméra pour l'activer.");
         return;
     }
-    let s;
+    camBusy = true;
     try {
-        s = await navigator.mediaDevices.getUserMedia({ video: { frameRate: { ideal: 30 } }, audio: false });
+        let s;
+        try {
+            s = await navigator.mediaDevices.getUserMedia({ video: { frameRate: { ideal: 30 } }, audio: false });
+        }
+        catch (e) {
+            log("Caméra : accès refusé ou indisponible (" + e + ")");
+            return;
+        }
+        S.localCam = s;
+        showTile("moi_cam", "Moi (cam)", s, true);
+        ensureGroupPcs();
+        addStreamToPcs(s);
+        $("#btnGroupCam").textContent = "⏹️ Caméra";
+        const vt = s.getVideoTracks()[0];
+        if (vt)
+            vt.onended = () => stopCam();
+        log("📹 Caméra activée.");
     }
-    catch (e) {
-        log("Caméra : accès refusé ou indisponible (" + e + ")");
-        return;
+    finally {
+        camBusy = false;
     }
-    S.localCam = s;
-    showTile("moi_cam", "Moi (cam)", s, true);
-    ensureGroupPcs();
-    addStreamToPcs(s);
-    $("#btnGroupCam").textContent = "⏹️ Caméra";
-    const vt = s.getVideoTracks()[0];
-    if (vt)
-        vt.onended = () => stopCam();
-    log("📹 Caméra activée.");
 }
 async function startScreen() {
     if (screenBusy)
@@ -1620,6 +1682,11 @@ function handleNativeSignal(peer, nv) {
                 log("🖥️ " + memberName(peer) + " partage son écran dans un autre groupe — rejoins CET appel pour le voir.");
             return;
         }
+        // SÉCURITÉ (#47) : n'accepter la vignette QUE si `peer` est réellement membre du groupe
+        // de l'appel — même prédicat que le filtrage des TRAMES (nativePeerAllowed). Un ami hors
+        // du groupe qui connaît le gid ne peut ainsi pas imposer une vignette « X (écran) ».
+        if (!nativePeerAllowed(peer))
+            return;
         nativeShareGid[peer] = nv.gid;
         delete nativeTomb[peer];
         nativeBroken.delete(peer);
@@ -1977,6 +2044,11 @@ export function initGroups() {
             stopGroupCall();
             return;
         }
+        // En appel dans un AUTRE groupe : raccrocher d'abord (group_call_stop coupe aussi les
+        // partages orphelins et envoie le beacon final inCall:false) avant de démarrer le
+        // nouvel appel — sinon un partage natif/son système continuerait d'émettre vers l'ancien.
+        if (S.inGroupCall && S.groupCallId !== g.id)
+            stopGroupCall();
         startGroupCall(g, true);
     };
     $("#btnGroupMute").onclick = () => {
@@ -2056,10 +2128,13 @@ export function initGroups() {
         if (e.payload) {
             S.meshOnline.add(e.payload);
             flushPInv(e.payload);
-            // VID-1 : si je partage déjà ma cam/écran, pousser la vidéo vers un arrivant
-            // tardif (membre du groupe ouvert) en créant sa connexion → offre + mes pistes.
-            if ((S.localCam || S.localScreen) && !S.pcs[e.payload]) {
-                const g = loadGroups().find((x) => x.id === S.openGroupId);
+            // VID-1 : si je partage déjà ma cam/écran, pousser la vidéo vers un arrivant tardif.
+            // Le partage appartient à l'APPEL (S.groupCallId), pas au groupe affiché : on peut
+            // naviguer ailleurs pendant l'appel, donc tester le groupe de l'appel — sinon on
+            // fuiterait mes pistes vers un membre du groupe OUVERT hors de l'appel, et on ne
+            // resservirait pas un membre de l'appel qui revient pendant qu'un autre groupe est ouvert.
+            if (S.inGroupCall && (S.localCam || S.localScreen) && !S.pcs[e.payload]) {
+                const g = loadGroups().find((x) => x.id === S.groupCallId);
                 if (g && g.members.includes(e.payload))
                     getPc(e.payload);
             }
@@ -2255,6 +2330,17 @@ export function initGroups() {
             handleNativeSignal(peer, msg.nativeVideo);
             return;
         }
+        // SÉCURITÉ : n'ouvrir/alimenter une RTCPeerConnection QUE si je suis dans l'appel du
+        // groupe dont `peer` est membre (même prédicat que le chemin natif, nativePeerAllowed).
+        // Sinon un pair hors de ce cadre forcerait une négociation WebRTC (IP exposée, STUN
+        // contacté, mes flux poussés, vignette imposée) sans jamais passer par le confirm de
+        // confidentialité, qui ne couvre que l'ÉMISSION.
+        if (!nativePeerAllowed(peer))
+            return;
+        // Une candidate ICE tardive (après stopVideo) ne doit pas RESSUSCITER un pc supprimé :
+        // n'ouvrir un pc que sur une description ; une candidate sans pc existant est ignorée.
+        if (msg.candidate && !S.pcs[peer])
+            return;
         const st = getPc(peer);
         const pc = st.pc;
         try {
@@ -2302,6 +2388,11 @@ export function initGroups() {
     });
     listen("ghost-grecv-offer", (e) => {
         const p = e.payload || {};
+        // Une offre précédente est encore en attente : la refuser explicitement avant que la
+        // bannière ne soit écrasée — sinon son id est perdu et l'expéditeur resterait bloqué
+        // en attente (aucun respond_gfile ne partirait jamais pour elle).
+        if (S.gfileOfferId != null && S.gfileOfferId !== (p.id ?? null))
+            invoke("respond_gfile", { id: S.gfileOfferId, accept: false }).catch(() => { });
         S.gfileOfferId = p.id ?? null;
         $("#gfileOfferText").textContent =
             '📥 (groupe) « ' + (p.name || "fichier") + " » (" + fmt(p.size || 0) + ") de " + memberName(p.from || "") + " — accepter ?";

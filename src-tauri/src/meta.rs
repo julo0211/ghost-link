@@ -38,6 +38,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Taille max. d'un fichier chargé EN MÉMOIRE pour nettoyage (images, audio, docs).
 const MAX_IN_MEMORY: u64 = 256 * 1024 * 1024;
+/// Plafond SPÉCIFIQUE au PDF, bien plus bas que MAX_IN_MEMORY (deflate-bomb) :
+/// lopdf::Document::load DÉCOMPRESSE les object/xref streams pour parser. Un PDF
+/// hostile de quelques centaines de Ko (streams FlateDecode à très fort taux, ou
+/// imbriqués) peut allouer plusieurs Go → en Rust l'échec d'allocation ABORTE le
+/// process entier (un catch_unwind ne rattrape pas un OOM). On préfère un Skipped
+/// VISIBLE au-delà du seuil plutôt qu'un crash silencieux du transfert.
+const MAX_PDF: u64 = 64 * 1024 * 1024;
 /// Taille max. d'une vidéo recopiée pour patch (copie disque, pas de chargement RAM).
 const MAX_MP4_COPY: u64 = 2 * 1024 * 1024 * 1024;
 /// Âge au-delà duquel une copie nettoyée du dossier temporaire est purgée. 24 h : un
@@ -77,7 +84,9 @@ pub fn prepare(path: &Path) -> Prep {
         Err(e) => return Prep::Failed(format!("lecture: {e}")),
     };
     match ext.as_str() {
-        "jpg" | "jpeg" | "jfif" => clean_in_memory(path, size, clean_jpeg),
+        "jpg" | "jpeg" | "jfif" | "jpe" | "jfi" | "jif" => {
+            clean_in_memory(path, size, clean_jpeg)
+        }
         "png" => clean_in_memory(path, size, clean_png),
         "webp" => clean_in_memory(path, size, clean_webp),
         "wav" => clean_in_memory(path, size, clean_wav),
@@ -96,8 +105,78 @@ pub fn prepare(path: &Path) -> Prep {
         | "m2ts" | "mpg" | "mpeg" | "flv" | "3g2" | "mka" | "m4b" => {
             Prep::Skipped("format à métadonnées non nettoyable pour l'instant")
         }
-        _ => Prep::Untouched,
+        // Extension inconnue/absente : ne pas se fier à l'extension SEULE (un JPEG en
+        // .dat, en .jpg_large ou sans extension emporterait son GPS silencieusement —
+        // exactement l'« échec silencieux » que le contrat interdit). Sniffer les magic
+        // bytes des formats supportés ; router vers le bon nettoyeur, ou rester VISIBLE.
+        _ => match sniff_magic(path) {
+            Some(Magic::Jpeg) => clean_in_memory(path, size, clean_jpeg),
+            Some(Magic::Png) => clean_in_memory(path, size, clean_png),
+            Some(Magic::Webp) => clean_in_memory(path, size, clean_webp),
+            Some(Magic::Wav) => clean_in_memory(path, size, clean_wav),
+            Some(Magic::Mp3) => clean_in_memory(path, size, clean_mp3),
+            Some(Magic::Mp4) => clean_mp4_file(path, size),
+            Some(Magic::Pdf) => clean_pdf_file(path, size),
+            // ZIP au contenu inconnu (peut être un docx/odt renommé) : on ne devine
+            // pas OOXML vs ODF sans l'ouvrir — rester visible plutôt que se taire.
+            Some(Magic::Zip) => Prep::Skipped("extension ne correspond pas au contenu"),
+            None => Prep::Untouched,
+        },
     }
+}
+
+/// Formats détectés par magic bytes quand l'extension ne dit rien de fiable.
+enum Magic {
+    Jpeg,
+    Png,
+    Webp,
+    Wav,
+    Mp3,
+    Mp4,
+    Pdf,
+    Zip,
+}
+
+/// Renifle les premiers octets pour reconnaître un format porteur de métadonnées.
+fn sniff_magic(path: &Path) -> Option<Magic> {
+    use std::io::Read;
+    let mut f = fs::File::open(path).ok()?;
+    let mut buf = [0u8; 16];
+    let n = f.read(&mut buf).ok()?;
+    let h = &buf[..n];
+    if h.len() >= 2 && h[0] == 0xFF && h[1] == 0xD8 {
+        return Some(Magic::Jpeg); // FFD8 (JPEG SOI)
+    }
+    if h.len() >= 8 && h[..8] == PNG_SIG {
+        return Some(Magic::Png);
+    }
+    if h.len() >= 12 && &h[..4] == b"RIFF" {
+        let form = &h[8..12];
+        if form == b"WEBP" {
+            return Some(Magic::Webp);
+        }
+        if form == b"WAVE" {
+            return Some(Magic::Wav);
+        }
+        return None;
+    }
+    if h.len() >= 5 && &h[..5] == b"%PDF-" {
+        return Some(Magic::Pdf);
+    }
+    if h.len() >= 4 && &h[..4] == b"PK\x03\x04" {
+        return Some(Magic::Zip);
+    }
+    if h.len() >= 8 && &h[4..8] == b"ftyp" {
+        return Some(Magic::Mp4);
+    }
+    if h.len() >= 3 && &h[..3] == b"ID3" {
+        return Some(Magic::Mp3);
+    }
+    // Trame MPEG audio nue (sync 11 bits) : FF Ex/Fx — MP3 sans tag ID3 en tête.
+    if h.len() >= 2 && h[0] == 0xFF && (h[1] & 0xE0) == 0xE0 {
+        return Some(Magic::Mp3);
+    }
+    None
 }
 
 // ---- Copies temporaires ----
@@ -159,7 +238,12 @@ fn clean_in_memory(path: &Path, size: u64, f: Cleaner) -> Prep {
             let tmp = temp_path(path);
             match fs::write(&tmp, &bytes) {
                 Ok(()) => Prep::Cleaned(tmp),
-                Err(e) => Prep::Failed(format!("écriture temporaire: {e}")),
+                Err(e) => {
+                    // Écriture partielle (disque plein) : ne pas laisser d'orphelin
+                    // jusqu'à la purge 24 h — cohérent avec les chemins MP4/PDF/ZIP.
+                    let _ = fs::remove_file(&tmp);
+                    Prep::Failed(format!("écriture temporaire: {e}"))
+                }
             }
         }
         Err(e) => Prep::Failed(e),
@@ -432,6 +516,21 @@ fn clean_mp3(d: &[u8]) -> Result<Option<Vec<u8>>, String> {
 /// Un atome à neutraliser : (offset du début de l'atome, taille totale, taille d'en-tête).
 type BoxSpan = (u64, u64, u64);
 
+/// UUID des boxes `uuid` contenant du XMP (Adobe Premiere/After Effects, caméras) :
+/// BE7ACFCB-97A9-42E8-9C71-999491E3AFAC — souvent GPS, auteur, historique de montage.
+const XMP_BOX_UUID: [u8; 16] = [
+    0xBE, 0x7A, 0xCF, 0xCB, 0x97, 0xA9, 0x42, 0xE8, 0x9C, 0x71, 0x99, 0x94, 0x91, 0xE3, 0xAF, 0xAC,
+];
+
+/// Lit les 16 octets d'usertype d'une box `uuid` (à `pos`) et dit si c'est du XMP.
+fn mp4_uuid_is_xmp(f: &mut fs::File, pos: u64) -> Result<bool, String> {
+    use std::io::Read;
+    let mut id = [0u8; 16];
+    f.seek(SeekFrom::Start(pos)).map_err(|e| e.to_string())?;
+    f.read_exact(&mut id).map_err(|e| e.to_string())?;
+    Ok(id == XMP_BOX_UUID)
+}
+
 fn clean_mp4_file(path: &Path, size: u64) -> Prep {
     if size > MAX_MP4_COPY {
         return Prep::Skipped("trop volumineux pour le nettoyage");
@@ -505,6 +604,14 @@ fn mp4_meta_offsets(path: &Path) -> Result<Vec<BoxSpan>, String> {
         }
         match &typ {
             b"udta" | b"meta" => spans.push((pos, total, hlen)),
+            // XMP logé dans une box `uuid` top-level : même neutralisation (free +
+            // zéro), offsets inchangés. On ne touche que l'UUID XMP connu, pas les
+            // autres uuid (certains portent des données requises au décodage).
+            b"uuid" => {
+                if total >= hlen + 16 && mp4_uuid_is_xmp(&mut f, pos + hlen)? {
+                    spans.push((pos, total, hlen));
+                }
+            }
             b"moov" => {
                 collect_meta_children(&mut f, pos + hlen, pos + total, flen, 0, &mut boxes, &mut spans)?
             }
@@ -578,13 +685,42 @@ fn copy_with_free_patches(src: &Path, dst: &Path, spans: &[BoxSpan]) -> Result<(
 
 // ---- PDF (lopdf) ----
 
+/// Issue du nettoyage PDF (avant construction du Prep par l'appelant).
+enum PdfOutcome {
+    /// Métadonnées retirées : la copie a été écrite.
+    Cleaned,
+    /// Aucune métadonnée à retirer : NE PAS réécrire (voir clean_pdf_inner).
+    Untouched,
+    /// PDF signé numériquement : réécrire invaliderait la signature.
+    Signed,
+}
+
 fn clean_pdf_file(path: &Path, size: u64) -> Prep {
-    if size > MAX_IN_MEMORY {
-        return Prep::Skipped("trop volumineux pour le nettoyage");
+    // Plafond PDF prudent (deflate-bomb, cf. MAX_PDF) : au-delà, Skipped VISIBLE.
+    if size > MAX_PDF {
+        return Prep::Skipped("PDF trop volumineux pour le nettoyage");
     }
     let tmp = temp_path(path);
-    match clean_pdf_inner(path, &tmp) {
-        Ok(()) => Prep::Cleaned(tmp),
+    // #12 : lopdf peut PANIQUER sur un PDF malformé (index/unwrap internes). Le profil
+    // est en panic=unwind, donc catch_unwind contient la panique → Prep::Failed VISIBLE
+    // au lieu d'un crash du process (contrat : ne jamais faire échouer un transfert en
+    // silence). L'OOM d'une deflate-bomb reste un abort non rattrapable : c'est le rôle
+    // de la limite MAX_PDF ci-dessus ; l'isolation par sous-processus est un durcissement
+    // ultérieur documenté.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| clean_pdf_inner(path, &tmp)))
+        .unwrap_or_else(|_| Err("parseur PDF en échec (fichier malformé)".to_string()));
+    match outcome {
+        Ok(PdfOutcome::Cleaned) => Prep::Cleaned(tmp),
+        // Untouched/Signed : la copie n'a jamais été écrite (retour avant doc.save) —
+        // le remove_file est un no-op sûr, gardé par symétrie.
+        Ok(PdfOutcome::Untouched) => {
+            let _ = fs::remove_file(&tmp);
+            Prep::Untouched
+        }
+        Ok(PdfOutcome::Signed) => {
+            let _ = fs::remove_file(&tmp);
+            Prep::Skipped("PDF signé — nettoyage sauté pour préserver la signature")
+        }
         Err(e) => {
             let _ = fs::remove_file(&tmp);
             Prep::Failed(format!("PDF: {e}"))
@@ -592,20 +728,67 @@ fn clean_pdf_file(path: &Path, size: u64) -> Prep {
     }
 }
 
-fn clean_pdf_inner(path: &Path, out: &Path) -> Result<(), String> {
+/// Détecte une signature numérique : /AcroForm SigFlags (bit 1 = SignaturesExist)
+/// dans le catalogue, ou un objet /Type /Sig. Re-sérialiser un PDF signé casse la
+/// signature — mieux vaut prévenir (Skipped) que corrompre silencieusement.
+fn pdf_is_signed(doc: &lopdf::Document) -> bool {
+    if let Ok(root_id) = doc.trailer.get(b"Root").and_then(|o| o.as_reference()) {
+        if let Some(acro) = doc
+            .get_object(root_id)
+            .ok()
+            .and_then(|o| o.as_dict().ok())
+            .and_then(|d| d.get(b"AcroForm").ok())
+        {
+            // /AcroForm peut être une référence indirecte ou un dictionnaire en ligne.
+            let acro_dict = acro
+                .as_reference()
+                .ok()
+                .and_then(|id| doc.get_object(id).ok())
+                .and_then(|o| o.as_dict().ok())
+                .or_else(|| acro.as_dict().ok());
+            if let Some(dict) = acro_dict {
+                if let Ok(flags) = dict.get(b"SigFlags").and_then(|o| o.as_i64()) {
+                    if flags & 1 != 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    doc.objects.values().any(|o| {
+        o.as_dict()
+            .ok()
+            .and_then(|d| d.get(b"Type").ok())
+            .and_then(|t| t.as_name().ok())
+            .map(|n| n == b"Sig")
+            .unwrap_or(false)
+    })
+}
+
+fn clean_pdf_inner(path: &Path, out: &Path) -> Result<PdfOutcome, String> {
     let mut doc = lopdf::Document::load(path).map_err(|e| e.to_string())?;
     if doc.trailer.get(b"Encrypt").is_ok() {
         return Err("PDF chiffré".into());
     }
+    if pdf_is_signed(&doc) {
+        return Ok(PdfOutcome::Signed);
+    }
     // /Info (auteur, logiciel, dates), /ID (empreinte du document), /Metadata (XMP).
     // ATTENTION : retirer la RÉFÉRENCE ne suffit pas — l'OBJET resterait dans le
     // fichier sauvegardé, octets confidentiels compris. Supprimer les objets, puis
-    // élaguer les orphelins (flux XMP imbriqués, etc.).
+    // élaguer les orphelins (flux XMP imbriqués, etc.). On mémorise si QUELQUE CHOSE
+    // a réellement été retiré : sinon on ne réécrit pas (une re-sérialisation lopdf
+    // d'un PDF exotique pourrait le corrompre et serait livrée comme « Cleaned »).
+    let mut changed = false;
     if let Ok(info_id) = doc.trailer.get(b"Info").and_then(|o| o.as_reference()) {
         doc.objects.remove(&info_id);
     }
-    doc.trailer.remove(b"Info");
-    doc.trailer.remove(b"ID");
+    if doc.trailer.remove(b"Info").is_some() {
+        changed = true;
+    }
+    if doc.trailer.remove(b"ID").is_some() {
+        changed = true;
+    }
     if let Ok(root_id) = doc.trailer.get(b"Root").and_then(|o| o.as_reference()) {
         let meta_id = doc
             .get_object(root_id)
@@ -618,14 +801,21 @@ fn clean_pdf_inner(path: &Path, out: &Path) -> Result<(), String> {
         }
         if let Ok(obj) = doc.get_object_mut(root_id) {
             if let Ok(dict) = obj.as_dict_mut() {
-                dict.remove(b"Metadata");
-                dict.remove(b"PieceInfo");
+                if dict.remove(b"Metadata").is_some() {
+                    changed = true;
+                }
+                if dict.remove(b"PieceInfo").is_some() {
+                    changed = true;
+                }
             }
         }
     }
+    if !changed {
+        return Ok(PdfOutcome::Untouched);
+    }
     doc.prune_objects();
     doc.save(out).map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(PdfOutcome::Cleaned)
 }
 
 // ---- Documents ZIP : OOXML (docx/xlsx/pptx) et OpenDocument (odt/ods/odp) ----
@@ -839,6 +1029,53 @@ mod tests {
         let mut v1 = b"TAG".to_vec();
         v1.extend_from_slice(&[0u8; 125]);
         d.extend_from_slice(&v1);
+        let out = clean_mp3(&d).unwrap().expect("doit changer");
+        assert_eq!(out, vec![0xFF, 0xFB, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn png_oversized_chunk_len_errors_not_panics() {
+        // Longueur de chunk annoncée = 0xFFFFFFFF : les bornes (checked_add + fin de
+        // fichier) doivent renvoyer Err, sans déborder ni paniquer.
+        let mut d = PNG_SIG.to_vec();
+        d.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // len énorme
+        d.extend_from_slice(b"tEXt");
+        d.extend_from_slice(&[0u8; 8]); // données bien plus courtes qu'annoncé
+        assert!(clean_png(&d).is_err());
+    }
+
+    #[test]
+    fn riff_oversized_chunk_errors_not_panics() {
+        // Taille de chunk RIFF dépassant le fichier : Err propre, pas de panique.
+        let mut d = b"RIFF".to_vec();
+        d.extend_from_slice(&100u32.to_le_bytes()); // taille RIFF (indifférente ici)
+        d.extend_from_slice(b"WAVE");
+        d.extend_from_slice(b"data");
+        d.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // sz > fichier
+        d.extend_from_slice(&[0u8; 4]);
+        assert!(clean_wav(&d).is_err());
+    }
+
+    #[test]
+    fn mp3_truncated_id3v2_errors_not_panics() {
+        // En-tête ID3v2 annonçant une taille (syncsafe = 128) > fichier : Err, pas panic.
+        let mut d = b"ID3\x04\x00\x00\x00\x00\x01\x00".to_vec(); // taille syncsafe = 128
+        d.extend_from_slice(&[0u8; 4]); // corps bien plus court que 128
+        assert!(clean_mp3(&d).is_err());
+    }
+
+    #[test]
+    fn mp3_strips_apev2_footer() {
+        // Audio suivi d'un tag APEv2 (pied seul, 32 o) : le tag doit être retiré.
+        let mut d = vec![0xFF, 0xFB, 1, 2, 3, 4]; // « audio »
+        let mut footer = b"APETAGEX".to_vec(); // préambule (8)
+        footer.extend_from_slice(&2000u32.to_le_bytes()); // version (4)
+        footer.extend_from_slice(&32u32.to_le_bytes()); // tag_size = pied seul (4)
+        footer.extend_from_slice(&0u32.to_le_bytes()); // nombre d'items (4)
+        footer.extend_from_slice(&0u32.to_le_bytes()); // flags : bit31=0 → pas d'en-tête (4)
+        footer.extend_from_slice(&[0u8; 8]); // réservé (8)
+        assert_eq!(footer.len(), 32);
+        d.extend_from_slice(&footer);
         let out = clean_mp3(&d).unwrap().expect("doit changer");
         assert_eq!(out, vec![0xFF, 0xFB, 1, 2, 3, 4]);
     }
