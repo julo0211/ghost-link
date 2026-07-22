@@ -695,36 +695,87 @@ enum PdfOutcome {
     Signed,
 }
 
+/// Point d'entrée du SOUS-PROCESSUS de nettoyage PDF (#12) : appelé par main.rs quand
+/// l'app est relancée avec `--gl-clean-pdf <in> <out>`. Renvoie un code de sortie que
+/// `clean_pdf_file` mappe vers un `Prep`. catch_unwind contient les paniques internes de
+/// lopdf ; un OOM (deflate-bomb) abort ce process — le parent le traite comme Skipped.
+pub fn clean_pdf_worker(in_path: &str, out_path: &str) -> i32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        clean_pdf_inner(Path::new(in_path), Path::new(out_path))
+    })) {
+        Ok(Ok(PdfOutcome::Cleaned)) => 0,
+        Ok(Ok(PdfOutcome::Untouched)) => 10,
+        Ok(Ok(PdfOutcome::Signed)) => 11,
+        Ok(Err(_)) => 12,
+        Err(_) => 13, // panique lopdf contenue
+    }
+}
+
 fn clean_pdf_file(path: &Path, size: u64) -> Prep {
     // Plafond PDF prudent (deflate-bomb, cf. MAX_PDF) : au-delà, Skipped VISIBLE.
     if size > MAX_PDF {
         return Prep::Skipped("PDF trop volumineux pour le nettoyage");
     }
     let tmp = temp_path(path);
-    // #12 : lopdf peut PANIQUER sur un PDF malformé (index/unwrap internes). Le profil
-    // est en panic=unwind, donc catch_unwind contient la panique → Prep::Failed VISIBLE
-    // au lieu d'un crash du process (contrat : ne jamais faire échouer un transfert en
-    // silence). L'OOM d'une deflate-bomb reste un abort non rattrapable : c'est le rôle
-    // de la limite MAX_PDF ci-dessus ; l'isolation par sous-processus est un durcissement
-    // ultérieur documenté.
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| clean_pdf_inner(path, &tmp)))
-        .unwrap_or_else(|_| Err("parseur PDF en échec (fichier malformé)".to_string()));
-    match outcome {
-        Ok(PdfOutcome::Cleaned) => Prep::Cleaned(tmp),
-        // Untouched/Signed : la copie n'a jamais été écrite (retour avant doc.save) —
-        // le remove_file est un no-op sûr, gardé par symétrie.
-        Ok(PdfOutcome::Untouched) => {
+    // #12 : le nettoyage lopdf tourne dans un SOUS-PROCESSUS ISOLÉ (re-exec de nous-mêmes
+    // avec --gl-clean-pdf, cf. main.rs). Une deflate-bomb qui provoque un OOM (abort NON
+    // rattrapable par catch_unwind) ne tue QUE ce sous-processus ; le parent renvoie alors
+    // Skipped VISIBLE (métadonnées non retirées mais transfert préservé — contrat respecté).
+    // Le code de sortie encode le résultat (voir clean_pdf_worker).
+    let code = std::env::current_exe().ok().and_then(|exe| {
+        std::process::Command::new(exe)
+            .arg("--gl-clean-pdf")
+            .arg(path.as_os_str())
+            .arg(tmp.as_os_str())
+            .status()
+            .ok()
+            .map(|s| s.code())
+    });
+    match code {
+        Some(Some(0)) => Prep::Cleaned(tmp),
+        Some(Some(10)) => {
             let _ = fs::remove_file(&tmp);
             Prep::Untouched
         }
-        Ok(PdfOutcome::Signed) => {
+        Some(Some(11)) => {
             let _ = fs::remove_file(&tmp);
             Prep::Skipped("PDF signé — nettoyage sauté pour préserver la signature")
         }
-        Err(e) => {
+        Some(Some(12)) => {
             let _ = fs::remove_file(&tmp);
-            Prep::Failed(format!("PDF: {e}"))
+            Prep::Failed("PDF: illisible ou chiffré".to_string())
         }
+        Some(Some(13)) => {
+            let _ = fs::remove_file(&tmp);
+            Prep::Failed("PDF: parseur en échec (fichier malformé)".to_string())
+        }
+        // Sous-processus tué (OOM/abort) ou code inattendu : repli VISIBLE, transfert préservé.
+        Some(_) => {
+            let _ = fs::remove_file(&tmp);
+            Prep::Skipped("PDF trop coûteux à décompresser — nettoyage sauté")
+        }
+        // Impossible de lancer le sous-processus (current_exe/spawn en échec, rare) : repli
+        // in-process protégé par catch_unwind (contient les paniques ; l'OOM ne reste possible
+        // que dans ce cas résiduel).
+        None => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| clean_pdf_inner(path, &tmp))) {
+            Ok(Ok(PdfOutcome::Cleaned)) => Prep::Cleaned(tmp),
+            Ok(Ok(PdfOutcome::Untouched)) => {
+                let _ = fs::remove_file(&tmp);
+                Prep::Untouched
+            }
+            Ok(Ok(PdfOutcome::Signed)) => {
+                let _ = fs::remove_file(&tmp);
+                Prep::Skipped("PDF signé — nettoyage sauté pour préserver la signature")
+            }
+            Ok(Err(e)) => {
+                let _ = fs::remove_file(&tmp);
+                Prep::Failed(format!("PDF: {e}"))
+            }
+            Err(_) => {
+                let _ = fs::remove_file(&tmp);
+                Prep::Failed("PDF: parseur en échec (fichier malformé)".to_string())
+            }
+        },
     }
 }
 
@@ -1204,22 +1255,18 @@ mod tests {
         doc.trailer.set("Root", catalog_id);
         doc.trailer.set("Info", info_id);
         doc.save(&src).unwrap();
-        match clean_pdf_file(&src, fs::metadata(&src).unwrap().len()) {
-            Prep::Cleaned(tmp) => {
-                let cleaned = Document::load(&tmp).unwrap();
-                assert!(cleaned.trailer.get(b"Info").is_err());
-                let raw = fs::read(&tmp).unwrap();
-                assert!(!raw.windows(6).any(|w| w == b"SECRET"));
-                let _ = fs::remove_file(tmp);
-            }
-            other => panic!(
-                "le pdf aurait dû être nettoyé ({})",
-                match other {
-                    Prep::Failed(e) => e,
-                    _ => "statut inattendu".into(),
-                }
-            ),
-        }
+        // #12 : le nettoyage réel tourne dans clean_pdf_worker (exécuté par le sous-
+        // processus isolé en production). On le teste DIRECTEMENT — clean_pdf_file re-exec
+        // le vrai binaire de l'app, indisponible sous `cargo test` (current_exe = binaire
+        // de test). clean_pdf_worker écrit le fichier nettoyé et renvoie 0 = Cleaned.
+        let tmp = temp_path(&src);
+        let code = clean_pdf_worker(&src.to_string_lossy(), &tmp.to_string_lossy());
+        assert_eq!(code, 0, "le pdf aurait dû être nettoyé (code {code})");
+        let cleaned = Document::load(&tmp).unwrap();
+        assert!(cleaned.trailer.get(b"Info").is_err());
+        let raw = fs::read(&tmp).unwrap();
+        assert!(!raw.windows(6).any(|w| w == b"SECRET"));
+        let _ = fs::remove_file(tmp);
         let _ = fs::remove_file(src);
     }
 }

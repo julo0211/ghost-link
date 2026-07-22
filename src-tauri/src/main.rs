@@ -488,6 +488,16 @@ fn cancel_recv(state: State<'_, Net>) {
 }
 
 fn main() {
+    // #12 : mode interne « nettoyer un PDF dans un SOUS-PROCESSUS ISOLÉ ». Un PDF hostile
+    // (deflate-bomb) qui provoque un OOM n'abort QUE ce sous-processus — l'app parente
+    // survit et traite le fichier comme Skipped. DOIT rester la toute première chose de
+    // main() (avant l'init Tauri). Voir meta::clean_pdf_file / clean_pdf_worker.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() == 4 && args[1] == "--gl-clean-pdf" {
+            std::process::exit(meta::clean_pdf_worker(&args[2], &args[3]));
+        }
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
