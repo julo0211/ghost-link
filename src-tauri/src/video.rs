@@ -659,65 +659,73 @@ mod win {
     /// un off-by-one y lirait des pixels périmés/hors zone). Filtre boîte
     /// obligatoire (PAS de plus-proche-voisin) : un partage d'écran c'est du
     /// texte, le nearest fait scintiller les glyphes et explose le débit H.264.
-    #[inline]
+    /// Bornes source `[s0, s1)` d'une colonne (ou ligne) de SORTIE. Calculées UNE fois
+    /// par trame pour chaque colonne/ligne (O(w+h)) au lieu d'être recalculées pour
+    /// chacun des w×h pixels : ce recalcul (multiplications 64 bits + clamps par pixel)
+    /// coûtait à lui seul l'essentiel du temps de conversion.
+    fn spans(n_out: usize, step: u32, cov: usize) -> Vec<(u32, u32)> {
+        (0..n_out)
+            .map(|i| {
+                let s0 = ((i as u64 * step as u64) >> 16) as usize;
+                let s1 = ((((i + 1) as u64 * step as u64) >> 16) as usize)
+                    .max(s0 + 1)
+                    .min(cov);
+                // saturating : `cov == 0` (zone non couverte) donne une boîte vide, que
+                // box_avg traite comme du noir — jamais d'underflow.
+                let s0 = s0.min(s1.saturating_sub(1));
+                (s0 as u32, s1 as u32)
+            })
+            .collect()
+    }
+
+    #[inline(always)]
     unsafe fn box_avg(
         src: *const u8,
         pitch: usize,
-        sc: Scale,
-        ox: usize,
-        oy: usize,
-        src_cov_w: usize,
-        src_cov_h: usize,
+        (sx0, sx1): (usize, usize),
+        (sy0, sy1): (usize, usize),
     ) -> (i32, i32, i32) {
-        if src_cov_w == 0 || src_cov_h == 0 {
-            return (0, 0, 0);
+        if sx1 <= sx0 || sy1 <= sy0 {
+            return (0, 0, 0); // hors couverture
         }
-        let sx0 = ((ox as u64 * sc.step_x as u64) >> 16) as usize;
-        let sx1 = ((((ox + 1) as u64 * sc.step_x as u64) >> 16) as usize)
-            .max(sx0 + 1)
-            .min(src_cov_w);
-        let sx0 = sx0.min(sx1 - 1);
-        let sy0 = ((oy as u64 * sc.step_y as u64) >> 16) as usize;
-        let sy1 = ((((oy + 1) as u64 * sc.step_y as u64) >> 16) as usize)
-            .max(sy0 + 1)
-            .min(src_cov_h);
-        let sy0 = sy0.min(sy1 - 1);
-
-        let mut rs = 0i64;
-        let mut gs = 0i64;
-        let mut bs = 0i64;
+        // Cas DOMINANT d'un downscale modéré (2K→1080p : facteur 1,33) : la boîte ne
+        // couvre qu'un seul pixel → lecture directe, ni accumulation ni moyenne.
+        if sx1 - sx0 == 1 && sy1 - sy0 == 1 {
+            let p = src.add(sy0 * pitch + sx0 * 4);
+            return (*p.add(2) as i32, *p.add(1) as i32, *p as i32);
+        }
+        let mut rs = 0i32;
+        let mut gs = 0i32;
+        let mut bs = 0i32;
         for sy in sy0..sy1 {
-            let row = std::slice::from_raw_parts(src.add(sy * pitch), src_cov_w * 4);
-            for sx in sx0..sx1 {
-                let px = &row[sx * 4..sx * 4 + 4];
-                bs += px[0] as i64;
-                gs += px[1] as i64;
-                rs += px[2] as i64;
+            // Arithmétique de pointeur directe : reconstruire un slice par ligne ET par
+            // pixel de sortie empêchait toute optimisation de la boucle.
+            let mut p = src.add(sy * pitch + sx0 * 4);
+            for _ in sx0..sx1 {
+                bs += *p as i32;
+                gs += *p.add(1) as i32;
+                rs += *p.add(2) as i32;
+                p = p.add(4);
             }
         }
         // L'aire se déduit des bornes : inutile de compter pixel par pixel.
-        let n = ((sx1 - sx0) * (sy1 - sy0)) as i64;
-        if n <= 0 {
-            return (0, 0, 0);
-        }
-        // PERF : diviser ici coûterait 3 divisions entières par pixel de SORTIE, soit
-        // ~6 M par trame en 1080p — plusieurs dizaines de ms sur le thread d'encodage
-        // (grab_latest est appelé SYNCHRONEMENT sur METransformNeedInput), ce qui
-        // plafonnerait la cadence bien en dessous de la cible : choisir « 1080p » pour
-        // soulager le réseau aurait rendu le partage saccadé. On multiplie par une
-        // réciproque pré-calculée (arrondi au plus proche, donc au moins aussi juste
-        // qu'une division tronquée) ; au-delà de la table on retombe sur la division.
-        let nn = n as usize;
-        if nn < RECIP_Q20.len() {
-            let r = RECIP_Q20[nn] as i64;
-            const HALF: i64 = 1 << 19;
+        let n = (sx1 - sx0) * (sy1 - sy0);
+        // PERF : diviser ici coûterait 3 divisions entières par pixel de SORTIE (~6 M
+        // par trame en 1080p). On multiplie par une réciproque pré-calculée (arrondi au
+        // plus proche, donc au moins aussi juste qu'une division tronquée) ; au-delà de
+        // la table on retombe sur la division. Les sommes tiennent en i32 : rs×r vaut
+        // toujours ≈ 255 × 2^20, très en dessous de la limite.
+        if n < RECIP_Q20.len() {
+            let r = RECIP_Q20[n] as i32;
+            const HALF: i32 = 1 << 19;
             return (
-                ((rs * r + HALF) >> 20) as i32,
-                ((gs * r + HALF) >> 20) as i32,
-                ((bs * r + HALF) >> 20) as i32,
+                (rs.wrapping_mul(r).wrapping_add(HALF)) >> 20,
+                (gs.wrapping_mul(r).wrapping_add(HALF)) >> 20,
+                (bs.wrapping_mul(r).wrapping_add(HALF)) >> 20,
             );
         }
-        ((rs / n) as i32, (gs / n) as i32, (bs / n) as i32)
+        let n = n as i32;
+        (rs / n, gs / n, bs / n)
     }
 
     /// Conversion BGRA (avec pitch) → NV12 (BT.709, plage limitée), par blocs de
@@ -749,6 +757,10 @@ mod win {
             bgra_to_nv12_identity(src, pitch, w, h, cov_w, cov_h, out);
             return;
         }
+        // Bornes de boîte par colonne / ligne de SORTIE : calculées une seule fois ici
+        // (voir `spans`) puis simplement indexées dans la boucle chaude.
+        let sx_tab = spans(w, sc.step_x, src_cov_w);
+        let sy_tab = spans(h, sc.step_y, src_cov_h);
         let (y_plane, uv_plane) = out.split_at_mut(w * h);
         for by in 0..h / 2 {
             let oy0 = by * 2;
@@ -784,11 +796,13 @@ mod win {
                 let mut gs = 0i32;
                 let mut bs = 0i32;
                 for (dy, yrow) in [(0usize, &mut *yrow0), (1usize, &mut *yrow1)] {
+                    let (y0, y1) = sy_tab[oy0 + dy];
                     for dx in 0..2usize {
                         let ox = ox0 + dx;
-                        let oy = oy0 + dy;
-                        let (r, g, b) =
-                            unsafe { box_avg(src, pitch, sc, ox, oy, src_cov_w, src_cov_h) };
+                        let (x0, x1) = sx_tab[ox];
+                        let (r, g, b) = unsafe {
+                            box_avg(src, pitch, (x0 as usize, x1 as usize), (y0 as usize, y1 as usize))
+                        };
                         rs += r;
                         gs += g;
                         bs += b;
@@ -1502,6 +1516,49 @@ mod win {
         /// rapide (aucun scaler, code = ancienne version 1:1).
         fn identity(w: u32, h: u32) -> Scale {
             Scale::new(w, h, w, h)
+        }
+
+        /// Banc d'essai du coût CPU de la conversion, sur le cas qui a posé problème en
+        /// réel : un écran 2K partagé en 1080p oscillait à 40-60 fps alors que le même
+        /// écran en NATIF (chemin identité) tenait 60 fps stable.
+        /// `grab_latest` étant appelé SYNCHRONEMENT depuis la boucle d'encodage, ce temps
+        /// plafonne directement la cadence : il doit rester bien sous 16,6 ms (60 fps).
+        /// À lancer EN RELEASE, sinon la mesure n'a aucun sens :
+        ///   cargo test --release -- --ignored perf_conversion --nocapture
+        #[test]
+        #[ignore = "mesure de perf (lancer en --release)"]
+        fn perf_conversion() {
+            const SW: usize = 2560;
+            const SH: usize = 1440;
+            let src = vec![90u8; SW * SH * 4];
+            let bench = |label: &str, dw: usize, dh: usize| {
+                let sc = Scale::new(SW as u32, SH as u32, dw as u32, dh as u32);
+                let mut out = vec![0u8; dw * dh * 3 / 2];
+                let run = |out: &mut [u8]| {
+                    bgra_to_nv12(src.as_ptr(), SW * 4, dw, dh, dw, dh, sc, SW, SH, out)
+                };
+                run(&mut out); // chauffe (caches, pages)
+                const N: u32 = 20;
+                let t = std::time::Instant::now();
+                for _ in 0..N {
+                    run(&mut out);
+                }
+                let per = t.elapsed() / N;
+                println!(
+                    "{label:<34} {:>7.2} ms/trame  ({:>5.1} fps max)",
+                    per.as_secs_f64() * 1000.0,
+                    1.0 / per.as_secs_f64()
+                );
+                per
+            };
+            let natif = bench("2560x1440 NATIF (identité)", SW, SH);
+            let p1080 = bench("2560x1440 -> 1920x1080", 1920, 1080);
+            let p720 = bench("2560x1440 -> 1280x720", 1280, 720);
+            println!(
+                "ratio downscale/natif : 1080p x{:.2}, 720p x{:.2}",
+                p1080.as_secs_f64() / natif.as_secs_f64(),
+                p720.as_secs_f64() / natif.as_secs_f64()
+            );
         }
 
         /// Convertit un buffer BGRA uniforme et vérifie Y/U/V (BT.709 limité).

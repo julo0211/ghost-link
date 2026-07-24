@@ -4,7 +4,7 @@
 
 [package]
 name = "ghost-link"
-version = "0.35.1"
+version = "0.35.2"
 edition = "2021"
 
 [build-dependencies]
@@ -71,3 +71,15 @@ windows = { version = "0.58", features = [
 # 30 fps en dev sans sacrifier les temps de compilation ni le débogage.
 [profile.dev]
 opt-level = 1
+
+# Binaire PUBLIÉ : la conversion BGRA→NV12 et le mixage audio sont des boucles chaudes
+# temps réel (le partage d'écran doit tenir la cadence sur le thread d'encodage), et les
+# réglages par défaut de Cargo laissent du temps sur la table.
+#   lto = "thin"        : optimisation entre modules (le scaler appelle des helpers
+#                         définis ailleurs — sans LTO ils ne sont pas inlinés).
+#   codegen-units = 1   : une seule unité, donc l'optimiseur voit tout le code.
+# NE PAS ajouter panic = "abort" : le nettoyage PDF s'appuie sur catch_unwind pour
+# contenir une panique de parseur (cf. meta.rs) — un abort tuerait l'app.
+[profile.release]
+lto = "thin"
+codegen-units = 1
