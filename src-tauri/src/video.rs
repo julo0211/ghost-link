@@ -1518,6 +1518,36 @@ mod win {
             Scale::new(w, h, w, h)
         }
 
+        /// Balayage de robustesse : aucune combinaison réaliste (écran/fenêtre, cible,
+        /// couverture partielle d'une fenêtre redimensionnée) ne doit paniquer ni lire
+        /// hors de la source. Un panic ici tuerait le thread de capture — le partage
+        /// s'arrêterait alors que l'audio, sur un autre thread, continuerait.
+        #[test]
+        fn scaler_aucune_combinaison_ne_panique() {
+            const SRC: &[(usize, usize)] =
+                &[(2560, 1440), (1920, 1080), (3840, 2160), (1366, 768), (1280, 720), (800, 600)];
+            const CIBLE: &[(u32, u32)] = &[(0, 0), (1920, 1080), (1280, 720)];
+            for &(sw, sh) in SRC {
+                // Pitch volontairement plus large que la ligne (cas réel des textures D3D).
+                let pitch = sw * 4 + 64;
+                let src = vec![77u8; pitch * sh];
+                for &(mw, mh) in CIBLE {
+                    let (ew, eh) = super::clamp_dims(sw as u32, sh as u32, mw, mh);
+                    let (ew, eh) = (ew as usize, eh as usize);
+                    let sc = Scale::new(sw as u32, sh as u32, ew as u32, eh as u32);
+                    let mut out = vec![0u8; ew * eh * 3 / 2];
+                    // Couvertures : pleine, moitié, quart, une seule ligne/colonne, nulle.
+                    for &(num, den) in &[(1usize, 1usize), (1, 2), (1, 4), (1, 100), (0, 1)] {
+                        let scw = (sw * num / den) & !1;
+                        let sch = (sh * num / den) & !1;
+                        let cw = super::cov_out(scw as u32, sw as u32, ew as u32) as usize;
+                        let ch = super::cov_out(sch as u32, sh as u32, eh as u32) as usize;
+                        bgra_to_nv12(src.as_ptr(), pitch, ew, eh, cw, ch, sc, scw, sch, &mut out);
+                    }
+                }
+            }
+        }
+
         /// Banc d'essai du coût CPU de la conversion, sur le cas qui a posé problème en
         /// réel : un écran 2K partagé en 1080p oscillait à 40-60 fps alors que le même
         /// écran en NATIF (chemin identité) tenait 60 fps stable.

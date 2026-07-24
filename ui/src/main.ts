@@ -240,7 +240,7 @@ setTimeout(
 );
 // Tampon de build du FRONTEND. Si « UI » diverge de la version Rust (app_version),
 // c'est que la WebView sert un ancien frontend en cache (et non le code compilé).
-const UI_BUILD = "0.35.2";
+const UI_BUILD = "0.35.3";
 invoke("app_version")
   .then((v) => {
     $("#appVer").textContent = v + " · UI " + UI_BUILD;
