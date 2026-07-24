@@ -7,7 +7,7 @@ import { showTab, initSession, paintConvoUnread } from "./session.js";
 import { initCall } from "./call.js";
 import { initFriends, renderFriends, loadFingerprints, showFp, refreshPresence } from "./friends.js";
 import { initTransfer } from "./transfer.js";
-import { initGroups, renderGroups, renderGroupFriends } from "./groups.js";
+import { initGroups, renderGroups, renderGroupFriends, clearUnreadIfWatching } from "./groups.js";
 // ===== Identité (code permanent / éphémère) =====
 function initIdentity() {
     // Mon code : caché par défaut, révélé/masqué via le bouton.
@@ -268,7 +268,7 @@ $("#setName").value = (localStorage.getItem("ghostlink_name") || "").trim();
 setTimeout(() => loadGroups().forEach((g, i) => setTimeout(() => invoke("open_group", { members: friendsOnly(g.members) }).catch(() => { }), i * 500)), 800);
 // Tampon de build du FRONTEND. Si « UI » diverge de la version Rust (app_version),
 // c'est que la WebView sert un ancien frontend en cache (et non le code compilé).
-const UI_BUILD = "0.36.0";
+const UI_BUILD = "0.36.1";
 invoke("app_version")
     .then((v) => {
     $("#appVer").textContent = v + " · UI " + UI_BUILD;
@@ -296,21 +296,35 @@ document.addEventListener("click", () => unlockAudio(), { once: true, capture: t
 // d'effacement : sans lui, un message arrivé fenêtre floue sur le groupe DÉJÀ ouvert
 // laisserait une pastille que l'utilisateur ne pourrait effacer qu'en naviguant ailleurs
 // puis en revenant — alors qu'il est justement en train de le lire.
-listen("tauri://focus", () => {
-    S.focused = true;
-    if (S.openGroupId && S.unread[S.openGroupId]) {
-        delete S.unread[S.openGroupId];
+function setFocused(on) {
+    if (S.focused === on)
+        return;
+    S.focused = on;
+    if (!on)
+        return;
+    // Reprendre le focus n'efface que la conversation RÉELLEMENT affichée : un groupe resté
+    // chargé derrière un autre onglet ne doit pas voir sa pastille disparaître juste parce
+    // qu'on revient sur la fenêtre (même raison que le bug corrigé dans pushGroupMsg).
+    if (clearUnreadIfWatching(S.openGroupId))
         renderGroups();
-    }
     const sess = document.querySelector('[data-view="session"]');
     if (sess && !sess.classList.contains("view-hidden") && S.unread1to1) {
         S.unread1to1 = 0;
         paintConvoUnread();
     }
-});
-listen("tauri://blur", () => {
-    S.focused = false;
-});
+}
+// TROIS sources pour le même état, délibérément. Les deux premières sont du DOM Chromium
+// pur, donc garanties dans la WebView ; la troisième est l'événement Tauri, que je n'ai pas
+// pu vérifier empiriquement — il vient de `emit_to_window` (cible EventTarget::Window /
+// WebviewWindow), là où les événements de glisser-déposer, eux, passent explicitement par
+// `emit_to(EventTarget::labeled(...))`. Plutôt que de faire reposer les pastilles sur cette
+// asymétrie non élucidée, on prend le signal DOM comme source principale.
+window.addEventListener("focus", () => setFocused(true));
+window.addEventListener("blur", () => setFocused(false));
+document.addEventListener("visibilitychange", () => setFocused(document.visibilityState === "visible"));
+listen("tauri://focus", () => setFocused(true));
+listen("tauri://blur", () => setFocused(false));
+S.focused = document.hasFocus(); // état initial réel, et non un `true` optimiste
 setTimeout(() => checkUpdate(true), 5000);
 setTimeout(refreshPresence, 3000);
 setInterval(refreshPresence, 60000); // BUG-4 : 30 s → 60 s (moins de tempête de connexions)

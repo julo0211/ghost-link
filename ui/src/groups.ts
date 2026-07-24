@@ -77,6 +77,28 @@ function addDeclined(id: string): void {
 // mémoire — cf. le listener ghost-ginvite pour la raison de ne pas persister).
 const invPinged = new Set<string>();
 
+/** Est-ce que l'utilisateur REGARDE vraiment le groupe `id` en ce moment ?
+ *
+ *  Les trois conditions sont nécessaires, et c'est le bug corrigé en v0.36.1 : `S.openGroupId`
+ *  ne signifie PAS « l'utilisateur regarde ce groupe », seulement « ce groupe est chargé dans
+ *  le panneau ». Rien ne le remet à null quand on change d'onglet — seul closeGroup() le fait,
+ *  et il n'est appelé que par le ✕ ou une exclusion. Donc tester `S.openGroupId === id` seul
+ *  rendait la pastille invisible pour tout groupe déjà ouvert une fois dans la session, pour
+ *  le reste de la session. C'est exactement le test que noteIncoming1to1 fait déjà, en PV. */
+function watchingGroup(id: string): boolean {
+  if (!id || S.openGroupId !== id || !S.focused) return false;
+  const v = document.querySelector('[data-view="group"]');
+  return !!v && !v.classList.contains("view-hidden");
+}
+/** Efface la pastille d'un groupe si l'utilisateur est en train de le regarder. Exporté pour
+ *  le listener tauri://focus (main.ts) : reprendre le focus ne doit effacer que la
+ *  conversation RÉELLEMENT affichée, pas un groupe resté chargé derrière un autre onglet. */
+export function clearUnreadIfWatching(id: string | null): boolean {
+  if (!id || !watchingGroup(id) || !S.unread[id]) return false;
+  delete S.unread[id];
+  return true;
+}
+
 // ----- Rendu des groupes / membres -----
 function updateGroupLine(g: Group): void {
   const total = g.members.length + 1;
@@ -536,7 +558,9 @@ function pushGroupMsg(id: string, author: string, text: string, who: string, fro
   // Le compteur vit dans S, JAMAIS dans le DOM : renderGroups vide #groupList en innerHTML
   // et refreshGroupCounts le re-rend à chaque ghost-mesh-up/down — une pastille peinte dans
   // le DOM disparaîtrait au premier changement de présence.
-  if (S.openGroupId !== id || !S.focused) {
+  // On incrémente sauf si l'utilisateur REGARDE ce groupe — voir watchingGroup : tester
+  // `S.openGroupId === id` seul était le bug qui rendait la pastille invisible.
+  if (!watchingGroup(id)) {
     S.unread[id] = (S.unread[id] || 0) + 1;
     renderGroups();
   }
