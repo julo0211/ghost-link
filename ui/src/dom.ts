@@ -51,6 +51,84 @@ export function shortId(id: string): string {
   return id.length > 14 ? id.slice(0, 14) + "…" : id;
 }
 
+/** Borne un libellé d'origine DISTANTE avant affichage. Les noms auto-déclarés arrivent
+ *  via read_lp16, borné seulement par son préfixe u16 (64 Kio) : aucun plafond sémantique,
+ *  aucune élision. Sans ça un pseudo de 60 000 caractères casse la mise en page. */
+export function clampLabel(s?: string): string {
+  const v = String(s ?? "").trim();
+  return v.length > 40 ? v.slice(0, 40) + "…" : v;
+}
+
+// ----- Son de notification -----
+// Oscillateur WebAudio et NON un fichier : le CSP (tauri.conf.json) a
+// `media-src 'self' blob:` SANS `data:`, donc une data-URI passée à new Audio() serait
+// refusée. Un oscillateur ne demande ni asset embarqué ni dérogation CSP.
+//
+// ⚠️ L'AUTOPLAY N'EST PAS ACQUIS DANS CETTE APP. Elle ne joue AUCUN son via la WebView :
+// getUserMedia est appelé avec audio:false, getDisplayMedia en vidéo seule (c'est
+// l'anti-écho, cf. groups.ts), et tout le son réel sort de cpal dans le processus hôte
+// (audio.rs). Les <video> autoplay un flux SILENCIEUX — cela ne prouve rien sur
+// l'autorisation de PRODUIRE du son. Chromium soumet AudioContext à une politique
+// distincte de <video autoplay> : un contexte créé au chargement du module peut démarrer
+// `suspended` et le rester indéfiniment. D'où création paresseuse + resume() déclenché par
+// le premier geste utilisateur réel (unlockAudio, câblé sur le premier clic dans main.ts).
+type PingKind = "msg" | "req" | "call";
+let actx: AudioContext | null = null;
+let audioUnlocked = false;
+const lastPing: Record<string, number> = {};
+
+/** À appeler depuis le premier geste utilisateur réel (n'importe quel clic). */
+export function unlockAudio(): void {
+  audioUnlocked = true;
+  if (actx && actx.state === "suspended") void actx.resume().catch(() => {});
+}
+function ctx(): AudioContext | null {
+  if (!audioUnlocked) return null; // avant tout geste : no-op silencieux assumé
+  if (!actx) {
+    const C =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!C) return null;
+    try {
+      actx = new C();
+    } catch {
+      return null;
+    }
+  }
+  if (actx.state === "suspended") void actx.resume().catch(() => {});
+  return actx;
+}
+/** Joue un bip court. Limité à 1 par 2 s PAR TIMBRE — et non globalement : un limiteur
+ *  partagé ferait taire un appel entrant arrivé juste après un ping de message, ce qui
+ *  contredirait la règle « jamais muet pour un appel entrant ».
+ *  Ne JAMAIS brancher sur un événement haute fréquence (ghost-voice-activity ~10 Hz,
+ *  ghost-voice-presence 1 Hz × N membres). */
+export function playPing(kind: PingKind): void {
+  if (localStorage.getItem("ghostlink_sound") === "0") return;
+  const now = Date.now();
+  if (now - (lastPing[kind] || 0) < 2000) return;
+  lastPing[kind] = now;
+  const a = ctx();
+  if (!a) return;
+  const freq = kind === "call" ? 880 : kind === "req" ? 620 : 740;
+  const dur = kind === "call" ? 0.22 : 0.12;
+  try {
+    const o = a.createOscillator();
+    const g = a.createGain();
+    o.type = "sine";
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(0, a.currentTime);
+    g.gain.linearRampToValueAtTime(0.14, a.currentTime + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
+    o.connect(g);
+    g.connect(a.destination);
+    o.start();
+    o.stop(a.currentTime + dur + 0.02);
+  } catch {
+    /* pas de son : jamais bloquant */
+  }
+}
+
 // ----- Visionneuse d'image plein écran (overlay #imgViewWrap défini dans index.html) -----
 // Pourquoi un overlay et pas une fenêtre : WebView2 neutralise window.open, et Chromium
 // interdit une navigation top-level vers une data: URI — les deux sources d'images du chat
@@ -131,12 +209,25 @@ export function clearImgBlobs(box: HTMLElement): void {
 /** Ajoute une bulle image dans un conteneur de chat (data-URI ou blob-URL).
  *  Mirroir de la structure `.msg`/`.me`/`.them` des bulles texte (addMsg /
  *  addGroupMsgDom), avec un <img> au lieu d'un noeud texte. */
-export function addImgBubble(box: HTMLElement, src: string, who: string, author?: string): void {
+export function addImgBubble(
+  box: HTMLElement,
+  src: string,
+  who: string,
+  author?: string,
+  from?: string,
+  unverified?: boolean,
+): void {
   const m = document.createElement("div");
   m.className = "msg " + (who === "me" ? "me" : "them");
   if (who !== "me" && author && author.trim()) {
     const au = document.createElement("div");
+    au.className = "auth" + (unverified ? " unverified" : "");
     au.style.cssText = "font-size:11px;font-weight:700;opacity:.8;margin-bottom:2px";
+    // data-from = code AUTHENTIFIÉ de l'expéditeur : cible du ré-étiquetage en place lors
+    // d'un renommage. On ne peut PAS re-rendre le journal pour rafraîchir un libellé —
+    // renderGroupMsgs fait clearImgBlobs + innerHTML="" et ne rejoue que le texte, donc
+    // toutes les images affichées seraient détruites et leurs blob: révoqués.
+    if (from) au.dataset.from = from;
     au.textContent = author.trim();
     m.appendChild(au);
   }

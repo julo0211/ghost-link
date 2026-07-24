@@ -1,7 +1,8 @@
 // Transfert de fichiers 1-à-1 (envoi/réception + accord) + chat texte + glisser-déposer.
 import { invoke, listen } from "./tauri.js";
-import { $, log, fmt, etaStr, baseName, addImgBubble } from "./dom.js";
-import { S, myName } from "./state.js";
+import { $, log, fmt, etaStr, baseName, addImgBubble, clampLabel, playPing } from "./dom.js";
+import { S, myName, memberName, isDeclaredLabel } from "./state.js";
+import { paintConvoUnread } from "./session.js";
 // Images/GIF inline (Task 3.4) : au-delà, pas de chemin fichier disponible pour
 // un `File` issu du picker/presse-papiers — repli documenté (log), pas d'échec silencieux.
 const MAX_INLINE_IMG = 5 * 1024 * 1024;
@@ -27,11 +28,26 @@ function addMsg(text, who, author) {
     const c = $("#chatLog");
     const m = document.createElement("div");
     m.className = "msg " + (who === "me" ? "me" : "them");
-    if (who !== "me" && author && author.trim()) {
-        const au = document.createElement("div");
-        au.style.cssText = "font-size:11px;font-weight:700;opacity:.8;margin-bottom:2px";
-        au.textContent = author.trim();
-        m.appendChild(au);
+    if (who !== "me") {
+        // ghost-chat ne transporte AUCUNE identité d'expéditeur (net.rs n'émet que
+        // { name, text }, et le spawn par flux de run_conn ne clone jamais `peer`). On résout
+        // donc depuis S.currentPeer = remote_id AUTHENTIFIÉ de la session.
+        // LIMITE ASSUMÉE : lors d'un échange de session (accepter une connexion entrante ferme
+        // la précédente), un message encore EN VOL du pair sortant s'afficherait sous le
+        // libellé du nouveau pair. Fenêtre étroite — le log est vidé à la déconnexion — et
+        // strictement meilleur que l'état antérieur, où le nom affiché était intégralement
+        // usurpable. Correctif propre = 3 lignes de Rust, hors de ce lot.
+        const peer = S.currentPeer || "";
+        const label = peer ? memberName(peer, author) : clampLabel(author);
+        if (label) {
+            const au = document.createElement("div");
+            au.className = "auth" + (peer && isDeclaredLabel(peer, author) ? " unverified" : "");
+            au.style.cssText = "font-size:11px;font-weight:700;opacity:.8;margin-bottom:2px";
+            if (peer)
+                au.dataset.from = peer;
+            au.textContent = label;
+            m.appendChild(au);
+        }
     }
     const b = document.createElement("div");
     b.textContent = text;
@@ -42,6 +58,17 @@ function addMsg(text, who, author) {
     m.appendChild(t);
     c.appendChild(m);
     c.scrollTop = c.scrollHeight;
+}
+/** Un message 1-à-1 vient d'arriver : bip, puis compteur de non-lu si je ne suis pas en
+ *  train de le regarder (fenêtre au second plan, ou vue « session » masquée). */
+function noteIncoming1to1() {
+    playPing("msg");
+    const sess = document.querySelector('[data-view="session"]');
+    const visible = !!sess && !sess.classList.contains("view-hidden");
+    if (!S.focused || !visible) {
+        S.unread1to1++;
+        paintConvoUnread();
+    }
 }
 async function sendChat() {
     const text = $("#chatInput").value.trim();
@@ -273,6 +300,7 @@ export function initTransfer() {
         }
     };
     listen("ghost-chat", (e) => {
+        noteIncoming1to1();
         addMsg(e.payload.text, "them", e.payload.name);
     });
     // Images/GIF inline : bouton + coller (le glisser-déposer reste sur le flux fichier).
@@ -291,7 +319,9 @@ export function initTransfer() {
     });
     listen("ghost-chat-img", (e) => {
         const p = e.payload;
-        addImgBubble($("#chatLog"), `data:${p.mime};base64,${p.dataB64}`, "them", p.author);
+        noteIncoming1to1();
+        const peer = S.currentPeer || "";
+        addImgBubble($("#chatLog"), `data:${p.mime};base64,${p.dataB64}`, "them", peer ? memberName(peer, p.author) : clampLabel(p.author), peer || undefined, !!(peer && isDeclaredLabel(peer, p.author)));
     });
     // Glisser-déposer natif
     listen("tauri://drag-enter", () => $("#drop").classList.add("over"));

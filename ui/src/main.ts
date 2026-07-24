@@ -2,9 +2,9 @@
 // identité + réglages + mises à jour + thème ici, le reste délégué aux init*().
 
 import { invoke, listen } from "./tauri.js";
-import { $, log } from "./dom.js";
-import { S, loadGroups, friendsOnly, pushFriendsToBackend } from "./state.js";
-import { showTab, initSession } from "./session.js";
+import { $, log, playPing, unlockAudio } from "./dom.js";
+import { S, loadGroups, friendsOnly, pushFriendsToBackend, resetGains } from "./state.js";
+import { showTab, initSession, paintConvoUnread } from "./session.js";
 import { initCall } from "./call.js";
 import { initFriends, renderFriends, loadFingerprints, showFp, refreshPresence } from "./friends.js";
 import { initTransfer } from "./transfer.js";
@@ -137,6 +137,33 @@ function initSettings(): void {
       ? "🧪 Partage d'écran natif activé (appliqué au prochain partage) — sans WebRTC/STUN."
       : "Partage d'écran natif désactivé — retour au partage WebRTC.");
   };
+  // Son de notification. ACTIVÉ par défaut (clé absente = activé) ; "0" = désactivé.
+  // Cocher joue un bip de confirmation — c'est aussi le seul moyen simple, pour
+  // l'utilisateur, de vérifier que le son sort vraiment sur sa machine.
+  $<HTMLInputElement>("#setSound").checked = localStorage.getItem("ghostlink_sound") !== "0";
+  $<HTMLInputElement>("#setSound").onchange = () => {
+    const on = $<HTMLInputElement>("#setSound").checked;
+    localStorage.setItem("ghostlink_sound", on ? "1" : "0");
+    if (on) playPing("msg");
+    log(on ? "🔔 Son de notification activé." : "Son de notification désactivé.");
+  };
+  // Soupape des volumes persistés : sans issue de secours VISIBLE, un réglage invisible et
+  // durable est un piège. Portée complète — disque, mémoire, backend si un appel tourne, et
+  // les curseurs affichés : dans un lot dont le sujet est justement un désync
+  // curseur/backend, une réinitialisation partielle recréerait le bug volontairement.
+  $("#btnResetGains").onclick = () => {
+    const peers = new Set<string>([...Object.keys(S.groupGains), ...Object.keys(S.screenGains)]);
+    resetGains();
+    if (S.inGroupCall) {
+      peers.forEach((c) => {
+        invoke("group_call_volume", { peer: c, vol: 1 }).catch(() => {});
+        invoke("screen_audio_gain", { peer: c, vol: 1 }).catch(() => {});
+      });
+    }
+    document.querySelectorAll<HTMLInputElement>("input[data-vol]").forEach((r) => (r.value = "100"));
+    renderGroups();
+    log("Volumes par pair réinitialisés.");
+  };
   const storedStreams = localStorage.getItem("ghostlink_streams") ?? "4";
   $<HTMLSelectElement>("#setStreams").value = storedStreams;
   // #14 : le backend repart toujours de NSTREAMS=4 au démarrage — réappliquer la valeur
@@ -240,7 +267,7 @@ setTimeout(
 );
 // Tampon de build du FRONTEND. Si « UI » diverge de la version Rust (app_version),
 // c'est que la WebView sert un ancien frontend en cache (et non le code compilé).
-const UI_BUILD = "0.35.5";
+const UI_BUILD = "0.36.0";
 invoke("app_version")
   .then((v) => {
     $("#appVer").textContent = v + " · UI " + UI_BUILD;
@@ -259,6 +286,30 @@ invoke("get_download_dir")
   pushFriendsToBackend();
   invoke("set_only_friends", { on }).catch(() => {});
 })();
+// Chromium peut créer un AudioContext « suspended » tant qu'aucun geste utilisateur n'a eu
+// lieu, et l'app ne joue par ailleurs AUCUN son via la WebView (tout passe par cpal côté
+// Rust) : rien ne le déverrouille autrement. On le fait au premier clic réel, une fois.
+document.addEventListener("click", () => unlockAudio(), { once: true, capture: true });
+// Focus de la fenêtre : pilote les pastilles (un message reçu fenêtre au premier plan ET
+// conversation ouverte ne doit rien marquer). Reprendre le focus est AUSSI un point
+// d'effacement : sans lui, un message arrivé fenêtre floue sur le groupe DÉJÀ ouvert
+// laisserait une pastille que l'utilisateur ne pourrait effacer qu'en naviguant ailleurs
+// puis en revenant — alors qu'il est justement en train de le lire.
+listen("tauri://focus", () => {
+  S.focused = true;
+  if (S.openGroupId && S.unread[S.openGroupId]) {
+    delete S.unread[S.openGroupId];
+    renderGroups();
+  }
+  const sess = document.querySelector('[data-view="session"]');
+  if (sess && !sess.classList.contains("view-hidden") && S.unread1to1) {
+    S.unread1to1 = 0;
+    paintConvoUnread();
+  }
+});
+listen("tauri://blur", () => {
+  S.focused = false;
+});
 setTimeout(() => checkUpdate(true), 5000);
 setTimeout(refreshPresence, 3000);
 setInterval(refreshPresence, 60000); // BUG-4 : 30 s → 60 s (moins de tempête de connexions)

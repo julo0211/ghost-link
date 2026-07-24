@@ -1,7 +1,7 @@
 // Groupes : channel multi-pairs (chat), appel de groupe (audio), vidéo (WebRTC), fichiers.
 
 import { invoke, listen } from "./tauri.js";
-import { $, log, fmt, addImgBubble, clearImgBlobs } from "./dom.js";
+import { $, log, fmt, addImgBubble, clearImgBlobs, clampLabel, playPing } from "./dom.js";
 import {
   S,
   PINV,
@@ -13,11 +13,16 @@ import {
   loadFriends,
   friendsOnly,
   memberName,
+  isDeclaredLabel,
+  saveGains,
+  saveSGains,
   myName,
   type Group,
   type PInvItem,
 } from "./state.js";
 import { showTab } from "./session.js";
+// Pas de cycle : friends.ts n'importe que tauri/dom/state/session, jamais groups.ts.
+import { startAliasEdit } from "./friends.js";
 
 // ----- Invitations en attente (BUG-1 : fiables, ré-envoyées à la reconnexion) -----
 function loadPInv(): PInvItem[] {
@@ -68,6 +73,10 @@ function addDeclined(id: string): void {
   }
 }
 
+// Groupes pour lesquels un bip d'invitation a déjà été joué (dédup du SON uniquement, en
+// mémoire — cf. le listener ghost-ginvite pour la raison de ne pas persister).
+const invPinged = new Set<string>();
+
 // ----- Rendu des groupes / membres -----
 function updateGroupLine(g: Group): void {
   const total = g.members.length + 1;
@@ -77,6 +86,9 @@ function updateGroupLine(g: Group): void {
 function renderGroupMembers(g: Group): void {
   const box = $("#groupMembers");
   if (!box || !g) return;
+  // Une saisie de surnom en cours ne doit pas être détruite par un re-rendu déclenché par
+  // un simple changement de présence (refreshGroupCounts ← ghost-mesh-up/down).
+  if (S.editingAlias) return;
   box.innerHTML = "";
   const callActive = S.inGroupCall && S.groupCallId === g.id;
   const chip = (code: string, label: string, online: boolean, self: boolean): HTMLElement => {
@@ -95,6 +107,23 @@ function renderGroupMembers(g: Group): void {
     c.appendChild(d);
     c.appendChild(t);
     if (!self) {
+      // Renommage local. C'est le SEUL chemin pour étiqueter un membre de groupe qui n'est
+      // pas un ami — or ce sont précisément les gens qu'on veut le plus étiqueter, puisque
+      // leur nom affiché est auto-déclaré (ou un code brut s'ils sont arrivés par
+      // convergence de roster).
+      const ren = document.createElement("button");
+      ren.className = "memkick";
+      ren.type = "button";
+      ren.textContent = "✏️";
+      ren.title = "Renommer (surnom local)";
+      ren.onclick = (e: MouseEvent) => {
+        e.stopPropagation();
+        startAliasEdit(t, code, () => {
+          const gg = loadGroups().find((x) => x.id === S.openGroupId);
+          if (gg) renderGroupMembers(gg);
+        });
+      };
+      c.appendChild(ren);
       // Vote d'exclusion (60 % des en-ligne). Discret, apparaît au survol du chip.
       const kick = document.createElement("button");
       kick.className = "memkick";
@@ -124,6 +153,10 @@ function renderGroupMembers(g: Group): void {
         pct.textContent = r.value + "%";
         invoke("group_call_volume", { peer: code, vol: +r.value / 100 }).catch(() => {});
       };
+      // L'invoke reste sur `input` (réactivité du curseur) ; seule l'ÉCRITURE DISQUE passe
+      // sur `change` — un curseur 0..200 au pas de 5 produirait sinon jusqu'à 40 écritures
+      // synchrones dans localStorage par glissement.
+      r.onchange = () => saveGains();
       c.appendChild(r);
       c.appendChild(pct);
     }
@@ -178,7 +211,7 @@ export function renderGroupFriends(): void {
     cb.style.cssText = "width:auto;flex:0 0 auto";
     const sp = document.createElement("span");
     sp.style.fontSize = "13.5px";
-    sp.textContent = f.name + (f.mutual ? "" : " (non mutuel)");
+    sp.textContent = memberName(f.code) + (f.mutual ? "" : " (non mutuel)");
     lab.appendChild(cb);
     lab.appendChild(sp);
     box.appendChild(lab);
@@ -333,7 +366,7 @@ function renderAddMembersFriends(g: Group): void {
     cb.style.cssText = "width:auto;flex:0 0 auto";
     const sp = document.createElement("span");
     sp.style.fontSize = "13px";
-    sp.textContent = f.name;
+    sp.textContent = memberName(f.code);
     lab.appendChild(cb);
     lab.appendChild(sp);
     box.appendChild(lab);
@@ -389,6 +422,16 @@ export function renderGroups(): void {
     nm.className = "grow";
     nm.textContent = g.name;
     nm.title = g.members.length + 1 + " membres · " + onl + " en ligne";
+    // Pastille de non-lu LUE DEPUIS S à chaque rendu (cf. pushGroupMsg) : c'est ce qui la
+    // fait survivre au re-rendu déclenché par un changement de présence.
+    const un = S.unread[g.id] || 0;
+    if (un) {
+      d.classList.add("has-unread");
+      const bg = document.createElement("span");
+      bg.className = "badge unread";
+      bg.textContent = un > 99 ? "99+" : String(un);
+      nm.appendChild(bg);
+    }
     const del = document.createElement("button");
     del.className = "iconx";
     del.textContent = "✕";
@@ -421,6 +464,8 @@ function openGroup(id: string, skipDial?: boolean): void {
   const g = loadGroups().find((x) => x.id === id);
   if (!g) return;
   S.openGroupId = id;
+  // Uniquement CE groupe. renderGroups() plus bas fait disparaître la pastille.
+  delete S.unread[id];
   $("#groupChannelName").textContent = "👪 " + g.name;
   updateGroupLine(g);
   renderGroupMembers(g);
@@ -443,15 +488,23 @@ function closeGroup(): void {
 }
 
 // ----- Chat de groupe -----
-function addGroupMsgDom(author: string, text: string, who: string): void {
+function addGroupMsgDom(author: string, text: string, who: string, from?: string): void {
   const box = $("#groupChatLog");
   const m = document.createElement("div");
   m.className = "msg " + (who === "me" ? "me" : "them");
-  if (who !== "me" && author) {
-    const au = document.createElement("div");
-    au.style.cssText = "font-size:11px;font-weight:700;opacity:.8;margin-bottom:2px";
-    au.textContent = author;
-    m.appendChild(au);
+  if (who !== "me") {
+    // Résolution AU RENDU (et non à la réception) : c'est ce qui rend un renommage
+    // rétroactif quand le tampon est rejoué en changeant de groupe. `author` (nom
+    // auto-déclaré par le pair) devient un ÉCHELON de l'échelle, pas la source.
+    const label = from ? memberName(from, author) : clampLabel(author) || "?";
+    if (label) {
+      const au = document.createElement("div");
+      au.className = "auth" + (from && isDeclaredLabel(from, author) ? " unverified" : "");
+      au.style.cssText = "font-size:11px;font-weight:700;opacity:.8;margin-bottom:2px";
+      if (from) au.dataset.from = from; // cible du ré-étiquetage en place (relabelPeer)
+      au.textContent = label;
+      m.appendChild(au);
+    }
   }
   const b = document.createElement("div");
   b.textContent = text;
@@ -463,14 +516,30 @@ function renderGroupMsgs(): void {
   const box = $("#groupChatLog");
   // Libérer les blob: des images encore affichées AVANT de vider (cf. clearImgBlobs) :
   // les révoquer plus tôt casserait la visionneuse plein écran, qui recharge la même URL.
+  // ⚠️ NE JAMAIS appeler cette fonction pour rafraîchir un LIBELLÉ : elle détruit toutes
+  // les images affichées (elles ne sont pas dans S.groupMsgs). Utiliser relabelPeer.
   clearImgBlobs(box);
   box.innerHTML = "";
-  (S.groupMsgs[S.openGroupId || ""] || []).forEach((m) => addGroupMsgDom(m.author, m.text, m.who));
+  (S.groupMsgs[S.openGroupId || ""] || []).forEach((m) => addGroupMsgDom(m.author, m.text, m.who, m.from));
 }
-function pushGroupMsg(id: string, author: string, text: string, who: string): void {
-  (S.groupMsgs[id] = S.groupMsgs[id] || []).push({ author, text, who });
+function pushGroupMsg(id: string, author: string, text: string, who: string, from?: string): void {
+  (S.groupMsgs[id] = S.groupMsgs[id] || []).push({ author, from, text, who });
   if (S.groupMsgs[id].length > 200) S.groupMsgs[id].shift();
-  if (S.openGroupId === id) addGroupMsgDom(author, text, who);
+  if (S.openGroupId === id) addGroupMsgDom(author, text, who, from);
+  // `who !== "me"` est OBLIGATOIRE : pushGroupMsg est AUSSI le chemin de MES propres
+  // messages sortants (sendGroupMsg passe who = "me"). Sans ce terme, mon propre message
+  // incrémenterait ma propre pastille dès que la fenêtre a perdu le focus — un invariant
+  // qui dépendrait d'une coïncidence plutôt que d'une intention.
+  if (who === "me") return;
+  // Muet pendant un appel de groupe : un bip dans le casque est pire que rien.
+  if (!S.inGroupCall) playPing("msg");
+  // Le compteur vit dans S, JAMAIS dans le DOM : renderGroups vide #groupList en innerHTML
+  // et refreshGroupCounts le re-rend à chaque ghost-mesh-up/down — une pastille peinte dans
+  // le DOM disparaîtrait au premier changement de présence.
+  if (S.openGroupId !== id || !S.focused) {
+    S.unread[id] = (S.unread[id] || 0) + 1;
+    renderGroups();
+  }
 }
 function sendGroupMsg(): void {
   if (!S.openGroupId) return;
@@ -557,6 +626,20 @@ async function startGroupCall(g: Group, announce: boolean): Promise<void> {
   $<HTMLButtonElement>("#btnGroupCall").disabled = true;
   try {
     await invoke("group_call_start", { members: g.members, gid: g.id, announce });
+    // Re-pousser les gains de voix PERSISTÉS. GroupCall::start vide la map du mixeur
+    // (p.clear()) et receive_group_voice recrée chaque entrée à 1.0 via or_insert : sans
+    // ce re-push, régler un pair à 130 % puis raccrocher/rejoindre laisse le CURSEUR à
+    // 130 % pendant que le BACKEND est revenu à 1.0 (bug préexistant à ce lot).
+    // APRÈS le await, jamais avant — la commande attend le démarrage bloquant, donc à la
+    // résolution de la promesse le clear() a eu lieu ; pousser plus tôt serait effacé.
+    // Cibles = membres du groupe PRÉSENTS DANS LE MAILLAGE, c'est-à-dire exactement
+    // l'ensemble que net::group_conns construit côté Rust et pour lequel une tâche de
+    // réception est lancée. Ne PAS filtrer sur S.voiceAct : il est vide à cet instant (il
+    // n'est alimenté qu'après le premier CALL_PING ~1 Hz), le re-push ne pousserait rien.
+    // Best-effort (leçon #1) : un échec laisse le son à 100 %, ne bloque rien.
+    g.members
+      .filter((c) => S.meshOnline.has(c) && (S.groupGains[c] ?? 100) !== 100)
+      .forEach((c) => invoke("group_call_volume", { peer: c, vol: (S.groupGains[c] ?? 100) / 100 }).catch(() => {}));
     S.inGroupCall = true;
     S.groupCallId = g.id;
     S.groupMuted = false;
@@ -736,6 +819,10 @@ function attachStreamAudio(w: HTMLElement, peer: string, video?: HTMLVideoElemen
       (r as HTMLInputElement).value = String(v);
     });
   };
+  // Même raison que le curseur de voix : persister sur `change`, pas sur `input`.
+  // Le bouton 🔇 n'écrit RIEN : le mute n'est délibérément pas persisté (il est invisible
+  // hors survol, un mute durable serait un pair muet sans cause visible à l'écran).
+  vol.onchange = () => saveSGains();
   w.appendChild(vol);
   // Ré-affirmer l'état au backend : après une reconnexion, receive_group_voice a pu
   // réinitialiser le gain à 1.0 — sans ça, l'icône dirait 🔇 mais le son jouerait.
@@ -787,6 +874,24 @@ function dropPeerTiles(peer: string): void {
   });
   maybeHideGrid();
 }
+/** Met à jour l'étiquette des vignettes DÉJÀ créées d'un pair. showTile et showCanvasTile
+ *  n'écrivent le libellé que dans leur branche de création : sans cette passe, renommer
+ *  quelqu'un pendant un appel laisse l'ancien nom affiché sur sa vignette jusqu'à ce
+ *  qu'elle soit recréée — le genre de résultat à moitié appliqué qui se lit comme un bug.
+ *  Les vignettes « moi » ne sont pas concernées (clés moi_cam / moi_screen / moi_natscr,
+ *  hors du préfixe `vidw_<code>_`). */
+function relabelPeerTiles(peer: string): void {
+  if (!peer) return;
+  document.querySelectorAll<HTMLElement>('[id^="vidw_' + peer + '_"]').forEach((w) => {
+    // Ordre d'insertion dans showTile/showCanvasTile : [<video|canvas>, <div étiquette>, …]
+    const tag = w.children[1] as HTMLElement | undefined;
+    if (!tag || tag.tagName !== "DIV") return;
+    // Formats repris mot pour mot des appelants : memberName(peer) pour la vignette WebRTC,
+    // memberName(peer) + " (écran)" pour le partage natif.
+    tag.textContent = memberName(peer) + (w.id.endsWith(NATIVE_KEY) ? " (écran)" : "");
+  });
+}
+
 function sigSend(peer: string, payload: unknown): void {
   invoke("send_signal", { peer, data: JSON.stringify(payload) }).catch(() => {});
 }
@@ -2024,13 +2129,25 @@ export function initGroups(): void {
   };
 
   // Réessai doux des invitations encore en attente (membres hors ligne à la création).
+  // DURCISSEMENT : retirer l'entrée APRÈS un envoi réussi, comme le fait déjà flushPInv.
+  // Avant, l'entrée n'était purgée qu'au ghost-mesh-up — qui ne refire JAMAIS pour un pair
+  // resté continuellement en ligne : l'invitation était donc ré-émise toutes les 60 s
+  // indéfiniment, et le listener du receveur ré-exécuté à chaque fois. Inoffensif tant que
+  // rien n'y était branché ; une alarme par minute dès qu'un son l'est.
   setInterval(() => {
     const p = loadPInv();
     if (!p.length) return;
     p.forEach((x) =>
-      invoke("send_ginvite", { member: x.member, gid: x.gid, name: x.name, members: x.csv }).catch(() => {}),
+      invoke("send_ginvite", { member: x.member, gid: x.gid, name: x.name, members: x.csv })
+        .then(() => savePInv(loadPInv().filter((y) => !(y.member === x.member && y.gid === x.gid))))
+        .catch(() => {}),
     );
   }, 60000);
+
+  // Ré-étiquetage des vignettes vivantes après un renommage. Passe par un événement DOM
+  // parce que state.ts (où vit relabelPeer) ne peut pas importer groups.ts — ce serait un
+  // cycle d'imports, et state.ts est la base du graphe.
+  document.addEventListener("gl-relabel", (e) => relabelPeerTiles((e as CustomEvent).detail as string));
 
   // Listeners groupes
   listen("ghost-mesh-up", (e) => {
@@ -2075,9 +2192,19 @@ export function initGroups(): void {
     refreshGroupCounts();
   });
   listen("ghost-gchat", (e) => {
-    const p = e.payload || ({} as { group?: string; author?: string; text?: string });
-    if (!loadGroups().some((x) => x.id === p.group)) return;
-    pushGroupMsg(p.group as string, p.author || "?", p.text || "", "them");
+    // Le cast en ligne doit lui aussi porter `from`, sinon `p.from` est une erreur de type
+    // sur l'union (la déclaration dans tauri.ts ne suffit pas à elle seule).
+    const p = e.payload || ({} as { group?: string; author?: string; text?: string; from?: string });
+    const g = loadGroups().find((x) => x.id === p.group);
+    if (!g) return;
+    // DURCISSEMENT : n'accepter un message que d'un membre CONNU du groupe — le même
+    // contrôle que ghost-gmembers et ghost-kick appliquent déjà. Sans lui, un membre exclu
+    // par vote continue d'écrire : applyKick ne touche pas Settings.friends, donc le mesh
+    // l'accepte toujours. Il ferait sonner et incrémenterait la pastille de non-lu.
+    // La garde `p.from &&` est volontaire : si l'émission de `from` changeait, mieux vaut
+    // afficher un message non attribué que perdre tout le chat.
+    if (p.from && !g.members.includes(p.from) && p.from !== S.myCode) return;
+    pushGroupMsg(p.group as string, p.author || "", p.text || "", "them", p.from);
   });
   listen("ghost-gchat-img", (e) => {
     const p = e.payload || ({} as { group?: string; author?: string; mime?: string; dataB64?: string });
@@ -2086,8 +2213,22 @@ export function initGroups(): void {
     // dans S.groupMsgs (pas d'historique par groupe) : on ne rend que si CE
     // groupe est actuellement ouvert, sinon l'image apparaîtrait à tort dans
     // le #groupChatLog d'un autre groupe actif à l'écran.
-    if (S.openGroupId !== p.group) return;
-    addImgBubble($("#groupChatLog"), `data:${p.mime};base64,${p.dataB64}`, "them", p.author);
+    // Ne RIEN compter serait un mensonge par omission (une image envoyée seule ne
+    // notifierait jamais) ; compter sans trace donnerait une pastille qui s'ouvre sur
+    // rien. On pousse donc une ligne de remplacement dans le tampon — ce qui rend au
+    // passage visible une perte de données qui existe déjà aujourd'hui.
+    if (S.openGroupId !== p.group) {
+      pushGroupMsg(p.group, p.author || "", "🖼️ a envoyé une image (non conservée)", "them", p.from);
+      return;
+    }
+    addImgBubble(
+      $("#groupChatLog"),
+      `data:${p.mime};base64,${p.dataB64}`,
+      "them",
+      p.from ? memberName(p.from, p.author) : clampLabel(p.author),
+      p.from,
+      !!(p.from && isDeclaredLabel(p.from, p.author)),
+    );
   });
   listen("ghost-ginvite", (e) => {
     const p = e.payload || ({} as { id?: string; name?: string; members?: string });
@@ -2101,6 +2242,15 @@ export function initGroups(): void {
     S.pendingInvite = { id: p.id as string, name: p.name || "Groupe", full };
     $("#groupInviteText").textContent =
       '👪 Invitation au groupe « ' + (p.name || "?") + " » (" + full.length + " membres).";
+    // Ne sonner qu'UNE fois par groupe et par session. Dédup volontairement EN MÉMOIRE et
+    // non persistée : la bannière, elle, doit rester ré-affichable après un redémarrage
+    // (S.pendingInvite est perdu au démarrage), sinon une invitation non traitée serait
+    // définitivement injoignable. Le remartelage lui-même est corrigé côté ÉMETTEUR (la
+    // boucle de réessai purge maintenant après un envoi réussi).
+    if (p.id && !invPinged.has(p.id)) {
+      invPinged.add(p.id);
+      playPing("req");
+    }
     $("#groupInviteBanner").classList.remove("hidden");
   });
   // Sync de roster : union des MEMBRES reçus (jamais de tombstones sur le fil) — puis
@@ -2200,6 +2350,7 @@ export function initGroups(): void {
     if (!g) return;
     S.pendingGCall = g.id;
     $("#gcallText").textContent = '📞 Appel dans le groupe « ' + g.name + " » — rejoindre ?";
+    playPing("call");
     $("#gcallBanner").classList.remove("hidden");
   });
   listen("ghost-signal", async (e) => {

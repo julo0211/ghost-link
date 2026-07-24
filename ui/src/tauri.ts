@@ -140,7 +140,9 @@ export interface Events {
 
   "ghost-mesh-up": string;
   "ghost-mesh-down": string;
-  "ghost-gchat": { group: string; author?: string; text?: string };
+  // `from` = remote_id AUTHENTIFIÉ, émis par net.rs depuis toujours sur ghost-gchat —
+  // seule l'omission de ce type empêchait l'UI de le lire. Rien ne change sur le fil.
+  "ghost-gchat": { group: string; author?: string; text?: string; from?: string };
   "ghost-gchat-img": { group: string; author?: string; name?: string; mime: string; dataB64: string; from?: string };
   "ghost-ginvite": { id: string; name?: string; members?: string };
   "ghost-gmembers": { group: string; name?: string; members?: string; from?: string };
@@ -168,6 +170,11 @@ export interface Events {
     w: number;
     h: number;
   };
+
+  // Focus de la fenêtre : déjà autorisé par les capabilities actuelles (core:event:default
+  // accorde allow-listen, cf. les 4 événements de glisser-déposer ci-dessous).
+  "tauri://focus": unknown;
+  "tauri://blur": unknown;
 
   "tauri://drag-enter": unknown;
   "tauri://drag-over": unknown;

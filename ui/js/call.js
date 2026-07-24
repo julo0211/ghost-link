@@ -1,7 +1,12 @@
 // Vocal 1-à-1 : test micro local + appel duplex (datagrammes iroh) + périphériques audio.
 import { invoke, listen } from "./tauri.js";
-import { $, log } from "./dom.js";
+import { $, log, playPing } from "./dom.js";
 import { S } from "./state.js";
+// Sonnerie répétée de l'appel entrant. Un ping unique à t=0 n'améliorerait presque rien :
+// la bannière d'offre s'auto-annule après 30 s, et si l'utilisateur n'est pas devant
+// l'écran il l'aura manquée en silence — c'est précisément le problème que ce timbre existe
+// pour résoudre. Nettoyée par hideCallOffer, seul chemin de fermeture de la bannière.
+let ringTimer = 0;
 export function setCallUI(on) {
     S.inCall = on;
     const b = $("#btnCall");
@@ -24,6 +29,10 @@ export function hideCallOffer() {
     if (S.callOfferTimer) {
         clearTimeout(S.callOfferTimer);
         S.callOfferTimer = null;
+    }
+    if (ringTimer) {
+        clearInterval(ringTimer);
+        ringTimer = 0;
     }
 }
 function fillSel(sel, items, chosen) {
@@ -128,6 +137,17 @@ export function initCall() {
         if (S.inCall)
             return;
         $("#callOfferBanner").classList.remove("hidden");
+        playPing("call");
+        if (ringTimer)
+            clearInterval(ringTimer);
+        ringTimer = window.setInterval(() => {
+            if ($("#callOfferBanner").classList.contains("hidden")) {
+                clearInterval(ringTimer);
+                ringTimer = 0;
+                return;
+            }
+            playPing("call");
+        }, 5000);
         if (S.callOfferTimer)
             clearTimeout(S.callOfferTimer);
         S.callOfferTimer = setTimeout(() => {

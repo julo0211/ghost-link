@@ -1,11 +1,37 @@
 // Connexion / session 1-à-1 + demande de connexion entrante + onglets.
 
 import { invoke, listen } from "./tauri.js";
-import { $, log, shortId, clearImgBlobs } from "./dom.js";
-import { S, loadFriends } from "./state.js";
+import { $, log, shortId, clearImgBlobs, playPing } from "./dom.js";
+import { S, loadFriends, memberName, ensureFpLabel } from "./state.js";
 import { setCallUI, hideCallOffer } from "./call.js";
 
+/** Peint (ou retire) la pastille de non-lu sur l'item de conversation du rail, EN PLACE :
+ *  l'item est reconstruit par setConnected, on ne va pas le refaire à chaque message. */
+export function paintConvoUnread(): void {
+  const grow = document.querySelector("#railConvo .item .grow");
+  if (!grow) return;
+  grow.querySelector(".badge.unread")?.remove();
+  const item = grow.closest(".item");
+  if (!S.unread1to1) {
+    item?.classList.remove("has-unread");
+    return;
+  }
+  item?.classList.add("has-unread");
+  const bg = document.createElement("span");
+  bg.className = "badge unread";
+  bg.textContent = S.unread1to1 > 99 ? "99+" : String(S.unread1to1);
+  grow.appendChild(bg);
+}
+
 export function showTab(name: string): void {
+  // Portée EXPLICITE : entrer dans la vue « session » efface le compteur 1-à-1, et RIEN
+  // d'autre. Les compteurs de groupe ne sont effacés que par openGroup — les vider à
+  // l'entrée d'onglet effacerait les pastilles de groupes jamais ouverts, ce qui annulerait
+  // la fonctionnalité.
+  if (name === "session" && S.unread1to1) {
+    S.unread1to1 = 0;
+    paintConvoUnread();
+  }
   document
     .querySelectorAll<HTMLElement>("[data-view]")
     .forEach((el) => el.classList.toggle("view-hidden", el.getAttribute("data-view") !== name));
@@ -35,8 +61,8 @@ export async function connectTo(addr: string): Promise<void> {
 function setConnected(peer: string): void {
   S.currentPeer = peer;
   $("#connStatus").className = "conn s-ok";
-  ($("#connStatus").querySelector(".conn-text") as HTMLElement).textContent = "Connecté à " + shortId(peer);
-  $("#peerLabel").textContent = "Connecté à " + shortId(peer);
+  ($("#connStatus").querySelector(".conn-text") as HTMLElement).textContent = "Connecté à " + memberName(peer);
+  $("#peerLabel").textContent = "Connecté à " + memberName(peer);
   $("#connectForm").classList.add("hidden");
   $("#sessionBox").classList.remove("hidden");
   $<HTMLButtonElement>("#btnConnect").disabled = false;
@@ -44,8 +70,8 @@ function setConnected(peer: string): void {
   showTab("session");
   const convo = document.getElementById("railConvo");
   if (convo) {
-    const fr = loadFriends().find((x) => x.code === peer);
-    const label = fr ? fr.name : shortId(peer);
+    const fr = loadFriends().find((x) => x.code === peer); // encore utilisé pour le tag TEMP
+    const label = memberName(peer);
     convo.innerHTML = "";
     const it = document.createElement("div");
     it.className = "item active";
@@ -59,6 +85,7 @@ function setConnected(peer: string): void {
     }
     it.onclick = () => showTab("session");
     convo.appendChild(it);
+    paintConvoUnread(); // un compteur peut déjà courir (message reçu avant l'affichage)
   }
 }
 function setDisconnected(): void {
@@ -96,25 +123,24 @@ export function initSession(): void {
   $("#btnDisconnect").onclick = () => invoke("disconnect").catch((e) => log("Déconnexion : " + e));
 
   // Demande de connexion entrante (accepter / refuser)
-  listen("ghost-incoming", async (e) => {
+  listen("ghost-incoming", (e) => {
     const p = e.payload || ({} as { id?: number; peer?: string });
     S.incomingId = p.id ?? null;
-    let label = "";
-    const f = loadFriends().find((x) => x.code === p.peer);
-    if (f) {
-      label = f.name;
-    } else {
-      label = S.fpCache[p.peer || ""];
-      if (!label) {
-        try {
-          label = await invoke("fingerprint", { code: p.peer || "" });
-          S.fpCache[p.peer || ""] = label;
-        } catch {
-          label = shortId(p.peer || "");
-        }
-      }
-    }
-    $("#incomingText").textContent = label + " veut se connecter à toi.";
+    // Premier barreau PROPRE à ce site : le nom d'ami. Cet événement ne porte AUCUN nom
+    // déclaré (payload = { id, peer }). Les barreaux bas sont dans ensureFpLabel.
+    const code = p.peer || "";
+    const paint = (): void => {
+      $("#incomingText").textContent = memberName(code) + " veut se connecter à toi.";
+    };
+    paint();
+    void ensureFpLabel(code, paint);
+    // DURCISSEMENT : ne SONNER que si le pair est un ami. ghost-incoming est émis avant
+    // toute AUTORISATION applicative — le pair est bien authentifié cryptographiquement
+    // (remote_id), mais le filtre « amis uniquement » est DÉSACTIVÉ par défaut et
+    // l'anti-flood de 2 s est indexé sur l'identité, donc contournable en faisant tourner
+    // ses clés (c'est gratuit). Sans ce filtre, un inconnu peut mitrailler le haut-parleur.
+    // La BANNIÈRE, elle, ne change pas de comportement.
+    if (loadFriends().some((x) => x.code === code)) playPing("req");
     $("#incomingBanner").classList.remove("hidden");
   });
   $("#btnAccept").onclick = () => {
@@ -144,12 +170,13 @@ export function initSession(): void {
   });
 
   listen("ghost-connected", (e) => {
-    log("🔗 Connecté à : " + e.payload);
+    // Avant : imprimait le code brut COMPLET dans le journal.
+    log("🔗 Connecté à : " + memberName(e.payload));
     setConnected(e.payload);
   });
   listen("ghost-disconnected", () => {
     log("Déconnecté.");
     setDisconnected();
   });
-  listen("ghost-refused", (e) => log("⛔ Connexion refusée (pair pas dans tes amis) : " + shortId(e.payload)));
+  listen("ghost-refused", (e) => log("⛔ Connexion refusée (pair pas dans tes amis) : " + memberName(e.payload)));
 }

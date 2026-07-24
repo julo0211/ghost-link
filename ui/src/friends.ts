@@ -1,9 +1,66 @@
 // Carnet d'amis : rendu, présence, empreintes, demandes d'ami mutuelles.
 
 import { invoke, listen } from "./tauri.js";
-import { $, log, shortId } from "./dom.js";
-import { S, loadFriends, saveFriends, pushFriendsToBackend, myName } from "./state.js";
+import { $, log, shortId, playPing } from "./dom.js";
+import {
+  S,
+  loadFriends,
+  saveFriends,
+  pushFriendsToBackend,
+  myName,
+  memberName,
+  ensureFpLabel,
+  loadAliases,
+  setAlias,
+  relabelPeer,
+} from "./state.js";
 import { showTab } from "./session.js";
+
+/** Édition EN LIGNE d'un surnom local : le libellé devient un <input>. Entrée valide,
+ *  Échap annule, la perte de focus valide.
+ *  S.editingAlias porte le code en cours d'édition : la puce de membre de groupe vit dans
+ *  #groupMembers, que refreshGroupCounts re-rend à CHAQUE changement de présence — sans cet
+ *  état hors du DOM, un ami qui se connecte détruirait la saisie en cours. */
+export function startAliasEdit(host: HTMLElement, code: string, after: () => void): void {
+  if (host.querySelector("input")) return;
+  S.editingAlias = code;
+  const inp = document.createElement("input");
+  inp.className = "aliasedit";
+  inp.value = loadAliases()[code] || "";
+  // Indice = le libellé RÉSOLU, et non host.textContent : ce dernier embarque le contenu
+  // des enfants (la pastille « ✓ » d'ami mutuel, par exemple).
+  inp.placeholder = memberName(code);
+  host.textContent = "";
+  host.appendChild(inp);
+  inp.focus();
+  inp.select();
+  let done = false;
+  const finish = (commit: boolean): void => {
+    if (done) return;
+    done = true;
+    S.editingAlias = null;
+    if (commit) {
+      setAlias(code, inp.value);
+      // Ré-étiquetage EN PLACE de tout ce qui est déjà à l'écran (messages, bulles image,
+      // vignettes vidéo). Surtout PAS un re-rendu des journaux de chat : cela détruirait
+      // les images affichées.
+      relabelPeer(code);
+    }
+    after();
+  };
+  inp.onclick = (e: MouseEvent) => e.stopPropagation();
+  inp.onblur = () => finish(true);
+  inp.onkeydown = (e: KeyboardEvent) => {
+    e.stopPropagation(); // ne pas laisser Échap fermer la visionneuse d'image
+    if (e.key === "Enter") {
+      e.preventDefault();
+      finish(true);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      finish(false);
+    }
+  };
+}
 
 export function renderFriends(): void {
   const a = loadFriends();
@@ -25,9 +82,11 @@ export function renderFriends(): void {
       pcls +
       '" title="' +
       ptitle +
-      '"></span><span class="grow"></span><button class="iconx" title="Retirer">✕</button>';
+      '"></span><span class="grow"></span><button class="iconx" data-act="ren" title="Renommer (surnom local)">✏️</button><button class="iconx" data-act="del" title="Retirer">✕</button>';
     const nm = d.querySelector(".grow") as HTMLElement;
-    nm.textContent = f.name;
+    // memberName : surnom local d'abord, puis le nom enregistré. Ne PAS lire f.name
+    // directement — le surnom serait invisible ici.
+    nm.textContent = memberName(f.code);
     nm.title = S.fpCache[f.code] || shortId(f.code);
     if (f.mutual) {
       const bg = document.createElement("span");
@@ -43,11 +102,18 @@ export function renderFriends(): void {
       const inp = $<HTMLInputElement>("#peerAddr");
       inp.value = f.code;
       inp.focus();
-      log("Prêt à te connecter à « " + f.name + " » — clique sur « 🔌 Se connecter ».");
+      log("Prêt à te connecter à « " + memberName(f.code) + " » — clique sur « 🔌 Se connecter ».");
     };
-    (d.querySelector("button") as HTMLElement).onclick = (e: MouseEvent) => {
+    (d.querySelector('[data-act="del"]') as HTMLElement).onclick = (e: MouseEvent) => {
       e.stopPropagation();
       removeFriend(f.code);
+    };
+    // Le surnom vit dans une carte SÉPARÉE (ghostlink_aliases), pas dans Friend.name :
+    // il doit survivre à removeFriend, à un kick, et au fait que saveMutual laisse un pair
+    // écraser le nom stocké localement.
+    (d.querySelector('[data-act="ren"]') as HTMLElement).onclick = (e: MouseEvent) => {
+      e.stopPropagation();
+      startAliasEdit(nm, f.code, () => renderFriends());
     };
     box.appendChild(d);
   });
@@ -195,24 +261,22 @@ export function initFriends(): void {
       log("Demande : " + e);
     }
   };
-  listen("ghost-freq", async (e) => {
+  listen("ghost-freq", (e) => {
     if (!S.currentPeer) return;
     S.pendingFreqName = e.payload && e.payload.name ? e.payload.name : "";
     // Enregistrer le code PERMANENT de l'autre (pas l'éphémère de la connexion).
     S.pendingFreqCode = e.payload && e.payload.code ? e.payload.code : S.currentPeer;
-    let label = S.pendingFreqName.trim();
-    if (!label) {
-      label = S.fpCache[S.pendingFreqCode];
-      if (!label) {
-        try {
-          label = await invoke("fingerprint", { code: S.pendingFreqCode });
-          S.fpCache[S.pendingFreqCode] = label;
-        } catch {
-          label = shortId(S.pendingFreqCode);
-        }
-      }
-    }
-    $("#freqText").textContent = label + " veut t'ajouter en ami.";
+    // Premier barreau PROPRE à ce site : le nom DÉCLARÉ porté par la demande. Les barreaux
+    // bas (empreinte → code court) sont factorisés dans memberName/ensureFpLabel — les deux
+    // échelles inline (ici et session.ts) ne partageaient QUE ces barreaux-là.
+    const paint = (): void => {
+      $("#freqText").textContent = memberName(S.pendingFreqCode, S.pendingFreqName) + " veut t'ajouter en ami.";
+    };
+    paint();
+    void ensureFpLabel(S.pendingFreqCode, paint);
+    // Une demande d'ami n'arrive que sur une session déjà établie et acceptée : pas besoin
+    // du filtre « ami » appliqué à ghost-incoming.
+    playPing("req");
     $("#freqBanner").classList.remove("hidden");
   });
   $("#btnFreqAccept").onclick = async () => {
