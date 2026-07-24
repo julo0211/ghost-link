@@ -1374,9 +1374,13 @@ const nativeTomb: Record<string, number> = {};
 // d'essayer jusqu'à une VRAIE relance (bit newSession ou signal start) — sinon la
 // pierre tombale expirerait et le cycle vignette noire → fermeture repartirait.
 const nativeBroken = new Set<string>();
-// Item 5 : gid du partage natif ANNONCÉ par chaque pair — n'afficher sa vignette que si
-// ce gid == le groupe de MON appel courant (un partage destiné à A ne fuit pas dans B).
-const nativeShareGid: Record<string, string> = {};
+// (Il exista ici une table peer→gid du partage ANNONCÉ, qui conditionnait l'affichage des
+// trames à la réception préalable du signal de début. Retirée : un signal manqué rendait le
+// partage définitivement invisible. Le confinement inter-groupes repose désormais sur
+// `nativePeerAllowed` — être dans l'appel du groupe dont l'émetteur est membre — comme
+// avant la v0.34. Le gid reste envoyé dans le signal : un futur durcissement pourra s'en
+// servir, mais seulement en REJET explicite d'un gid connu-différent, jamais en exigeant sa
+// présence, et il devra être testé à 2 pairs avant d'être livré.)
 // Membres et groupe du partage natif ÉMIS en cours : le signal d'arrêt doit aller
 // aux destinataires du partage, pas aux membres du groupe actuellement OUVERT.
 let nativeShareMembers: string[] | null = null;
@@ -1401,15 +1405,16 @@ function nativePeerAllowed(peer: string): boolean {
 }
 
 /// Codec WebCodecs selon la résolution annoncée (H.264 Main ; niveau ≥ résolution).
-// Le NIVEAU H.264 dépend de la résolution ET de la cadence : Main 3.1 ne couvre que du
-// 720p30. Depuis que la downscale existe, un 720p60 est possible — l'annoncer en 3.1 ferait
-// échouer decoder.configure() et la vignette resterait NOIRE pour toujours. On monte donc
-// d'un cran dès 50 fps. (Le décodeur lit de toute façon le vrai niveau dans le SPS.)
-function nativeCodecOf(w: number, h: number, fps: number): string {
+/// Codec WebCodecs selon la résolution annoncée (H.264 Main ; niveau ≥ résolution).
+/// RETOUR EN ARRIÈRE ASSUMÉ : une variante « niveau relevé si fps ≥ 50 » (3.2 / 4.2) avait
+/// été introduite pour être formellement exacte en 60 fps. Ces chaînes n'ont jamais été
+/// validées sur un vrai décodeur, alors que celles-ci ont fonctionné en production — et un
+/// codec refusé fait échouer decoder.configure(), donc vignette NOIRE. Le décodeur lit de
+/// toute façon le niveau réel dans le SPS du flux ; cette chaîne n'est qu'une indication.
+function nativeCodecOf(w: number, h: number): string {
   const px = w * h;
-  const fast = fps >= 50;
-  if (px > 0 && px <= 1280 * 720) return fast ? "avc1.4d4020" : "avc1.4d401f"; // Main 3.2 / 3.1
-  if (px > 0 && px <= 1920 * 1080) return fast ? "avc1.4d402a" : "avc1.4d4028"; // Main 4.2 / 4.0
+  if (px > 0 && px <= 1280 * 720) return "avc1.4d401f"; // Main 3.1
+  if (px > 0 && px <= 1920 * 1080) return "avc1.4d4028"; // Main 4.0
   return "avc1.4d4033"; // Main 5.1 — couvre 1440p+ et les tailles inconnues
 }
 
@@ -1473,11 +1478,11 @@ function handleNativeFrame(raw: unknown): void {
   for (let i = 2 + pl; i < 10 + pl; i++) id = id * 256 + b[i];
   const data = b.subarray(10 + pl);
   if (typeof VideoDecoder === "undefined") return; // moteur sans WebCodecs
-  // Item 5 : une trame ne s'affiche que si on connaît le gid du partage de ce pair ET
-  // que ce gid est celui de mon appel courant. Trame arrivée avant le signal → ignorée
-  // (le signal start, envoyé au démarrage, arrive normalement en tête ; sinon on attend).
+  // Gating : être dans l'appel du groupe dont ce pair est membre. Volontairement TOLÉRANT
+  // (comportement v0.33) — une trame peut devancer le signal de début, la vignette est
+  // alors créée à la volée. Exiger le signal rendait le partage invisible dès qu'il était
+  // manqué (cf. handleNativeSignal).
   if (!nativePeerAllowed(peer)) return;
-  if (nativeShareGid[peer] !== S.groupCallId) return;
   // Images en vol après un arrêt : ne pas ressusciter la vignette (sauf vraie relance).
   if (newSession) {
     delete nativeTomb[peer];
@@ -1513,7 +1518,7 @@ function handleNativeFrame(raw: unknown): void {
       error: () => noteNativeDecodeError(peer, st),
     });
     try {
-      decoder.configure({ codec: nativeCodecOf(st.w, st.h, st.fps), optimizeForLatency: true });
+      decoder.configure({ codec: nativeCodecOf(st.w, st.h), optimizeForLatency: true });
     } catch {
       return; // codec refusé : on retentera à la prochaine clé
     }
@@ -1555,22 +1560,22 @@ function noteNativeDecodeError(peer: string, st: NativeRx): void {
 /// par la première trame du flux qui s'en charge (aucune course signal/trames).
 function handleNativeSignal(peer: string, nv: { start?: boolean; w?: number; h?: number; fps?: number; gid?: string }): void {
   if (nv.start) {
-    // Item 5 : n'accepter que si le partage vise le groupe de mon appel courant.
-    if (!nv.gid || !S.inGroupCall || S.groupCallId !== nv.gid) {
-      if (nv.gid) log("🖥️ " + memberName(peer) + " partage son écran dans un autre groupe — rejoins CET appel pour le voir.");
+    // Gating = appartenance au groupe de MON appel courant (comme les TRAMES).
+    // RETOUR EN ARRIÈRE ASSUMÉ : la v0.34 exigeait EN PLUS que le gid annoncé corresponde,
+    // et ne décodait une trame que si ce signal avait été reçu au préalable. Un signal
+    // manqué (pair pas encore en ligne au démarrage du partage, appel rejoint après,
+    // signal perdu) rendait alors le partage DÉFINITIVEMENT invisible, sans erreur —
+    // c'est le bug « plus personne ne voit le partage ». Le signal redevient un BONUS
+    // (dimensions + log), plus une condition d'affichage.
+    if (!nativePeerAllowed(peer)) {
+      log("🖥️ " + memberName(peer) + " partage son écran (natif) — rejoins l'appel du groupe pour le voir.");
       return;
     }
-    // SÉCURITÉ (#47) : n'accepter la vignette QUE si `peer` est réellement membre du groupe
-    // de l'appel — même prédicat que le filtrage des TRAMES (nativePeerAllowed). Un ami hors
-    // du groupe qui connaît le gid ne peut ainsi pas imposer une vignette « X (écran) ».
-    if (!nativePeerAllowed(peer)) return;
-    nativeShareGid[peer] = nv.gid;
     delete nativeTomb[peer];
     nativeBroken.delete(peer);
     ensureNativeRx(peer, nv.w || 0, nv.h || 0, nv.fps || 30);
     log("🖥️ " + memberName(peer) + " partage son écran (natif" + (nv.w ? " " + nv.w + "×" + nv.h : "") + ").");
   } else {
-    delete nativeShareGid[peer];
     closeNativeRx(peer);
   }
 }

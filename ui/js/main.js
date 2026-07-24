@@ -240,7 +240,7 @@ $("#setName").value = (localStorage.getItem("ghostlink_name") || "").trim();
 setTimeout(() => loadGroups().forEach((g, i) => setTimeout(() => invoke("open_group", { members: friendsOnly(g.members) }).catch(() => { }), i * 500)), 800);
 // Tampon de build du FRONTEND. Si « UI » diverge de la version Rust (app_version),
 // c'est que la WebView sert un ancien frontend en cache (et non le code compilé).
-const UI_BUILD = "0.35.4";
+const UI_BUILD = "0.35.5";
 invoke("app_version")
     .then((v) => {
     $("#appVer").textContent = v + " · UI " + UI_BUILD;

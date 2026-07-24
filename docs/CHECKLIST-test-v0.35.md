@@ -79,9 +79,14 @@
       - [ ] Si un écho persiste : es-tu en **haut-parleurs** ? (le micro peut capter les enceintes — teste
             au casque) et as-tu une **sortie audio virtuelle** (VoiceMeeter, SteelSeries Sonar, NVIDIA
             Broadcast) ? Ces deux cas ont des causes différentes : signale-le, ne relance pas le test.
-- [ ] **Confinement par groupe (v0.34 item 5)** : être co-membre de 2 groupes G1 et G2 avec un ami ;
-      partager dans G1 pendant que l'ami est dans l'appel de **G2** → il **ne voit PAS** ton écran. Il
-      rejoint l'appel de **G1** → il le voit.
+- [ ] **Confinement par groupe** : être co-membre de 2 groupes G1 et G2 avec un ami ; partager dans G1
+      pendant que l'ami est dans l'appel de **G2** → il **ne voit PAS** ton écran. Il rejoint l'appel
+      de **G1** → il le voit.
+      ⚠️ Depuis la v0.35.5 ce confinement repose uniquement sur « être dans l'appel du groupe dont
+      l'émetteur est membre » (comportement v0.33). Le verrouillage plus strict par identifiant de
+      groupe a été RETIRÉ : il rendait le partage définitivement invisible dès que son signal
+      d'annonce était manqué. Si l'ami est membre des DEUX groupes, il peut donc voir le partage
+      depuis l'appel de G2 — limite assumée, à re-durcir seulement après un vrai test à 2 pairs.
 - [ ] **Sélecteur de fluidité (fps)** : choisir 60 vs 30 fps dans le picker → le stat overlay reflète le
       choix ; le réglage est **mémorisé** au prochain partage.
 - [ ] **Sélecteur de résolution** (720p / 1080p / native), depuis un écran 1440p ou 4K :
