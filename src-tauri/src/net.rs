@@ -587,9 +587,17 @@ fn mime_ok(m: &str) -> bool {
 /// Seau à jetons du relais vidéo d'UN pair (partagé entre ses flux) : (budget, dernier refill).
 type RelayBudget = Arc<StdMutex<(i64, std::time::Instant)>>;
 /// Débit de relais soutenu par pair : SOUS les ~3,5 Mo/s que la WebView sait consommer
-/// (mesure exp3), au-dessus des ~1,5 Mo/s du flux légitime le plus lourd (1440p, 12 Mb/s).
-const RELAY_RATE: i64 = 2_621_440; // 2,5 Mio/s
-const RELAY_BURST: i64 = 6 * 1024 * 1024;
+/// (mesure exp3), et NETTEMENT AU-DESSUS du flux légitime le plus lourd.
+///
+/// ⚠️ INVARIANT (régression vécue) : ce seau doit garder une vraie marge au-dessus de
+/// `video::MAX_BITRATE_BPS`, sinon il jette des trames — et comme un rejet impose
+/// d'attendre la prochaine image CLÉ (la plus grosse, donc rejetée à son tour), le
+/// partage devient TOTALEMENT invisible chez les pairs alors que l'émetteur diffuse
+/// normalement. C'est exactement ce qui est arrivé quand le passage à 60 fps par défaut
+/// a porté le pire cas (1440p60) à 2,25 Mio/s, au ras des 2,5 Mio/s d'alors.
+/// Le test `relay_rate_couvre_le_debit_video_max` verrouille cette marge.
+const RELAY_RATE: i64 = 3_670_016; // 3,5 Mio/s
+const RELAY_BURST: i64 = 8 * 1024 * 1024;
 
 /// Relaie les images d'un flux vidéo natif entrant vers la WebView (canal binaire).
 /// Message poussé au JS : [u8 peer_len][peer][u8 flags][u64 frame_id][octets H.264].
@@ -2287,4 +2295,31 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
         }
     }
     dir.join(name)
+}
+
+#[cfg(test)]
+mod tests {
+    /// GARDE-FOU DE RÉGRESSION : le seau à jetons du relais vidéo doit rester nettement
+    /// au-dessus du débit maximal qu'un partage d'écran peut demander à l'encodeur.
+    ///
+    /// Vécu en production : le passage à 60 fps par défaut (+50 % de débit) a porté le
+    /// pire cas à 2,25 Mio/s contre 2,5 Mio/s de budget. Le relais s'est mis à jeter des
+    /// trames ; or un rejet impose d'attendre la prochaine image CLÉ — la plus grosse,
+    /// donc rejetée elle aussi. Résultat : le partage était TOTALEMENT invisible chez les
+    /// pairs, alors que l'émetteur affichait fps et débit normaux et que le son passait.
+    /// Un simple ratio aurait suffi à l'attraper : c'est ce que fait ce test.
+    #[test]
+    fn relay_rate_couvre_le_debit_video_max() {
+        let max_octets_par_s = (crate::video::MAX_BITRATE_BPS / 8) as i64;
+        assert!(
+            super::RELAY_RATE >= max_octets_par_s * 3 / 2,
+            "RELAY_RATE ({} o/s) doit garder ≥50 % de marge sur le débit vidéo max ({} o/s) \
+             pour absorber les images clés — sinon le partage devient invisible",
+            super::RELAY_RATE,
+            max_octets_par_s
+        );
+        // Et rester sous ce que la WebView sait consommer (~3,5 Mo/s, mesure exp3),
+        // sinon on relaie plus vite qu'elle ne décode et la latence s'effondre.
+        assert!(super::RELAY_RATE <= 3_670_016, "au-delà de ~3,5 Mio/s la WebView décroche");
+    }
 }

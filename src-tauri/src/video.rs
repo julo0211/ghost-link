@@ -22,6 +22,23 @@ use tauri::AppHandle;
 
 /// Cadence par défaut (Auto) : plafond 60 fps (l'adaptatif descend si le réseau sature).
 const FPS_DEFAULT: u32 = 60;
+
+/// Supplément de débit au-delà de 50 fps, en % du palier de base. Doubler la cadence ne
+/// demande PAS le double de débit sur un partage d'écran (contenu souvent statique).
+/// 125 % — et surtout PAS 150 % : à 150 %, le pire cas (1440p60) atteignait 18 Mb/s, soit
+/// 2,25 Mio/s, au ras du seau à jetons du relais vidéo (`net::RELAY_RATE`), qui jetait
+/// alors les trames — y compris les images clés, donc PLUS RIEN ne s'affichait chez les
+/// pairs alors que l'émetteur croyait diffuser normalement.
+const FPS_HIGH_BITRATE_PCT: u32 = 125;
+
+/// Débit maximal qu'un partage peut demander à l'encodeur (pire cas : > 1080p à ≥ 50 fps).
+/// Sert de CONTRAT avec le relais vidéo de `net.rs` : le seau à jetons doit rester
+/// nettement au-dessus, sinon les trames légitimes sont jetées. Verrouillé par un test
+/// dans net.rs — ne pas changer les paliers de `bitrate_for_fps` sans le relire.
+// Consommée uniquement par le test d'invariant de net.rs : c'est un CONTRAT entre le
+// débit vidéo et le budget du relais, pas du code appelé à l'exécution.
+#[allow(dead_code)]
+pub const MAX_BITRATE_BPS: u32 = 12_000_000 / 100 * FPS_HIGH_BITRATE_PCT;
 /// Intervalle d'images clés (secondes) — borne le temps de « prise » d'un pair qui
 /// rejoint ou qui a sauté des trames.
 const KEYFRAME_SECS: u32 = 2;
@@ -343,7 +360,9 @@ mod tests {
 
 #[cfg(windows)]
 mod win {
-    use super::{dispatch, peer_writer, Frame, PeerOut, KEYFRAME_SECS, PEER_QUEUE};
+    use super::{
+        dispatch, peer_writer, Frame, PeerOut, FPS_HIGH_BITRATE_PCT, KEYFRAME_SECS, PEER_QUEUE,
+    };
     #[cfg(test)]
     use super::FPS_DEFAULT;
     use std::mem::ManuallyDrop;
@@ -420,7 +439,7 @@ mod win {
             }
         };
         if fps >= 50 {
-            base * 3 / 2
+            base / 100 * FPS_HIGH_BITRATE_PCT
         } else {
             base
         }
