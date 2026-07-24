@@ -1,7 +1,7 @@
 // Groupes : channel multi-pairs (chat), appel de groupe (audio), vidéo (WebRTC), fichiers.
 
 import { invoke, listen } from "./tauri.js";
-import { $, log, fmt, addImgBubble } from "./dom.js";
+import { $, log, fmt, addImgBubble, clearImgBlobs } from "./dom.js";
 import {
   S,
   PINV,
@@ -461,6 +461,9 @@ function addGroupMsgDom(author: string, text: string, who: string): void {
 }
 function renderGroupMsgs(): void {
   const box = $("#groupChatLog");
+  // Libérer les blob: des images encore affichées AVANT de vider (cf. clearImgBlobs) :
+  // les révoquer plus tôt casserait la visionneuse plein écran, qui recharge la même URL.
+  clearImgBlobs(box);
   box.innerHTML = "";
   (S.groupMsgs[S.openGroupId || ""] || []).forEach((m) => addGroupMsgDom(m.author, m.text, m.who));
 }
@@ -508,12 +511,10 @@ async function sendImageGroup(f: File): Promise<void> {
     // ne pas écrire ma bulle dans le #groupChatLog d'un groupe différent de celui d'envoi.
     if (S.openGroupId !== g.id) return;
     const box = $("#groupChatLog");
-    const u = URL.createObjectURL(f);
-    addImgBubble(box, u, "me");
-    // Révoquer le blob une fois l'image affichée (sinon fuite mémoire cumulative : une bulle
-    // effacée par un changement de groupe garderait son objet URL jusqu'à la fermeture).
-    const img = box.lastElementChild?.querySelector("img") as HTMLImageElement | null;
-    if (img) img.onload = () => URL.revokeObjectURL(u);
+    // Le blob reste VIVANT tant que la bulle est à l'écran (la visionneuse plein écran
+    // recharge cette même URL au clic) ; addImgBubble l'enregistre et il est révoqué au
+    // vidage du log (clearImgBlobs dans renderGroupMsgs).
+    addImgBubble(box, URL.createObjectURL(f), "me");
   } catch (e) {
     log("Image de groupe : " + e);
   }
@@ -599,11 +600,6 @@ function stopGroupCall(): void {
 // (loopback WASAPI) et l'envoie en Opus sur le maillage — audible par les membres
 // DANS l'appel de groupe. Ce drapeau dit si cette capture native est active.
 let screenAudioNative = false;
-// Après un échec du partage AVEC audio (rejet en bloc de getDisplayMedia), le retry
-// vidéo-seule immédiat peut lui-même échouer : l'activation utilisateur (~5 s après
-// le clic, consommée par le 1er appel — Chromium 111+) est morte. Ce drapeau fait
-// que le PROCHAIN clic sur 🖥️ Écran repart directement sans audio navigateur.
-let retryVideoOnly = false;
 // Verrou de réentrance : S.localScreen n'est posé qu'APRÈS l'await getDisplayMedia,
 // donc sans ce drapeau un double-clic sur 🖥️ Écran lancerait deux sélecteurs et le
 // premier flux fuirait (diffusé aux pairs, inarrêtable depuis l'UI).
@@ -1220,52 +1216,21 @@ async function startScreen(): Promise<void> {
     // ouvrir le sélecteur : « le stream ne se lance pas »). windowAudio est
     // volontairement ABSENT : le sélecteur WebView2 n'implémente pas l'audio de
     // fenêtre (WebView2Feedback#4327), ce hint n'avait aucun effet.
-    const wantBrowserAudio = !retryVideoOnly;
-    let audioFailed = retryVideoOnly; // l'audio navigateur a déjà échoué au clic précédent
-    retryVideoOnly = false;
-    const opts: DisplayMediaStreamOptions & {
-      systemAudio?: string;
-      restrictOwnAudio?: boolean;
-    } = wantBrowserAudio
-      ? {
-          video: vconf,
-          audio: true,
-          systemAudio: "include", // fait apparaître la case (onglet « Écran entier »)
-          restrictOwnAudio: true, // exclut le son émis par la WebView elle-même
-        }
-      : { video: vconf };
+    // ANTI-ÉCHO : on ne demande JAMAIS l'audio au navigateur. La piste audio de
+    // getDisplayMedia est le mix du son système capté par Chromium, et `restrictOwnAudio`
+    // n'exclut que le son émis par la WEBVIEW — PAS celui du process hôte, or les voix de
+    // l'appel sont jouées par cpal DANS ce process. Elles repartaient donc vers les pairs
+    // (chacun s'entendait en écho), et UNIQUEMENT en « Écran entier » puisque le sélecteur
+    // WebView2 ne propose la case audio que là (WebView2Feedback#4327) — d'où l'asymétrie
+    // observée avec le partage d'une fenêtre. Le son passe désormais TOUJOURS par le repli
+    // natif (process-loopback EXCLUDE, sysaudio.rs), le chemin déjà éprouvé SANS écho.
     let s: MediaStream;
     try {
-      s = await navigator.mediaDevices.getDisplayMedia(opts);
+      s = await navigator.mediaDevices.getDisplayMedia({ video: vconf });
     } catch (e) {
       const name = e instanceof DOMException ? e.name : String(e);
-      if (!wantBrowserAudio || name === "NotAllowedError") {
-        // Vrai refus / annulation du sélecteur.
-        log("Écran : accès refusé ou annulé (" + name + ")");
-        return;
-      }
-      // Contrairement à la spéc idéale, Chromium/Windows PEUT rejeter TOUT le partage
-      // quand la capture du son système échoue (NotReadableError « Could not start
-      // audio source », cf. jitsi/jitsi-meet#15417) ou quand l'activation a expiré
-      // (InvalidStateError). On retente aussitôt en vidéo seule — le son passera par
-      // le repli natif. (C'est le retry que v0.26.1 avait supprimé à tort.)
-      audioFailed = true;
-      log("Écran+son : échec (" + name + ") — nouvelle tentative sans audio…");
-      try {
-        s = await navigator.mediaDevices.getDisplayMedia({ video: vconf });
-      } catch (e2) {
-        const n2 = e2 instanceof DOMException ? e2.name : String(e2);
-        if (n2 === "NotAllowedError") {
-          // Annulation volontaire du 2e sélecteur : ne rien mémoriser.
-          log("Écran : partage annulé.");
-          return;
-        }
-        // L'activation du clic initial est consommée : impossible de réessayer sans
-        // nouveau geste. Le prochain clic partira directement sans audio navigateur.
-        retryVideoOnly = true;
-        log("⚠️ Partage avec son impossible (" + n2 + "). Re-clique sur 🖥️ Écran : la vidéo partira aussitôt et le son système pourra être capté en natif.");
-        return;
-      }
+      log("Écran : accès refusé ou annulé (" + name + ")");
+      return;
     }
     // La VIDÉO d'abord : vignette + envoi aux pairs immédiatement. La décision « son »
     // vient APRÈS — plus rien ne doit pouvoir bloquer ou annuler le lancement du flux.
@@ -1287,24 +1252,11 @@ async function startScreen(): Promise<void> {
     if (svt) svt.onended = () => stopScreen();
     log("🖥️ Partage d'écran lancé.");
     // ---- Décision « son », le flux vidéo étant déjà parti ----
-    if (s.getAudioTracks().length) {
-      log("🔊 Son système partagé avec l'écran (navigateur).");
-      return;
-    }
-    const surface = svt
-      ? (svt.getSettings() as MediaTrackSettings & { displaySurface?: string }).displaySurface
-      : undefined;
-    if (surface === "monitor" && !audioFailed) {
-      // Écran entier : la case « Partager l'audio » était disponible et NON cochée —
-      // choix explicite de l'utilisateur, on ne capte rien.
-      log("🔇 Sans le son (case « Partager l'audio » non cochée). Pour le son : relance avec la case cochée, ou partage une fenêtre (repli natif proposé).");
-      return;
-    }
-    // Fenêtre partagée (le sélecteur WebView2 n'y propose JAMAIS l'audio — #4327) ou
-    // capture audio navigateur en échec : proposer le repli natif. Ce confirm() arrive
-    // APRÈS le lancement du partage — plus d'activation utilisateur à préserver.
+    // Le flux navigateur ne porte JAMAIS d'audio (cf. anti-écho ci-dessus) : le son
+    // système passe toujours par le repli natif, écran entier comme fenêtre. Ce confirm()
+    // arrive APRÈS le lancement du partage — plus d'activation utilisateur à préserver.
     const wantNative = confirm(
-      "Partager aussi le SON ?\n\nLe navigateur ne fournit pas l'audio ici — ghost link peut capter le son système en natif (TOUT le son du PC, pas seulement la fenêtre partagée). Le flux chiffré part vers les membres du groupe en ligne ; seuls ceux qui ont rejoint l'appel l'entendent.\n\nOK = capter le son système · Annuler = vidéo seule (pour ajouter le son ensuite : arrête ⏹️ puis relance le partage)",
+      "Partager aussi le SON ?\n\nghost link peut capter le son système en natif (TOUT le son du PC, pas seulement la fenêtre partagée). Les voix de l'appel en sont exclues à la source — personne ne s'entend en écho. Le flux chiffré part vers les membres du groupe en ligne ; seuls ceux qui ont rejoint l'appel l'entendent.\n\nOK = capter le son système · Annuler = vidéo seule (pour ajouter le son ensuite : arrête ⏹️ puis relance le partage)",
     );
     if (!wantNative) return;
     // Garde anti-course : le partage a pu être arrêté PENDANT le confirm (bouton stop
@@ -1312,7 +1264,8 @@ async function startScreen(): Promise<void> {
     if (S.localScreen !== s) return;
     const g = loadGroups().find((x) => x.id === S.openGroupId);
     try {
-      // Partage WebRTC (fenêtre sans audio navigateur) → son SYSTÈME complet (pid null).
+      // Partage WebRTC (jamais d'audio navigateur) → son SYSTÈME complet (pid null),
+      // capté en excluant notre propre process : les voix de l'appel ne repartent pas.
       await invoke("screen_audio_start", { members: g ? g.members : [], pid: null });
       // Le partage a pu être arrêté PENDANT l'await (jusqu'à 5 s côté Rust) : stopScreen
       // a alors vu screenAudioNative=false et n'a rien arrêté — compenser ici, sinon la
@@ -1448,10 +1401,15 @@ function nativePeerAllowed(peer: string): boolean {
 }
 
 /// Codec WebCodecs selon la résolution annoncée (H.264 Main ; niveau ≥ résolution).
-function nativeCodecOf(w: number, h: number): string {
+// Le NIVEAU H.264 dépend de la résolution ET de la cadence : Main 3.1 ne couvre que du
+// 720p30. Depuis que la downscale existe, un 720p60 est possible — l'annoncer en 3.1 ferait
+// échouer decoder.configure() et la vignette resterait NOIRE pour toujours. On monte donc
+// d'un cran dès 50 fps. (Le décodeur lit de toute façon le vrai niveau dans le SPS.)
+function nativeCodecOf(w: number, h: number, fps: number): string {
   const px = w * h;
-  if (px > 0 && px <= 1280 * 720) return "avc1.4d401f"; // Main 3.1
-  if (px > 0 && px <= 1920 * 1080) return "avc1.4d4028"; // Main 4.0
+  const fast = fps >= 50;
+  if (px > 0 && px <= 1280 * 720) return fast ? "avc1.4d4020" : "avc1.4d401f"; // Main 3.2 / 3.1
+  if (px > 0 && px <= 1920 * 1080) return fast ? "avc1.4d402a" : "avc1.4d4028"; // Main 4.2 / 4.0
   return "avc1.4d4033"; // Main 5.1 — couvre 1440p+ et les tailles inconnues
 }
 
@@ -1555,7 +1513,7 @@ function handleNativeFrame(raw: unknown): void {
       error: () => noteNativeDecodeError(peer, st),
     });
     try {
-      decoder.configure({ codec: nativeCodecOf(st.w, st.h), optimizeForLatency: true });
+      decoder.configure({ codec: nativeCodecOf(st.w, st.h, st.fps), optimizeForLatency: true });
     } catch {
       return; // codec refusé : on retentera à la prochaine clé
     }
@@ -1685,8 +1643,8 @@ interface ShareTarget {
 }
 let nativeSharePid: number | null = null;
 
-// Item 3 (fps-only) : plafond de cadence choisi par l'utilisateur (l'adaptatif peut descendre en
-// dessous si le réseau sature). La résolution reste native (downscale reportée).
+// Plafond de cadence choisi par l'utilisateur (l'adaptatif peut descendre en dessous si
+// le réseau sature).
 type FpsPreset = { key: string; label: string; fps: number };
 const FPS_PRESETS: FpsPreset[] = [
   { key: "60", label: "60 fps (max)", fps: 60 },
@@ -1695,6 +1653,19 @@ const FPS_PRESETS: FpsPreset[] = [
 function currentFps(): FpsPreset {
   const k = localStorage.getItem("ghostlink_stream_quality") || "60";
   return FPS_PRESETS.find((q) => q.key === k) || FPS_PRESETS[0];
+}
+// Plafond de RÉSOLUTION (0×0 = natif). Le backend ne sur-échantillonne jamais : une cible
+// plus grande que l'écran partagé reste au natif. Clé localStorage DISTINCTE de celle du
+// fps — les réutiliser ferait lire « 60 » comme une résolution.
+type ResPreset = { key: string; label: string; w: number; h: number };
+const RES_PRESETS: ResPreset[] = [
+  { key: "native", label: "Native (max)", w: 0, h: 0 },
+  { key: "1080", label: "1080p (1920×1080 max)", w: 1920, h: 1080 },
+  { key: "720", label: "720p (moins de bande passante)", w: 1280, h: 720 },
+];
+function currentRes(): ResPreset {
+  const k = localStorage.getItem("ghostlink_stream_res") || "native";
+  return RES_PRESETS.find((r) => r.key === k) || RES_PRESETS[0];
 }
 
 // ----- Picker de partage natif (écran OU fenêtre), au clic sur 🖥️ -----
@@ -1724,6 +1695,15 @@ async function openNativePicker(g: Group): Promise<void> {
     qSel.appendChild(o);
   });
   qSel.onchange = () => localStorage.setItem("ghostlink_stream_quality", qSel.value);
+  const rSel = $<HTMLSelectElement>("#nativePickerRes");
+  rSel.replaceChildren();
+  RES_PRESETS.forEach((r) => {
+    const o = document.createElement("option");
+    o.value = r.key; o.textContent = r.label;
+    if (r.key === currentRes().key) o.selected = true;
+    rSel.appendChild(o);
+  });
+  rSel.onchange = () => localStorage.setItem("ghostlink_stream_res", rSel.value);
   const start = (t: ShareTarget) => {
     closeNativePicker();
     void startScreenNative(g, t);
@@ -1773,9 +1753,11 @@ async function startScreenNative(g: Group, target: ShareTarget): Promise<void> {
     const isWindow = target.kind === "window";
     // Écran = szDevice STABLE (Rust replie sur le principal si absent, monitorFound) ;
     // Fenêtre = HWND.
+    const q = currentFps();
+    const r = currentRes();
     const args = isWindow
-      ? { members: g.members, monitor: null, window: target.id, maxFps: currentFps().fps }
-      : { members: g.members, monitor: target.id || null, window: null, maxFps: currentFps().fps };
+      ? { members: g.members, monitor: null, window: target.id, maxFps: q.fps, maxW: r.w, maxH: r.h }
+      : { members: g.members, monitor: target.id || null, window: null, maxFps: q.fps, maxW: r.w, maxH: r.h };
     let info: { w: number; h: number; fps: number; monitor: string; monitorFound: boolean };
     try {
       info = await invoke("video_share_start", args);

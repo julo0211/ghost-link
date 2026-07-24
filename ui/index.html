@@ -258,6 +258,15 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 .vidtile:fullscreen .vidmax,.vidtile:fullscreen .vidsnd{opacity:1}
 
 /* ---------- Utilitaires d'état (toggle par le JS — NE PAS renommer) ---------- */
+/* ---------- Visionneuse d'image (lightbox) ---------- */
+/* Même patron que .modal-wrap, mais fond plus opaque et image centrée « contain »,
+   comme le plein écran des vignettes vidéo. Masquée par .hidden (display:none!important,
+   qui doit gagner sur ce display:flex — donc surtout PAS de !important ici). */
+.imgview-wrap{position:fixed;inset:0;background:rgba(0,0,0,.88);display:flex;align-items:center;justify-content:center;padding:36px;z-index:60;cursor:zoom-out}
+.imgview-wrap img{max-width:100%;max-height:100%;object-fit:contain;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.55);cursor:default}
+.imgview-close{position:absolute;top:12px;right:14px;border:none;background:rgba(0,0,0,.5);color:#fff;border-radius:6px;width:32px;height:32px;font-size:15px;cursor:pointer;display:grid;place-items:center;line-height:1;transition:.12s}
+.imgview-close:hover{background:rgba(0,0,0,.85)}
+.imgview-close:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .hidden{display:none!important}
 .view-hidden{display:none!important}
 .members.view-hidden{display:none!important}
@@ -474,11 +483,23 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
         <span style="font-size:13px;opacity:.8">Fluidité</span>
         <select id="nativePickerQuality" style="flex:1"></select>
       </label>
+      <label class="row" style="gap:6px;margin-bottom:8px">
+        <span style="font-size:13px;opacity:.8">Résolution</span>
+        <select id="nativePickerRes" style="flex:1"></select>
+      </label>
       <p class="hint" style="margin:14px 0 4px">Écrans</p>
       <div id="nativePickerScreens" class="list"></div>
       <p class="hint" style="margin:16px 0 4px">Fenêtres</p>
       <div id="nativePickerWindows" class="list" style="max-height:38vh;overflow:auto"></div>
     </div>
+  </div>
+
+  <!-- ===== Visionneuse d'image plein écran (clic sur une image du chat, 1-à-1 ET groupe) =====
+       Overlay DANS la page : window.open est neutralisé par WebView2 et une navigation
+       top-level vers data: est interdite par Chromium. Ids/classes NOUVEAUX (contrat DOM). -->
+  <div class="imgview-wrap hidden" id="imgViewWrap" role="dialog" aria-modal="true" aria-label="Image en plein écran">
+    <button class="imgview-close" type="button" id="imgViewClose" title="Fermer (Échap)" aria-label="Fermer">✕</button>
+    <img id="imgViewImg" alt="">
   </div>
 
   <!-- ===== Modale réglages (héberge aussi Mises à jour + Journal) ===== -->

@@ -60,13 +60,17 @@ pub enum ShareTarget {
     Window(isize),
 }
 
-/// Plafond de qualité choisi par l'utilisateur.
+/// Plafond de qualité choisi par l'utilisateur. `max_w`/`max_h` bornent la
+/// résolution ENCODÉE (0/0 = illimité = résolution native). Jamais d'upscale :
+/// une source déjà sous le plafond n'est jamais agrandie (voir `win::clamp_dims`).
 #[derive(Clone, Copy)]
 pub struct Quality {
     pub fps: u32,
+    pub max_w: u32,
+    pub max_h: u32,
 }
 impl Default for Quality {
-    fn default() -> Self { Quality { fps: FPS_DEFAULT } }
+    fn default() -> Self { Quality { fps: FPS_DEFAULT, max_w: 0, max_h: 0 } }
 }
 
 impl VideoShare {
@@ -298,6 +302,43 @@ mod tests {
         // les crans inférieurs descendent
         assert!(super::win::levels_for(60)[3].0 < 60);
     }
+
+    #[test]
+    fn clamp_dims_downscale_4k_vers_1080p() {
+        assert_eq!(super::win::clamp_dims(3840, 2160, 1920, 1080), (1920, 1080));
+    }
+
+    #[test]
+    fn clamp_dims_jamais_d_upscale() {
+        // Source déjà sous le plafond : renvoyée telle quelle, jamais agrandie.
+        assert_eq!(super::win::clamp_dims(1280, 720, 1920, 1080), (1280, 720));
+    }
+
+    #[test]
+    fn clamp_dims_illimite() {
+        assert_eq!(super::win::clamp_dims(3840, 2160, 0, 0), (3840, 2160));
+    }
+
+    #[test]
+    fn clamp_dims_ratio_non_16_9() {
+        // Source 4:3 VRAIMENT différente du 16:9 du plafond : c'est la hauteur qui doit
+        // piloter. (1366×768 ne conviendrait pas : c'est du 16:9 à 0,05 % près, et une
+        // inversion de l'axe choisi y donnerait le MÊME résultat — test aveugle.)
+        assert_eq!(super::win::clamp_dims(1600, 1200, 1280, 720), (960, 720));
+        // Aucun axe ne doit jamais dépasser le plafond demandé.
+        for &(nw, nh) in &[(1600u32, 1200u32), (3840, 2160), (1366, 768), (2560, 1080)] {
+            let (w, h) = super::win::clamp_dims(nw, nh, 1280, 720);
+            assert!(w <= 1280 && h <= 720, "{nw}x{nh} -> {w}x{h} dépasse le plafond");
+            assert_eq!((w % 2, h % 2), (0, 0), "dimensions paires (NV12)");
+        }
+    }
+
+    #[test]
+    fn clamp_dims_plancher_encodeur() {
+        // Source très étirée (bandeau 4000×70) : le fit sur le plafond ferait
+        // tomber sous 64px de haut → plancher = pas de clamp du tout.
+        assert_eq!(super::win::clamp_dims(4000, 70, 1280, 720), (4000, 70));
+    }
 }
 
 #[cfg(windows)]
@@ -369,6 +410,12 @@ mod win {
             } else if px > 1280 * 720 {
                 8_000_000
             } else {
+                // ≤720p (y compris 1280×720 EXACT, qui échoue le test précédent).
+                // On NE baisse PAS ce palier : `bitrate_for_fps` ne voit que (w,h) et ne
+                // peut pas distinguer « l'utilisateur a choisi 720p » d'un écran 720p
+                // natif ou d'un partage de FENÊTRE (souvent du texte, où une baisse de
+                // débit se voit tout de suite sur les glyphes). L'économie vient déjà du
+                // passage de 12/8 → 5 Mb/s. Paliers du dessus : validés matériel.
                 5_000_000
             }
         };
@@ -533,13 +580,245 @@ mod win {
         out
     }
 
-    /// Conversion BGRA (avec pitch) → NV12 (BT.709, plage limitée), par blocs 2×2.
-    /// `out` : plan Y (w*h) puis plan UV entrelacé (w*h/2). `cover_w/cover_h` (pairs,
-    /// ≤ w/h) = zone RÉELLEMENT couverte par la source : au-delà on écrit du noir. Sert
-    /// au letterbox/crop d'une fenêtre redimensionnée dans un tampon d'encodeur FIXE
-    /// (la fenêtre a rétréci → bords noirs ; elle a grandi → on rogne). Boucle chaude :
-    /// voir l'opt-level 1 du profil dev dans Cargo.toml.
-    fn bgra_to_nv12(src: *const u8, pitch: usize, w: usize, h: usize, cover_w: usize, cover_h: usize, out: &mut [u8]) {
+    /// Plafonne (nw,nh) à (mw,mh) EN GARDANT LE RATIO, sans jamais upscaler.
+    /// mw==0||mh==0 = illimité. Si (nw,nh) est déjà sous le plafond, renvoyé tel
+    /// quel (jamais d'agrandissement). Dimensions toujours PAIRES (NV12). Si le
+    /// fit descend sous le plancher de l'encodeur matériel (64px, un côté très
+    /// étiré p.ex.), on renonce au clamp plutôt que produire une image invalide.
+    pub(super) fn clamp_dims(nw: u32, nh: u32, mw: u32, mh: u32) -> (u32, u32) {
+        let (nw, nh) = (nw & !1, nh & !1);
+        if mw == 0 || mh == 0 || nw == 0 || nh == 0 || (nw <= mw && nh <= mh) {
+            return (nw, nh); // illimité, ou déjà sous le plafond : JAMAIS d'upscale
+        }
+        let fit_w = (mw as u64) * (nh as u64) <= (mh as u64) * (nw as u64);
+        let (mut w, mut h) = if fit_w {
+            (mw as u64, (mw as u64 * nh as u64 + nw as u64 / 2) / nw as u64)
+        } else {
+            ((mh as u64 * nw as u64 + nh as u64 / 2) / nh as u64, mh as u64)
+        };
+        w &= !1;
+        h &= !1;
+        if w < 64 || h < 64 {
+            return (nw, nh); // plancher encodeur
+        }
+        (w as u32, h as u32)
+    }
+
+    /// Pas de rééchantillonnage source→sortie, en Q16.16 (65536 = 1:1). Calculé
+    /// UNE SEULE fois au démarrage de la capture (`build_capture`) à partir des
+    /// dimensions natives et des dimensions encodées, puis reste FIXE toute la
+    /// session : le recalculer par trame ferait « pomper » l'image à chaque
+    /// redimensionnement de la fenêtre/l'écran partagé.
+    #[derive(Clone, Copy)]
+    pub(super) struct Scale {
+        step_x: u32,
+        step_y: u32,
+    }
+    impl Scale {
+        pub(super) fn new(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Self {
+            let step = |s: u32, d: u32| -> u32 {
+                if d == 0 { 65536 } else { (((s as u64) << 16) / d as u64) as u32 }
+            };
+            Scale { step_x: step(src_w, dst_w), step_y: step(src_h, dst_h) }
+        }
+        fn is_identity(self) -> bool {
+            self.step_x == 65536 && self.step_y == 65536
+        }
+    }
+
+    /// Convertit une largeur/hauteur COUVERTE de l'espace SOURCE (capture) vers l'espace
+    /// SORTIE (encodeur), avec le facteur d'échelle FIXE de la session. Fonction à part
+    /// — et non recopiée dans `grab_latest` — pour qu'un test puisse l'exercer
+    /// directement : c'est exactement la classe de désynchronisation capture/sortie qui
+    /// avait fait retirer la mise à l'échelle par le passé. Résultat PAIR (NV12) et
+    /// borné par la dimension encodée.
+    pub(super) fn cov_out(src: u32, native: u32, enc: u32) -> u32 {
+        if native == 0 {
+            return 0;
+        }
+        ((src as u64 * enc as u64 / native as u64) as u32 & !1).min(enc)
+    }
+
+    /// Réciproques 1/n en Q20 (`RECIP_Q20[n] ≈ 2^20 / n`), pour remplacer les divisions
+    /// entières de la moyenne d'aire par des multiplications — voir la note PERF dans
+    /// `box_avg`. Dimensionnée large : l'aire d'une boîte reste petite en pratique
+    /// (4K→1080p = 2×2, 4K→720p = 3×3), et au-delà `box_avg` retombe sur la division.
+    static RECIP_Q20: [u32; 256] = {
+        let mut t = [0u32; 256];
+        let mut i = 1usize;
+        while i < 256 {
+            t[i] = ((1u64 << 20) / i as u64) as u32;
+            i += 1;
+        }
+        t
+    };
+
+    /// Moyenne d'aire (filtre BOÎTE) de la boîte source qui correspond au pixel de
+    /// SORTIE (ox,oy) sous l'échelle `sc`. Bornée EXPLICITEMENT par `src_cov_w` /
+    /// `src_cov_h` (jamais de lecture au-delà — `src` pointe une texture mappée,
+    /// un off-by-one y lirait des pixels périmés/hors zone). Filtre boîte
+    /// obligatoire (PAS de plus-proche-voisin) : un partage d'écran c'est du
+    /// texte, le nearest fait scintiller les glyphes et explose le débit H.264.
+    #[inline]
+    unsafe fn box_avg(
+        src: *const u8,
+        pitch: usize,
+        sc: Scale,
+        ox: usize,
+        oy: usize,
+        src_cov_w: usize,
+        src_cov_h: usize,
+    ) -> (i32, i32, i32) {
+        if src_cov_w == 0 || src_cov_h == 0 {
+            return (0, 0, 0);
+        }
+        let sx0 = ((ox as u64 * sc.step_x as u64) >> 16) as usize;
+        let sx1 = ((((ox + 1) as u64 * sc.step_x as u64) >> 16) as usize)
+            .max(sx0 + 1)
+            .min(src_cov_w);
+        let sx0 = sx0.min(sx1 - 1);
+        let sy0 = ((oy as u64 * sc.step_y as u64) >> 16) as usize;
+        let sy1 = ((((oy + 1) as u64 * sc.step_y as u64) >> 16) as usize)
+            .max(sy0 + 1)
+            .min(src_cov_h);
+        let sy0 = sy0.min(sy1 - 1);
+
+        let mut rs = 0i64;
+        let mut gs = 0i64;
+        let mut bs = 0i64;
+        for sy in sy0..sy1 {
+            let row = std::slice::from_raw_parts(src.add(sy * pitch), src_cov_w * 4);
+            for sx in sx0..sx1 {
+                let px = &row[sx * 4..sx * 4 + 4];
+                bs += px[0] as i64;
+                gs += px[1] as i64;
+                rs += px[2] as i64;
+            }
+        }
+        // L'aire se déduit des bornes : inutile de compter pixel par pixel.
+        let n = ((sx1 - sx0) * (sy1 - sy0)) as i64;
+        if n <= 0 {
+            return (0, 0, 0);
+        }
+        // PERF : diviser ici coûterait 3 divisions entières par pixel de SORTIE, soit
+        // ~6 M par trame en 1080p — plusieurs dizaines de ms sur le thread d'encodage
+        // (grab_latest est appelé SYNCHRONEMENT sur METransformNeedInput), ce qui
+        // plafonnerait la cadence bien en dessous de la cible : choisir « 1080p » pour
+        // soulager le réseau aurait rendu le partage saccadé. On multiplie par une
+        // réciproque pré-calculée (arrondi au plus proche, donc au moins aussi juste
+        // qu'une division tronquée) ; au-delà de la table on retombe sur la division.
+        let nn = n as usize;
+        if nn < RECIP_Q20.len() {
+            let r = RECIP_Q20[nn] as i64;
+            const HALF: i64 = 1 << 19;
+            return (
+                ((rs * r + HALF) >> 20) as i32,
+                ((gs * r + HALF) >> 20) as i32,
+                ((bs * r + HALF) >> 20) as i32,
+            );
+        }
+        ((rs / n) as i32, (gs / n) as i32, (bs / n) as i32)
+    }
+
+    /// Conversion BGRA (avec pitch) → NV12 (BT.709, plage limitée), par blocs de
+    /// sortie 2×2, avec mise à l'échelle CPU optionnelle (filtre boîte).
+    /// `w`/`h` = dimensions du tampon ENCODEUR (dimensions de SORTIE, PAIRES).
+    /// `cov_w`/`cov_h` (pairs, ≤ w/h) = zone couverte par la source, EN ESPACE
+    /// SORTIE : au-delà on écrit du noir — sert au letterbox/crop d'une fenêtre
+    /// redimensionnée dans le tampon FIXE de l'encodeur.
+    /// `sc` = échelle source→sortie (voir `Scale`) ; `src_cov_w`/`src_cov_h` =
+    /// bornes DURES de lecture, EN ESPACE SOURCE (taille réelle de la zone
+    /// couverte dans la texture mappée — jamais dépassées).
+    /// Chemin rapide : si `sc` est l'identité, ce code fait EXACTEMENT ce que
+    /// l'ancienne version (1:1, pas de scaler) faisait — zéro régression.
+    /// Boucle chaude : voir l'opt-level 1 du profil dev dans Cargo.toml.
+    #[allow(clippy::too_many_arguments)] // dimensions capture/sortie/échelle : chacune a un rôle distinct, les regrouper masquerait le contrat (voir doc ci-dessus)
+    fn bgra_to_nv12(
+        src: *const u8,
+        pitch: usize,
+        w: usize,
+        h: usize,
+        cov_w: usize,
+        cov_h: usize,
+        sc: Scale,
+        src_cov_w: usize,
+        src_cov_h: usize,
+        out: &mut [u8],
+    ) {
+        if sc.is_identity() {
+            bgra_to_nv12_identity(src, pitch, w, h, cov_w, cov_h, out);
+            return;
+        }
+        let (y_plane, uv_plane) = out.split_at_mut(w * h);
+        for by in 0..h / 2 {
+            let oy0 = by * 2;
+            let uvrow = &mut uv_plane[by * w..(by + 1) * w];
+            // Bloc de 2 lignes ENTIÈREMENT hors couverture → noir (Y=16, chroma neutre).
+            if oy0 >= cov_h {
+                for x in 0..w {
+                    y_plane[oy0 * w + x] = 16;
+                    y_plane[(oy0 + 1) * w + x] = 16;
+                }
+                for c in uvrow.iter_mut() {
+                    *c = 128;
+                }
+                continue;
+            }
+            let (yrow0, yrow1) = {
+                let (a, b) = y_plane[oy0 * w..(oy0 + 2) * w].split_at_mut(w);
+                (a, b)
+            };
+            for bx in 0..w / 2 {
+                let ox0 = bx * 2;
+                // Colonnes hors couverture → noir.
+                if ox0 >= cov_w {
+                    yrow0[ox0] = 16;
+                    yrow0[ox0 + 1] = 16;
+                    yrow1[ox0] = 16;
+                    yrow1[ox0 + 1] = 16;
+                    uvrow[ox0] = 128;
+                    uvrow[ox0 + 1] = 128;
+                    continue;
+                }
+                let mut rs = 0i32;
+                let mut gs = 0i32;
+                let mut bs = 0i32;
+                for (dy, yrow) in [(0usize, &mut *yrow0), (1usize, &mut *yrow1)] {
+                    for dx in 0..2usize {
+                        let ox = ox0 + dx;
+                        let oy = oy0 + dy;
+                        let (r, g, b) =
+                            unsafe { box_avg(src, pitch, sc, ox, oy, src_cov_w, src_cov_h) };
+                        rs += r;
+                        gs += g;
+                        bs += b;
+                        // BT.709 limité : Y = 16 + (47R + 157G + 16B) / 256
+                        yrow[ox] = (16 + ((47 * r + 157 * g + 16 * b) >> 8)).clamp(0, 255) as u8;
+                    }
+                }
+                // Moyenne 2×2 pour la chroma (rs/gs/bs = sommes de 4 valeurs moyennées).
+                let u = 128 + ((-26 * rs - 87 * gs + 112 * bs) >> 10);
+                let v = 128 + ((112 * rs - 102 * gs - 10 * bs) >> 10);
+                uvrow[ox0] = u.clamp(0, 255) as u8;
+                uvrow[ox0 + 1] = v.clamp(0, 255) as u8;
+            }
+        }
+    }
+
+    /// Chemin 1:1 (pas de mise à l'échelle) : code INCHANGÉ par rapport à la
+    /// version pré-scaler — un pixel de sortie = un pixel de source, lu
+    /// directement (pas de moyenne d'aire). `cover_w`/`cover_h` (pairs, ≤ w/h) =
+    /// zone RÉELLEMENT couverte par la source ; au-delà, noir (letterbox/crop
+    /// d'une fenêtre redimensionnée dans le tampon FIXE de l'encodeur).
+    fn bgra_to_nv12_identity(
+        src: *const u8,
+        pitch: usize,
+        w: usize,
+        h: usize,
+        cover_w: usize,
+        cover_h: usize,
+        out: &mut [u8],
+    ) {
         let (y_plane, uv_plane) = out.split_at_mut(w * h);
         for by in 0..h / 2 {
             let y0 = by * 2;
@@ -763,8 +1042,19 @@ mod win {
         session: windows::Graphics::Capture::GraphicsCaptureSession,
         staging: ID3D11Texture2D,
         ctx: ID3D11DeviceContext,
+        /// Dimensions de CAPTURE (natives : ce que WGC délivre, taille de la
+        /// texture `staging` mappée). PAS ce qui part sur le réseau — voir `enc_*`.
         w: u32,
         h: u32,
+        /// Dimensions ENCODÉES (ce que `build_encoder`/`encode_loop` utilisent,
+        /// ce qui sort réellement de l'encodeur et part sur le réseau) — issues
+        /// de `clamp_dims(w, h, quality.max_w, quality.max_h)`. Égales à `w`/`h`
+        /// quand aucune mise à l'échelle n'est demandée (Quality::max_w/h = 0).
+        enc_w: u32,
+        enc_h: u32,
+        /// Échelle source (w×h) → sortie (enc_w×enc_h), calculée UNE fois ici et
+        /// figée pour toute la session (voir `Scale`).
+        scale: Scale,
         /// Nom de l'écran RÉELLEMENT capturé (pour l'UI de l'émetteur).
         label: String,
         /// false = l'écran demandé (szDevice) était introuvable → on a replié sur le
@@ -777,8 +1067,13 @@ mod win {
     }
 
     /// Capture WGC de la CIBLE demandée (moniteur par szDevice stable, ou fenêtre par
-    /// HWND) + texture de relecture CPU (dimensions paires).
-    unsafe fn build_capture(device: &ID3D11Device, target: &super::ShareTarget) -> anyhow::Result<Capture> {
+    /// HWND) + texture de relecture CPU (dimensions paires). `quality` fixe le plafond
+    /// de résolution ENCODÉE (`clamp_dims`) — calculé UNE fois ici, figé pour la session.
+    unsafe fn build_capture(
+        device: &ID3D11Device,
+        target: &super::ShareTarget,
+        quality: super::Quality,
+    ) -> anyhow::Result<Capture> {
         let ctx = device.GetImmediateContext()?;
         let dxgi: IDXGIDevice = device.cast()?;
         let inspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi)?;
@@ -835,7 +1130,11 @@ mod win {
         let mut staging: Option<ID3D11Texture2D> = None;
         device.CreateTexture2D(&desc, None, Some(&mut staging))?;
         let staging = staging.ok_or_else(|| anyhow::anyhow!("texture de relecture impossible"))?;
-        Ok(Capture { pool, session, staging, ctx, w, h, label, found, closed })
+        // Résolution ENCODÉE : bornée au plafond choisi, JAMAIS d'upscale, figée
+        // pour toute la session (recalculer par trame ferait pomper l'image).
+        let (enc_w, enc_h) = clamp_dims(w, h, quality.max_w, quality.max_h);
+        let scale = Scale::new(w, h, enc_w, enc_h);
+        Ok(Capture { pool, session, staging, ctx, w, h, enc_w, enc_h, scale, label, found, closed })
     }
 
     /// S'il y a une (ou plusieurs) nouvelle(s) trame(s) WGC, copie la plus récente dans
@@ -855,28 +1154,34 @@ mod win {
             }
         }
         let Some(frame) = latest else { return Ok(false) };
-        // Taille COURANTE de la source (une fenêtre partagée change de taille). On la
-        // letterbox/crop dans le tampon FIXE de l'encodeur (cap.w×cap.h) : rétréci →
-        // bords noirs, agrandi → rogné. Jamais d'arrêt ni de reconfiguration NVENC.
-        let (cover_w, cover_h) = match frame.ContentSize() {
+        // Taille COURANTE de la source (une fenêtre partagée change de taille), EN
+        // ESPACE SOURCE — bornes dures de lecture de la texture mappée. On la
+        // letterbox/crop dans le tampon FIXE de l'encodeur : rétréci → bords noirs,
+        // agrandi → rogné. Jamais d'arrêt ni de reconfiguration NVENC.
+        let (src_cw, src_ch) = match frame.ContentSize() {
             Ok(s) => (
                 ((s.Width as u32) & !1).min(cap.w),
                 ((s.Height as u32) & !1).min(cap.h),
             ),
             Err(_) => (cap.w, cap.h),
         };
+        // Même conversion EN ESPACE SORTIE (résolution encodée), au même facteur
+        // fixe `cap.scale` que la conversion NV12 ci-dessous — sinon la couverture
+        // annoncée au scaler ne correspondrait plus à ce qu'il lit réellement.
+        let cov_w = cov_out(src_cw, cap.w, cap.enc_w);
+        let cov_h = cov_out(src_ch, cap.h, cap.enc_h);
         let ok = (|| -> anyhow::Result<()> {
             let surface = frame.Surface()?;
             let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
             let tex: ID3D11Texture2D = access.GetInterface()?;
             // CopySubresourceRegion (pas CopyResource) : ne copier que la zone couverte
-            // (bornée à la texture source ET au tampon fixe).
+            // (bornée à la texture source ET au tampon fixe), EN ESPACE SOURCE.
             let src_box = D3D11_BOX {
                 left: 0,
                 top: 0,
                 front: 0,
-                right: cover_w.max(2),
-                bottom: cover_h.max(2),
+                right: src_cw.max(2),
+                bottom: src_ch.max(2),
                 back: 1,
             };
             cap.ctx
@@ -886,10 +1191,13 @@ mod win {
             bgra_to_nv12(
                 mapped.pData as *const u8,
                 mapped.RowPitch as usize,
-                cap.w as usize,
-                cap.h as usize,
-                cover_w as usize,
-                cover_h as usize,
+                cap.enc_w as usize,
+                cap.enc_h as usize,
+                cov_w as usize,
+                cov_h as usize,
+                cap.scale,
+                src_cw as usize,
+                src_ch as usize,
                 nv12,
             );
             cap.ctx.Unmap(&cap.staging, 0);
@@ -941,11 +1249,13 @@ mod win {
                 // Requis avec le DXGI Device Manager (l'encodeur travaille sur d'autres threads).
                 let mt: ID3D10Multithread = device.cast()?;
                 let _ = mt.SetMultithreadProtected(true);
-                let cap = build_capture(&device, &target)?;
-                // Résolution NATIVE pour l'instant — la downscale (choix 720p/1080p/2K) est
-                // reportée : elle exige un redimensionnement de l'étage BGRA→NV12 (voir spec).
-                // Ici on ne plafonne QUE le fps.
-                let enc = build_encoder(&device, cap.w, cap.h, quality.fps.max(1))?;
+                let cap = build_capture(&device, &target, quality)?;
+                // L'encodeur est construit aux dimensions ENCODÉES (cap.enc_w/enc_h),
+                // PAS aux dimensions de capture natives (cap.w/cap.h) : cap.enc_* est ce
+                // que bgra_to_nv12 remplit réellement dans le tampon NV12 (voir grab_latest
+                // / encode_loop) — les désynchroniser reproduit le bug historique de
+                // trames corrompues (encodeur configuré à une taille, tampon à une autre).
+                let enc = build_encoder(&device, cap.enc_w, cap.enc_h, quality.fps.max(1))?;
                 Ok((cap, enc, device))
             })();
             let (cap, enc, _device) = match run {
@@ -956,9 +1266,9 @@ mod win {
                     return;
                 }
             };
-            // Dimensions ENCODÉES = dimensions natives (pas de downscale pour l'instant) :
-            // l'UI affiche la vraie résolution diffusée.
-            let _ = ready.send(Ok((cap.w, cap.h, cap.label.clone(), cap.found)));
+            // Dimensions ENCODÉES (après clamp_dims) : l'UI affiche la vraie résolution
+            // diffusée, pas la résolution native de la source.
+            let _ = ready.send(Ok((cap.enc_w, cap.enc_h, cap.label.clone(), cap.found)));
 
             // Un flux QUIC par pair, alimenté par une file bornée (contre-pression).
             let mut peers: Vec<PeerOut> = conns
@@ -1006,12 +1316,15 @@ mod win {
         peers: &mut [PeerOut],
         quality: super::Quality,
     ) -> anyhow::Result<()> {
-        let (w, h) = (cap.w as usize, cap.h as usize);
+        // ENCODÉES, pas natives : c'est ce que bgra_to_nv12 remplit (voir grab_latest)
+        // et ce que build_encoder a configuré — doivent rester en accord (sinon
+        // c'est exactement le bug historique de trames corrompues).
+        let (w, h) = (cap.enc_w as usize, cap.enc_h as usize);
         let mut nv12 = vec![0u8; w * h * 3 / 2]; // noir NV12 = Y=0/UV=0 acceptable au 1er tick
         for uv in nv12[w * h..].iter_mut() {
             *uv = 128;
         }
-        let base_bitrate = bitrate_for_fps(cap.w, cap.h, quality.fps);
+        let base_bitrate = bitrate_for_fps(cap.enc_w, cap.enc_h, quality.fps);
         let mut level: usize = 0;
         let mut frame_interval =
             Duration::from_nanos(1_000_000_000 / levels_for(quality.fps)[level].0 as u64);
@@ -1169,8 +1482,8 @@ mod win {
                     "level": level,
                     "pct": levels_for(quality.fps)[level].1,
                     "dyn": dynamic_ok,
-                    "w": cap.w,
-                    "h": cap.h,
+                    "w": cap.enc_w,
+                    "h": cap.enc_h,
                 }),
             );
             win_start = Instant::now();
@@ -1185,6 +1498,12 @@ mod win {
     mod tests {
         use super::*;
 
+        /// Échelle identité W×H → W×H, pour les tests de non-régression du chemin
+        /// rapide (aucun scaler, code = ancienne version 1:1).
+        fn identity(w: u32, h: u32) -> Scale {
+            Scale::new(w, h, w, h)
+        }
+
         /// Convertit un buffer BGRA uniforme et vérifie Y/U/V (BT.709 limité).
         fn convert_uniform(b: u8, g: u8, r: u8) -> (u8, u8, u8) {
             const W: usize = 8;
@@ -1197,7 +1516,7 @@ mod win {
                 px[3] = 255;
             }
             let mut out = vec![0u8; W * H * 3 / 2];
-            bgra_to_nv12(src.as_ptr(), W * 4, W, H, W, H, &mut out);
+            bgra_to_nv12(src.as_ptr(), W * 4, W, H, W, H, identity(W as u32, H as u32), W, H, &mut out);
             (out[0], out[W * H], out[W * H + 1])
         }
 
@@ -1233,7 +1552,7 @@ mod win {
                 }
             }
             let mut out = vec![0u8; W * H * 3 / 2];
-            bgra_to_nv12(src.as_ptr(), PITCH, W, H, W, H, &mut out);
+            bgra_to_nv12(src.as_ptr(), PITCH, W, H, W, H, identity(W as u32, H as u32), W, H, &mut out);
             for &y in &out[..W * H] {
                 assert!((233..=237).contains(&y), "Y = {y}");
             }
@@ -1247,7 +1566,7 @@ mod win {
             const H: usize = 4;
             let mut src = vec![255u8; W * H * 4]; // tout blanc opaque
             let mut out = vec![0u8; W * H * 3 / 2];
-            bgra_to_nv12(src.as_mut_ptr(), W * 4, W, H, 2, 2, &mut out);
+            bgra_to_nv12(src.as_mut_ptr(), W * 4, W, H, 2, 2, identity(W as u32, H as u32), 2, 2, &mut out);
             // Y : (0,0) et (1,1) couverts (~235), (2,*) et (*,2) noirs (16).
             assert!((233..=237).contains(&out[0]), "Y couvert = {}", out[0]);
             assert_eq!(out[2], 16, "Y bord droit doit être noir");
@@ -1255,6 +1574,104 @@ mod win {
             // Chroma du bloc couvert (0,0) neutre-ish ; bloc bord = 128/128.
             assert_eq!(out[W * H + 2], 128);
             assert_eq!(out[W * H + 3], 128);
+        }
+
+        #[test]
+        fn nv12_scale_downscale_8x8_vers_4x4_blanc() {
+            // (a) tout blanc, downscale 2× dans les deux axes : tous les Y ≈ 235
+            // (la moyenne d'aire d'un bloc uniforme reste la même valeur).
+            const SW: usize = 8;
+            const SH: usize = 8;
+            let src = vec![255u8; SW * SH * 4];
+            let sc = Scale::new(SW as u32, SH as u32, 4, 4);
+            let mut out = vec![0u8; 4 * 4 * 3 / 2];
+            bgra_to_nv12(src.as_ptr(), SW * 4, 4, 4, 4, 4, sc, SW, SH, &mut out);
+            for &y in &out[..4 * 4] {
+                assert!((233..=237).contains(&y), "Y = {y}");
+            }
+        }
+
+        #[test]
+        fn nv12_scale_frontiere_moyenne() {
+            // (b) 3 colonnes blanches puis 5 noires sur une source 8 large, downscale
+            // 2× : la boîte de la colonne de sortie ox=1 couvre les colonnes source
+            // 2 (blanche) et 3 (noire) → doit tomber au milieu de la plage Y valide,
+            // pas à une extrémité comme le nearest-neighbor le ferait.
+            const SW: usize = 8;
+            const SH: usize = 8;
+            let mut src = vec![0u8; SW * SH * 4];
+            for y in 0..SH {
+                for x in 0..SW {
+                    let o = (y * SW + x) * 4;
+                    let v = if x < 3 { 255 } else { 0 };
+                    src[o] = v;
+                    src[o + 1] = v;
+                    src[o + 2] = v;
+                    src[o + 3] = 255;
+                }
+            }
+            let sc = Scale::new(SW as u32, SH as u32, 4, 4);
+            let mut out = vec![0u8; 4 * 4 * 3 / 2];
+            bgra_to_nv12(src.as_ptr(), SW * 4, 4, 4, 4, 4, sc, SW, SH, &mut out);
+            let y_full_white = out[0];
+            let y_boundary = out[1];
+            let y_full_black = out[3];
+            assert!((233..=237).contains(&y_full_white), "Y blanc = {y_full_white}");
+            assert!((15..=17).contains(&y_full_black), "Y noir = {y_full_black}");
+            assert!(
+                (60..=180).contains(&y_boundary),
+                "Y frontière = {y_boundary} (ni blanc ni noir pur : moyenne d'aire attendue)"
+            );
+        }
+
+        #[test]
+        fn nv12_scale_letterbox_a_l_echelle() {
+            // (c) Source native 8×8, mais la fenêtre ne couvre que sa moitié gauche
+            // (4×8 en espace SOURCE). Downscale 2× vers un tampon encodeur 4×4 : en
+            // espace SORTIE, la couverture devient 2×4 (moitié gauche du tampon), le
+            // reste doit rester letterbox noir — exactement la formule de conversion
+            // de couverture source→sortie utilisée par grab_latest.
+            const SW: usize = 8;
+            const SH: usize = 8;
+            let src = vec![255u8; SW * SH * 4]; // tout blanc (seule la zone couverte compte)
+            let sc = Scale::new(SW as u32, SH as u32, 4, 4);
+            let (src_cov_w, src_cov_h) = (4usize, 8usize);
+            // On appelle la fonction de PRODUCTION (celle qu'utilise grab_latest) au lieu
+            // de recopier sa formule : une recopie s'auto-validerait et laisserait passer
+            // une inversion source/sortie — le bug qui avait fait retirer la downscale.
+            let cov_w = super::cov_out(src_cov_w as u32, SW as u32, 4) as usize;
+            let cov_h = super::cov_out(src_cov_h as u32, SH as u32, 4) as usize;
+            assert_eq!((cov_w, cov_h), (2, 4), "couverture sortie attendue = moitié gauche");
+            // Le sens de la conversion doit être source→sortie : une fenêtre rétrécie
+            // couvre MOINS que le tampon (inverser les termes donnerait 8, clampé à 4).
+            assert_eq!(super::cov_out(960, 3840, 1920), 480, "4K→1080p, fenêtre au quart");
+            let mut out = vec![0u8; 4 * 4 * 3 / 2];
+            bgra_to_nv12(src.as_ptr(), SW * 4, 4, 4, cov_w, cov_h, sc, src_cov_w, src_cov_h, &mut out);
+            for oy in 0..4 {
+                assert!((233..=237).contains(&out[oy * 4]), "colonne 0 (couverte) doit être blanche");
+                assert!((233..=237).contains(&out[oy * 4 + 1]), "colonne 1 (couverte) doit être blanche");
+                assert_eq!(out[oy * 4 + 2], 16, "colonne 2 (hors couverture) doit être noire");
+                assert_eq!(out[oy * 4 + 3], 16, "colonne 3 (hors couverture) doit être noire");
+            }
+            // Chroma du bloc bordure (colonnes 2-3, lignes 0-1) = neutre.
+            assert_eq!(out[4 * 4 + 2], 128);
+            assert_eq!(out[4 * 4 + 3], 128);
+        }
+
+        #[test]
+        fn nv12_scale_ratio_non_entier_ne_panique_pas() {
+            // (d) 6→4 : ratio non entier (step_x/step_y = 1.5 en Q16.16). Ne doit
+            // jamais paniquer ni lire hors de la zone source déclarée (src_cov=6×6) ;
+            // source uniforme gris moyen → sortie uniforme (sanity, pas de garbage).
+            const SW: usize = 6;
+            const SH: usize = 6;
+            let src = vec![128u8; SW * SH * 4];
+            let sc = Scale::new(SW as u32, SH as u32, 4, 4);
+            let mut out = vec![0u8; 4 * 4 * 3 / 2];
+            bgra_to_nv12(src.as_ptr(), SW * 4, 4, 4, 4, 4, sc, SW, SH, &mut out);
+            for &y in &out[..4 * 4] {
+                assert!((120..=132).contains(&y), "Y gris moyen = {y}");
+            }
         }
 
         #[test]
@@ -1305,10 +1722,14 @@ mod win {
                 let device = device.unwrap();
                 let mt: ID3D10Multithread = device.cast().unwrap();
                 let _ = mt.SetMultithreadProtected(true);
-                let cap = build_capture(&device, &crate::video::ShareTarget::Window(hwnd))
-                    .expect("capture de fenêtre");
-                let enc = build_encoder(&device, cap.w, cap.h, FPS_DEFAULT).expect("encodeur");
-                let (w, h) = (cap.w as usize, cap.h as usize);
+                let cap = build_capture(
+                    &device,
+                    &crate::video::ShareTarget::Window(hwnd),
+                    crate::video::Quality::default(),
+                )
+                .expect("capture de fenêtre");
+                let enc = build_encoder(&device, cap.enc_w, cap.enc_h, FPS_DEFAULT).expect("encodeur");
+                let (w, h) = (cap.enc_w as usize, cap.enc_h as usize);
                 let mut nv12 = vec![0u8; w * h * 3 / 2];
                 let frame_dur: i64 = 10_000_000 / FPS_DEFAULT as i64;
                 let mut fed = 0u64;
@@ -1407,9 +1828,14 @@ mod win {
                 let device = device.unwrap();
                 let mt: ID3D10Multithread = device.cast().unwrap();
                 let _ = mt.SetMultithreadProtected(true);
-                let cap = build_capture(&device, &crate::video::ShareTarget::Monitor(None)).expect("capture WGC");
-                let enc = build_encoder(&device, cap.w, cap.h, FPS_DEFAULT).expect("encodeur matériel");
-                let (w, h) = (cap.w as usize, cap.h as usize);
+                let cap = build_capture(
+                    &device,
+                    &crate::video::ShareTarget::Monitor(None),
+                    crate::video::Quality::default(),
+                )
+                .expect("capture WGC");
+                let enc = build_encoder(&device, cap.enc_w, cap.enc_h, FPS_DEFAULT).expect("encodeur matériel");
+                let (w, h) = (cap.enc_w as usize, cap.enc_h as usize);
                 let mut nv12 = vec![0u8; w * h * 3 / 2];
                 let frame_dur: i64 = 10_000_000 / FPS_DEFAULT as i64;
                 let mut fed: u64 = 0;
@@ -1500,6 +1926,112 @@ mod win {
                         "SetValue(bitrate) accepté mais sans effet mesurable ({before}o → {after}o)"
                     );
                 }
+            }
+        }
+
+        /// Smoke test MATÉRIEL du chemin AVEC mise à l'échelle (720p) : c'est le
+        /// SEUL test qui aurait attrapé le bug historique (encodeur construit aux
+        /// dimensions cibles, tampon NV12 rempli aux dimensions de capture natives
+        /// → trames corrompues). Vérifie que l'encodeur produit bien un flux Annex-B
+        /// valide (start code) une fois le scaler dans la boucle. `cargo test -- --ignored`.
+        #[test]
+        #[ignore = "matériel : GPU + écran requis"]
+        fn smoke_capture_encode_scaled_720p() {
+            unsafe {
+                let _ = RoInitialize(RO_INIT_MULTITHREADED);
+                MFStartup(MF_VERSION, MFSTARTUP_FULL).unwrap();
+                let mut device: Option<ID3D11Device> = None;
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    None,
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    None,
+                )
+                .unwrap();
+                let device = device.unwrap();
+                let mt: ID3D10Multithread = device.cast().unwrap();
+                let _ = mt.SetMultithreadProtected(true);
+                let quality = crate::video::Quality { fps: 30, max_w: 1280, max_h: 720 };
+                let cap = build_capture(&device, &crate::video::ShareTarget::Monitor(None), quality)
+                    .expect("capture WGC");
+                let enc = build_encoder(&device, cap.enc_w, cap.enc_h, quality.fps).expect("encodeur matériel");
+                assert!(
+                    cap.enc_w <= 1280 && cap.enc_h <= 720,
+                    "downscale non appliqué : enc={}x{} (natif {}x{})",
+                    cap.enc_w, cap.enc_h, cap.w, cap.h
+                );
+                let (w, h) = (cap.enc_w as usize, cap.enc_h as usize);
+                let mut nv12 = vec![0u8; w * h * 3 / 2];
+                let frame_dur: i64 = 10_000_000 / quality.fps as i64;
+                let mut fed: u64 = 0;
+                let mut got: usize = 0;
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while got < 6 && Instant::now() < deadline {
+                    let ev = match enc.gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+                        Ok(e) => e,
+                        Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(e) => panic!("GetEvent: {e}"),
+                    };
+                    let ty = ev.GetType().unwrap() as i32;
+                    if ty == METransformNeedInput.0 {
+                        let mut fails = 0u32;
+                        let _ = grab_latest(&cap, &mut nv12, &mut fails);
+                        let mb = MFCreateMemoryBuffer(nv12.len() as u32).unwrap();
+                        let mut dst: *mut u8 = std::ptr::null_mut();
+                        mb.Lock(&mut dst, None, None).unwrap();
+                        std::ptr::copy_nonoverlapping(nv12.as_ptr(), dst, nv12.len());
+                        mb.Unlock().unwrap();
+                        mb.SetCurrentLength(nv12.len() as u32).unwrap();
+                        let sample = MFCreateSample().unwrap();
+                        sample.AddBuffer(&mb).unwrap();
+                        sample.SetSampleTime(fed as i64 * frame_dur).unwrap();
+                        sample.SetSampleDuration(frame_dur).unwrap();
+                        enc.transform.ProcessInput(0, &sample, 0).unwrap();
+                        fed += 1;
+                    } else if ty == METransformHaveOutput.0 {
+                        let mut out = [MFT_OUTPUT_DATA_BUFFER {
+                            dwStreamID: 0,
+                            pSample: ManuallyDrop::new(None),
+                            dwStatus: 0,
+                            pEvents: ManuallyDrop::new(None),
+                        }];
+                        let mut status = 0u32;
+                        enc.transform.ProcessOutput(0, &mut out, &mut status).unwrap();
+                        let sample = ManuallyDrop::take(&mut out[0].pSample);
+                        let _ = ManuallyDrop::take(&mut out[0].pEvents);
+                        if let Some(sample) = sample {
+                            let (_key, data) = read_sample(&sample).unwrap();
+                            // C'est LA vérification qui aurait attrapé le bug historique :
+                            // un tampon NV12 mal dimensionné produit un flux H.264 corrompu
+                            // (l'encodeur n'émet même pas un Annex-B valide, ou plante).
+                            assert!(
+                                data.starts_with(&[0, 0, 0, 1]) || data.starts_with(&[0, 0, 1]),
+                                "sortie sans start code Annex-B — tampon NV12/encodeur désynchronisés ?"
+                            );
+                            got += 1;
+                        }
+                    }
+                }
+                let (native_w, native_h) = (cap.w, cap.h);
+                let _ = cap.session.Close();
+                let _ = cap.pool.Close();
+                enc.shutdown();
+                drop(cap);
+                drop(device);
+                let _ = MFShutdown();
+                assert!(got >= 6, "seulement {got} trames encodées en 720p ({fed} nourries)");
+                println!(
+                    "✅ smoke downscale {}x{} (natif {}x{}) : {got} trames H.264 valides",
+                    w, h, native_w, native_h
+                );
             }
         }
     }

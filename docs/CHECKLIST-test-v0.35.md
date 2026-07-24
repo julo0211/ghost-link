@@ -41,6 +41,14 @@
       NE doit PAS apparaître dans le chat du mauvais groupe.
 - [ ] Image > 5 Mo via bouton/coller → message clair « glisse-la sur la fenêtre pour l'envoyer en fichier ».
 - [ ] Session longue avec beaucoup d'images → pas de fuite mémoire visible (#44, blobs révoqués).
+- [ ] **Image en plein écran** : cliquer sur une image du chat l'ouvre en grand (fond noir).
+      - [ ] fonctionne pour une image **reçue** ET pour une image **que j'ai envoyée** (les deux sources) ;
+      - [ ] en **groupe** ET en **1-à-1** ;
+      - [ ] se ferme au clic sur le fond, par le bouton ✕, **et** par la touche Échap ;
+      - [ ] un clic **sur l'image** ne la referme pas ;
+      - [ ] après avoir changé de groupe puis être revenu, les images encore affichées s'ouvrent toujours
+            (blob non révoqué trop tôt) ;
+      - [ ] un **GIF animé** s'anime en plein écran, et se fige bien à la fermeture.
 
 ## 4. Appels vocaux / vidéo — les 3 bugs HIGH (2–3 personnes)
 - [ ] Appel de groupe : audio dans les deux sens, **mute** fonctionne, `CALL_PING` (indicateur « en appel »).
@@ -61,11 +69,30 @@
 ## 5. Partage d'écran natif + qualité (2–3 personnes)
 - [ ] Partage d'écran natif (Réglages → partage natif) : les membres **dans l'appel** voient l'écran ;
       son système/fenêtre optionnel fonctionne.
+- [ ] 🔴 **ÉCHO CORRIGÉ (le bug rapporté)** — partager l'**écran entier** en acceptant « Partager aussi
+      le SON ? », pendant que 2 autres personnes parlent dans l'appel :
+      - [ ] **personne ne s'entend en écho** (c'était le symptôme : les voix repartaient dans le flux) ;
+      - [ ] le son des autres applis (vidéo, musique, jeu) est bien transmis, lui ;
+      - [ ] même vérification en partageant **une fenêtre** (doit rester sans écho, comme avant) ;
+      - [ ] le sélecteur Windows **ne propose plus** de case « Partager l'audio » : c'est normal et voulu,
+            le son passe désormais toujours par la capture native anti-écho.
+      - [ ] Si un écho persiste : es-tu en **haut-parleurs** ? (le micro peut capter les enceintes — teste
+            au casque) et as-tu une **sortie audio virtuelle** (VoiceMeeter, SteelSeries Sonar, NVIDIA
+            Broadcast) ? Ces deux cas ont des causes différentes : signale-le, ne relance pas le test.
 - [ ] **Confinement par groupe (v0.34 item 5)** : être co-membre de 2 groupes G1 et G2 avec un ami ;
       partager dans G1 pendant que l'ami est dans l'appel de **G2** → il **ne voit PAS** ton écran. Il
       rejoint l'appel de **G1** → il le voit.
 - [ ] **Sélecteur de fluidité (fps)** : choisir 60 vs 30 fps dans le picker → le stat overlay reflète le
-      choix ; le réglage est **mémorisé** au prochain partage. (Résolution native — pas de choix de résolution.)
+      choix ; le réglage est **mémorisé** au prochain partage.
+- [ ] **Sélecteur de résolution** (720p / 1080p / native), depuis un écran 1440p ou 4K :
+      - [ ] en **720p** : le log au lancement annonce bien `1280×720`, la vignette d'état affiche la même
+            chose, et le débit (stats) **chute nettement** vs natif ;
+      - [ ] chez le récepteur l'image est **nette et non déformée** (pas de bandes, pas de bouillie) ;
+      - [ ] en **1080p** depuis un écran **1080p** → reste 1080p (**aucun sur-échantillonnage**) ;
+      - [ ] redimensionner une **fenêtre** partagée en 720p → bandes noires, jamais de gel ni d'image cassée ;
+      - [ ] le réglage est **mémorisé** au partage suivant.
+- [ ] **720p à 60 fps** s'affiche bien chez le récepteur (piège du niveau H.264 : une vignette qui
+      resterait **noire** signalerait une régression du codec annoncé).
 - [ ] **#47** : un ami **hors du groupe** ne doit pas pouvoir faire apparaître une vignette « X (écran) »
       chez toi.
 
@@ -90,7 +117,8 @@
 
 ## Notes / limites connues (normales, ne pas signaler comme bugs)
 - Vote-kick **advisory** (un mesh sans serveur ne peut pas forcer une exclusion).
-- Résolution de partage **native** (choix de résolution reporté ; seul le fps est réglable).
+- Le son du partage d'écran passe **toujours** par la capture native (le navigateur ne fournit plus
+  l'audio) : une seule question « Partager aussi le SON ? » après le lancement, écran comme fenêtre.
 - Destinataires d'un partage figés au **démarrage** du partage (un arrivant tardif : relancer le partage).
 - Images de chat **éphémères** (non persistées) ; images de groupe affichées seulement pour le groupe ouvert.
 - Transfert de gros fichiers : léger délai au démarrage (calcul du hash) — annulable. (#43 = optimisation reportée.)

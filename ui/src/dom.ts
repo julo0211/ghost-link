@@ -51,6 +51,83 @@ export function shortId(id: string): string {
   return id.length > 14 ? id.slice(0, 14) + "…" : id;
 }
 
+// ----- Visionneuse d'image plein écran (overlay #imgViewWrap défini dans index.html) -----
+// Pourquoi un overlay et pas une fenêtre : WebView2 neutralise window.open, et Chromium
+// interdit une navigation top-level vers une data: URI — les deux sources d'images du chat
+// (data: en réception, blob: à l'envoi) seraient donc impossibles à ouvrir « à côté ».
+let viewerWired = false;
+function wireImgViewer(): void {
+  if (viewerWired) return; // une seule fois : sinon les listeners s'empilent à chaque image
+  viewerWired = true;
+  const wrap = document.getElementById("imgViewWrap");
+  if (!wrap) return;
+  // Fermer au clic sur le FOND uniquement (un clic sur l'image ne doit pas refermer).
+  wrap.addEventListener("click", (e) => {
+    if (e.target === wrap) closeImgViewer();
+  });
+  document.getElementById("imgViewClose")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    closeImgViewer();
+  });
+  // Échap : on n'agit QUE si la visionneuse est ouverte, pour ne rien préempter.
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || wrap.classList.contains("hidden")) return;
+    e.preventDefault();
+    closeImgViewer();
+  });
+}
+function closeImgViewer(): void {
+  document.getElementById("imgViewWrap")?.classList.add("hidden");
+  const big = document.getElementById("imgViewImg") as HTMLImageElement | null;
+  // Détacher le repli AVANT de vider la source : retirer `src` fait passer l'image à
+  // l'état « broken » et déclenche un événement `error`. Sans ce nettoyage, le repli
+  // canvas se relancerait à CHAQUE fermeture — ré-encodage PNG pleine résolution sur le
+  // thread UI (gel visible sur une grande photo) et rétention mémoire à l'opposé du but.
+  if (big) big.onerror = null;
+  // removeAttribute et non src="" : une chaîne vide relancerait une requête vers l'URL du
+  // document. Ça stoppe aussi le décodage d'un GIF animé resté en fond.
+  big?.removeAttribute("src");
+}
+/** Ouvre une image du chat en plein écran. `thumb` (la vignette déjà décodée) sert de
+ *  repli si la source est un blob: déjà révoqué : on la recopie via un canvas. */
+export function openImgViewer(src: string, thumb?: HTMLImageElement): void {
+  wireImgViewer();
+  const wrap = document.getElementById("imgViewWrap");
+  const big = document.getElementById("imgViewImg") as HTMLImageElement | null;
+  if (!wrap || !big) return;
+  // Une vignette vidéo en plein écran NATIF passerait au-dessus de l'overlay : en sortir.
+  if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
+  big.onerror = () => {
+    big.onerror = null;
+    if (!thumb || !thumb.naturalWidth) return;
+    const c = document.createElement("canvas");
+    c.width = thumb.naturalWidth;
+    c.height = thumb.naturalHeight;
+    c.getContext("2d")?.drawImage(thumb, 0, 0);
+    try {
+      big.src = c.toDataURL("image/png");
+    } catch {
+      /* canvas « tainted » (ne devrait pas arriver : même origine) */
+    }
+  };
+  big.src = src;
+  wrap.classList.remove("hidden");
+  (document.getElementById("imgViewClose") as HTMLButtonElement | null)?.focus();
+}
+
+// Registre des blob: affichés, PAR conteneur de chat. On ne peut pas les révoquer dès
+// l'onload : tant qu'une bulle est à l'écran, la visionneuse plein écran recharge cette
+// MÊME url au clic (elle afficherait une image cassée). On les révoque donc au moment où
+// le conteneur est vidé — cf. clearImgBlobs. Les images reçues sont des data: (rien à
+// révoquer) ; seules celles que l'on envoie soi-même créent un blob.
+const imgBlobs = new WeakMap<HTMLElement, string[]>();
+/** Libère les blob: des images d'un conteneur de chat. À appeler JUSTE AVANT de le vider. */
+export function clearImgBlobs(box: HTMLElement): void {
+  const list = imgBlobs.get(box);
+  if (!list) return;
+  while (list.length) URL.revokeObjectURL(list.pop() as string);
+}
+
 /** Ajoute une bulle image dans un conteneur de chat (data-URI ou blob-URL).
  *  Mirroir de la structure `.msg`/`.me`/`.them` des bulles texte (addMsg /
  *  addGroupMsgDom), avec un <img> au lieu d'un noeud texte. */
@@ -63,11 +140,17 @@ export function addImgBubble(box: HTMLElement, src: string, who: string, author?
     au.textContent = author.trim();
     m.appendChild(au);
   }
+  if (src.startsWith("blob:")) {
+    const list = imgBlobs.get(box) ?? [];
+    list.push(src);
+    imgBlobs.set(box, list);
+  }
   const img = document.createElement("img");
   img.src = src;
   img.loading = "lazy";
-  img.style.cssText = "max-width:100%;max-height:320px;border-radius:8px;cursor:pointer;display:block";
-  img.onclick = () => window.open(src, "_blank");
+  img.style.cssText = "max-width:100%;max-height:320px;border-radius:8px;cursor:zoom-in;display:block";
+  img.title = "Cliquer pour agrandir";
+  img.onclick = () => openImgViewer(src, img);
   m.appendChild(img);
   box.appendChild(m);
   box.scrollTop = box.scrollHeight;

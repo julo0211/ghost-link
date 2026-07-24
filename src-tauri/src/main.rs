@@ -304,6 +304,9 @@ async fn send_signal(state: State<'_, Net>, peer: String, data: String) -> Resul
 // Partage d'écran NATIF (video.rs) : capture WGC + H.264 matériel + flux QUIC du
 // maillage — aucun WebRTC/STUN, l'IP n'est jamais exposée. Renvoie { w, h, fps }
 // pour que l'UI l'annonce aux membres via la signalisation existante.
+// Arguments nombreux mais imposés par le contrat UI (Tauri mappe chaque champ JSON sur un
+// paramètre) : les regrouper dans une struct changerait la forme de l'appel côté TypeScript.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn video_share_start(
     net: State<'_, Net>,
@@ -313,6 +316,8 @@ async fn video_share_start(
     monitor: Option<String>,
     window: Option<String>,
     max_fps: Option<u32>,
+    max_w: Option<u32>,
+    max_h: Option<u32>,
 ) -> Result<serde_json::Value, String> {
     let conns = net::group_conns(net.inner(), &members);
     if conns.is_empty() {
@@ -328,7 +333,13 @@ async fn video_share_start(
     };
     let v = vs.inner().clone();
     let rt = tokio::runtime::Handle::current();
-    let quality = video::Quality { fps: max_fps.filter(|f| *f > 0).unwrap_or(60) };
+    // 0 (ou absent) = illimité → résolution native. Le clamp côté video.rs ne
+    // sur-échantillonne jamais : une cible plus grande que l'écran reste au natif.
+    let quality = video::Quality {
+        fps: max_fps.filter(|f| *f > 0).unwrap_or(60),
+        max_w: max_w.unwrap_or(0),
+        max_h: max_h.unwrap_or(0),
+    };
     let info = tokio::task::spawn_blocking(move || v.start(app, conns, rt, target, quality))
         .await
         .map_err(|e| e.to_string())?

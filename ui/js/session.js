@@ -1,6 +1,6 @@
 // Connexion / session 1-à-1 + demande de connexion entrante + onglets.
 import { invoke, listen } from "./tauri.js";
-import { $, log, shortId } from "./dom.js";
+import { $, log, shortId, clearImgBlobs } from "./dom.js";
 import { S, loadFriends } from "./state.js";
 import { setCallUI, hideCallOffer } from "./call.js";
 export function showTab(name) {
@@ -82,6 +82,9 @@ function setDisconnected() {
         setCallUI(false);
     }
     $("#chatCard").classList.add("hidden");
+    // Libérer les blob: des images du chat avant de vider (sinon ils resteraient alloués
+    // pour toute la vie du process, plus aucune référence DOM ne pouvant les libérer).
+    clearImgBlobs($("#chatLog"));
     $("#chatLog").innerHTML = "";
     $("#chatInput").value = "";
     $("#filePath").value = "";

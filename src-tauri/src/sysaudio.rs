@@ -31,8 +31,14 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITH
 const CAPTURE_RATE: u32 = 48_000;
 const CAPTURE_CH: u16 = 2;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
-/// AUDCLNT_S_NO_SINGLE_PROCESS (0x08890008) : succès « soft » possible de l'activation.
-const AUDCLNT_S_NO_SINGLE_PROCESS: i32 = 0x0889_0008u32 as i32;
+/// AUDCLNT_S_NO_SINGLE_PROCESS = AUDCLNT_SUCCESS(0x00d) = 0x0889000D : succès « soft »
+/// (« la session couvre plus d'un process »). La valeur 0x08890008 utilisée auparavant
+/// n'est AUCUN HRESULT existant : un vrai succès soft était donc rejeté comme une erreur
+/// et la capture du son échouait en silence (surtout en mode INCLUDE d'un process, cas
+/// typique des apps UWP/navigateurs dont le rendu audio vit dans un autre process).
+/// On accepte désormais tout HRESULT de succès (sémantique SUCCEEDED, comme l'échantillon
+/// Microsoft ApplicationLoopback) — la constante reste pour la lisibilité du log.
+const AUDCLNT_S_NO_SINGLE_PROCESS: i32 = 0x0889_000Du32 as i32;
 
 /// PROPVARIANT au layout C exact (VT_BLOB + BLOB) : la PROPVARIANT « intelligente » de
 /// windows-core n'expose pas de constructeur BLOB — on la fabrique nous-mêmes et on
@@ -113,7 +119,19 @@ unsafe fn activate_loopback(target: LoopbackTarget) -> anyhow::Result<IAudioClie
     let mut hr = windows::core::HRESULT(0);
     let mut iface: Option<windows::core::IUnknown> = None;
     op.GetActivateResult(&mut hr, &mut iface)?;
-    if hr.0 != 0 && hr.0 != AUDCLNT_S_NO_SINGLE_PROCESS {
+    // Trace d'activation. ATTENTION : visible uniquement en `cargo tauri dev` — l'exe
+    // publié est lié en sous-système « windows » (pas de console attachée), donc stderr
+    // part dans le vide. Pour un diagnostic sur une machine d'utilisateur, il faudrait
+    // remonter l'échec au Journal de l'UI via un événement (comme `ghost-meta`).
+    eprintln!(
+        "[sysaudio] activation loopback pid={} mode={} hr=0x{:08x}{}",
+        pid,
+        if matches!(target, LoopbackTarget::ExcludeSelf) { "EXCLUDE(self)" } else { "INCLUDE" },
+        hr.0,
+        if hr.0 == AUDCLNT_S_NO_SINGLE_PROCESS { " (succès soft : session multi-process)" } else { "" },
+    );
+    // SUCCEEDED(hr) : tout HRESULT >= 0 est un succès (dont le succès « soft » ci-dessus).
+    if hr.0 < 0 {
         return Err(anyhow::anyhow!("activation loopback refusée (hr=0x{:08x})", hr.0));
     }
     // `params` est resté vivant durant toute l'activation (bloquée sur rx ci-dessus) :
