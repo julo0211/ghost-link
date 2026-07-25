@@ -1,11 +1,11 @@
 {
-  "version": "0.37.1",
-  "notes": "Glisser-deposer operationnel depuis les groupes, nettoyage des metadonnees des GIF, erreurs d'apercu d'image rendues visibles.",
-  "pub_date": "2026-07-25T17:12:18.832Z",
+  "version": "0.37.2",
+  "notes": "Les images et GIF glisses s'affichent directement dans la conversation, sans atterrir dans les telechargements du destinataire.",
+  "pub_date": "2026-07-25T18:48:54.527Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVRicVRrSkgzWEhwWDJPMXBTRmJ3WlQwQjZ5Lzk1MlhvSW5xSHlIV1VtQTI1YUFVZFNueXBLdkorSUxXdTFNb3ZCTXZ2bkI2cCs2N3hBUW4wOUxoVkFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0OTk5NTM3CWZpbGU6Z2hvc3QtbGlua18wLjM3LjFfeDY0LXNldHVwLmV4ZQp3UFB5UlR6Titrb3JRSDB1MEdmdFR4RkdvTFpjeTJQSC9STU5uUXAvNTVlQVhMRDZ5UXp1U3MzS1pydHFuUkFmMk9RODJPTUpyY0xhZUdya3ZkV3JBQT09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.37.1_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVJkVmsvMURyMWUzKzcyRW1CeEozVUxDK256N01XYTBlR0wzODBwZkoxUXdkUlFnUWRFOTg2YTREVlZSU0R3d2ljSHdySmdoclFpcHhhWHVLYzJ3a1FrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MDA1MzMzCWZpbGU6Z2hvc3QtbGlua18wLjM3LjJfeDY0LXNldHVwLmV4ZQpSWEJYRVJlanlXNVc3a29IREYxcTNQRzN2bzVEQTRBZEZJVGlxVmNxd1ZVLzA3MEl3K0dHZU5kT2d1RlBKaTZiRnZ3SE1WVjhLZzNISTNtc2xaTG9CZz09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.37.2_x64-setup.exe"
     }
   }
 }
