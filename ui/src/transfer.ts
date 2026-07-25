@@ -18,6 +18,13 @@ function guessImageMime(name: string): string | null {
   return null;
 }
 
+/** Vrai si la section `[data-view="<nom>"]` est actuellement AFFICHÉE.
+ *  Même idiome que noteIncoming1to1 et watchingGroup : `view-hidden` = masquée. */
+function vueAffichee(nom: string): boolean {
+  const v = document.querySelector(`[data-view="${nom}"]`);
+  return !!v && !v.classList.contains("view-hidden");
+}
+
 function setFile(path: string): void {
   $<HTMLInputElement>("#filePath").value = path;
   // Le nom de fichier est une DONNÉE : il ne doit pas atteindre un parseur HTML. C'était
@@ -255,7 +262,11 @@ export function initTransfer(): void {
           const url = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: mime }));
           addImgBubble($("#chatLog"), url, "them");
         })
-        .catch(() => {});
+        // Un `.catch(() => {})` nu rendait l'échec TOTALEMENT invisible : le fichier
+        // arrivait, aucune image n'apparaissait, et rien n'expliquait pourquoi. Le fichier
+        // est bien reçu (l'entrée ci-dessus le prouve) — seul l'aperçu manque, donc on
+        // informe sans alarmer, mais on ne se tait pas.
+        .catch((e) => log("Aperçu de l'image impossible (" + e + ") — le fichier est bien reçu : " + name));
     }
   });
   listen("ghost-recv-cancel", (e) => {
@@ -343,11 +354,27 @@ export function initTransfer(): void {
   listen("tauri://drag-drop", (e) => {
     $("#drop").classList.remove("over");
     const paths = e.payload && e.payload.paths;
-    if (paths && paths.length) {
-      if (paths.length > 1) {
-        log("Un seul fichier à la fois — « " + baseName(paths[0]) + " » sélectionné, " + (paths.length - 1) + " ignoré(s).");
-      }
-      setFile(paths[0]);
+    if (!paths || !paths.length) return;
+    if (paths.length > 1) {
+      log("Un seul fichier à la fois — « " + baseName(paths[0]) + " » sélectionné, " + (paths.length - 1) + " ignoré(s).");
     }
+    const p = paths[0];
+    // Le glisser-déposer est GLOBAL à la fenêtre, mais #drop et #filePath vivent dans la
+    // section [data-view="session"] (le 1-à-1). Sans ce routage, déposer un fichier alors
+    // qu'un groupe est ouvert — ou qu'aucune conversation n'est active — remplissait une
+    // zone MASQUÉE : l'événement partait bien, rien n'apparaissait, et l'utilisateur
+    // concluait que le glisser-déposer était cassé. Le groupe n'avait par ailleurs AUCUN
+    // glisser-déposer, son seul moyen de désigner un fichier étant la saisie du chemin.
+    if (vueAffichee("group")) {
+      $<HTMLInputElement>("#groupFilePath").value = p;
+      log("📎 « " + baseName(p) + " » prêt pour le groupe — clique « 📎 Envoyer ».");
+      return;
+    }
+    if (vueAffichee("session")) {
+      setFile(p);
+      return;
+    }
+    // Ne jamais absorber un dépôt en silence : dire pourquoi il n'a rien fait.
+    log("📄 « " + baseName(p) + " » : ouvre d'abord une conversation ou un groupe pour l'envoyer.");
   });
 }

@@ -155,19 +155,28 @@ async fn send_gimg(app: tauri::AppHandle, state: State<'_, Net>, members: Vec<St
 /// s'exécutant dans la vue. Le seul appel légitime (ui/src/transfer.ts) passe un chemin
 /// que NOUS venons de fabriquer et d'émettre dans `ghost-recv-done` : il est toujours
 /// dans le dossier de réception, le confinement ne coûte donc rien fonctionnellement.
-#[tauri::command]
-async fn read_image_bytes(state: State<'_, Net>, path: String) -> Result<Vec<u8>, String> {
-    // canonicalize() résout liens, jonctions, « .. » et casse : la comparaison de préfixe
-    // porte sur le chemin RÉEL, jamais sur la chaîne fournie par le JS.
-    let dossier = std::path::PathBuf::from(net::get_download_dir(&state.settings))
+/// Résout `path` en garantissant qu'il reste À L'INTÉRIEUR de `dossier`.
+///
+/// `canonicalize()` résout liens, jonctions, « .. » et casse : la comparaison de préfixe
+/// porte donc sur le chemin RÉEL et non sur la chaîne fournie par le JS. Extrait de la
+/// commande pour être TESTABLE — c'est un contrôle de sécurité sur le chemin critique du
+/// rendu d'images reçues, il ne doit pas pouvoir casser sans qu'un test le dise.
+fn confiner_dans(dossier: &str, path: &str) -> Result<std::path::PathBuf, String> {
+    let racine = std::path::PathBuf::from(dossier)
         .canonicalize()
         .map_err(|e| format!("dossier de réception illisible : {e}"))?;
-    let cible = std::path::Path::new(&path)
+    let cible = std::path::Path::new(path)
         .canonicalize()
         .map_err(|e| e.to_string())?;
-    if !cible.starts_with(&dossier) {
+    if !cible.starts_with(&racine) {
         return Err("chemin hors du dossier de réception".into());
     }
+    Ok(cible)
+}
+
+#[tauri::command]
+async fn read_image_bytes(state: State<'_, Net>, path: String) -> Result<Vec<u8>, String> {
+    let cible = confiner_dans(&net::get_download_dir(&state.settings), &path)?;
     let meta = std::fs::metadata(&cible).map_err(|e| e.to_string())?;
     if !meta.is_file() {
         return Err("pas un fichier régulier".into());
@@ -694,7 +703,36 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::signed_file_name;
+    use super::{confiner_dans, signed_file_name};
+
+    // ---- Confinement du rendu d'images reçues ----
+    // Test de NON-RÉGRESSION du cas nominal : le durcissement ne doit pas casser le rendu
+    // inline d'une image reçue par le flux fichier (glisser-déposer). Côté UI l'erreur est
+    // avalée par un `.catch()`, donc une régression ici serait TOTALEMENT silencieuse.
+
+    #[test]
+    fn confinement_accepte_un_fichier_du_dossier_de_reception() {
+        let dir = std::env::temp_dir().join("gl-confine-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("photo reçue.jpg");
+        std::fs::write(&f, b"x").unwrap();
+        let r = confiner_dans(&dir.to_string_lossy(), &f.to_string_lossy());
+        assert!(r.is_ok(), "un fichier DU dossier doit passer, or : {r:?}");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn confinement_refuse_un_fichier_hors_du_dossier() {
+        let dir = std::env::temp_dir().join("gl-confine-ko");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dehors = std::env::temp_dir().join("gl-secret.txt");
+        std::fs::write(&dehors, b"x").unwrap();
+        assert!(confiner_dans(&dir.to_string_lossy(), &dehors.to_string_lossy()).is_err());
+        // Et la traversée explicite, qui est le vrai vecteur.
+        let traverse = format!("{}\\..\\gl-secret.txt", dir.to_string_lossy());
+        assert!(confiner_dans(&dir.to_string_lossy(), &traverse).is_err());
+        let _ = std::fs::remove_file(&dehors);
+    }
 
     /// Signature RÉELLE publiée dans latest.json pour v0.36.1 (clé publique du dépôt).
     /// Sert de référence de format : si tauri change la forme du « trusted comment »,

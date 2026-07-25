@@ -10,6 +10,10 @@
 //           géolocalisée APRÈS la fin de l'image.
 // - PNG   : tEXt/zTXt/iTXt/tIME/eXIf (+ données après IEND).
 // - WebP  : chunks EXIF/XMP + bits correspondants du VP8X.
+// - GIF   : extensions de commentaire (0xFE), de texte (0x01) et d'application non
+//           essentielles (XMP Adobe, ICC, tags d'éditeur) + troncature après le trailer.
+//           GARDE le contrôle graphique (timing/transparence) et la boucle NETSCAPE2.0 —
+//           les retirer casserait visiblement l'animation.
 // - WAV   : LIST INFO, bext (broadcast), iXML/axml, id3.
 // - MP3   : ID3v2 (en-tête + pied), ID3v1, APEv2.
 // - MP4/MOV/M4A : atomes udta/meta (GPS ©xyz, tags iTunes) renommés « free » ET
@@ -24,7 +28,7 @@
 // DEUX POINTS D'ENTRÉE, MÊME CONTRAT :
 // - `prepare(path)`      : chemin FICHIER (envoi de fichier, glisser-déposer).
 // - `prepare_bytes(data)`: chemin IMAGE INLINE du chat (🖼️ et Ctrl+V), qui n'expose aucun
-//           chemin de fichier. Couvre JPEG/PNG/WebP ; le GIF reste non nettoyé et le SIGNALE.
+//           chemin de fichier. MÊME couverture que `prepare` : JPEG, PNG, WebP et GIF.
 //           Ce second point d'entrée manquait : coller une photo transmettait son EXIF/GPS
 //           intact alors que la MÊME photo glissée était nettoyée, et le Journal restait
 //           muet — donc l'utilisateur lisait l'absence de message comme « rien à nettoyer ».
@@ -98,6 +102,7 @@ pub fn prepare(path: &Path) -> Prep {
         }
         "png" => clean_in_memory(path, size, clean_png),
         "webp" => clean_in_memory(path, size, clean_webp),
+        "gif" => clean_in_memory(path, size, clean_gif),
         "wav" => clean_in_memory(path, size, clean_wav),
         "mp3" => clean_in_memory(path, size, clean_mp3),
         "mp4" | "m4a" | "m4v" | "mov" | "3gp" => clean_mp4_file(path, size),
@@ -108,7 +113,7 @@ pub fn prepare(path: &Path) -> Prep {
         // Métadonnées présentes mais nettoyage non implémenté : prévenir, ne pas se taire.
         // (heic/heif = photos iPhone : EXIF/GPS complet ; RAW constructeurs ; conteneurs
         // vidéo à tags ; formats bureautiques hérités ; svg = XML avec commentaires.)
-        "heic" | "heif" | "tif" | "tiff" | "gif" | "avi" | "mkv" | "webm" | "flac" | "ogg"
+        "heic" | "heif" | "tif" | "tiff" | "avi" | "mkv" | "webm" | "flac" | "ogg"
         | "opus" | "aac" | "wma" | "wmv" | "doc" | "xls" | "ppt" | "rtf" | "dng" | "cr2"
         | "cr3" | "nef" | "arw" | "orf" | "rw2" | "raf" | "avif" | "jxl" | "svg" | "mts"
         | "m2ts" | "mpg" | "mpeg" | "flv" | "3g2" | "mka" | "m4b" => {
@@ -122,6 +127,7 @@ pub fn prepare(path: &Path) -> Prep {
             Some(Magic::Jpeg) => clean_in_memory(path, size, clean_jpeg),
             Some(Magic::Png) => clean_in_memory(path, size, clean_png),
             Some(Magic::Webp) => clean_in_memory(path, size, clean_webp),
+            Some(Magic::Gif) => clean_in_memory(path, size, clean_gif),
             Some(Magic::Wav) => clean_in_memory(path, size, clean_wav),
             Some(Magic::Mp3) => clean_in_memory(path, size, clean_mp3),
             Some(Magic::Mp4) => clean_mp4_file(path, size),
@@ -152,7 +158,7 @@ pub enum BytesPrep {
 ///
 /// Le format est déduit des MAGIC BYTES et jamais du mime déclaré par la WebView :
 /// ce mime vient de `File.type`, c'est-à-dire du système de fichiers du poste, il est
-/// donc renommable et ne prouve rien. Même couverture que `prepare` pour JPEG/PNG/WebP.
+/// donc renommable et ne prouve rien. Même couverture que `prepare` : JPEG, PNG, WebP, GIF.
 ///
 /// Contrat identique au chemin fichier : on n'échoue JAMAIS l'envoi pour un nettoyage
 /// raté, mais on ne se tait jamais non plus (cf. LIMITES ASSUMÉES en tête de module).
@@ -160,17 +166,11 @@ pub fn prepare_bytes(data: &[u8]) -> BytesPrep {
     if data.len() as u64 > MAX_IN_MEMORY {
         return BytesPrep::Skipped("trop volumineux pour le nettoyage");
     }
-    // GIF n'a pas de nettoyeur (extensions d'application, commentaires, XMP) : il est
-    // dans la liste blanche des mimes acceptés par net.rs, il faut donc le traiter
-    // explicitement ici — sinon il tomberait dans « format non reconnu », message
-    // trompeur pour un format que l'app accepte volontairement.
-    if data.len() >= 6 && (&data[..6] == b"GIF87a" || &data[..6] == b"GIF89a") {
-        return BytesPrep::Skipped("format à métadonnées non nettoyable pour l'instant");
-    }
     let cleaner: Cleaner = match sniff_bytes(data) {
         Some(Magic::Jpeg) => clean_jpeg,
         Some(Magic::Png) => clean_png,
         Some(Magic::Webp) => clean_webp,
+        Some(Magic::Gif) => clean_gif,
         _ => return BytesPrep::Skipped("format d'image non reconnu"),
     };
     match cleaner(data) {
@@ -185,6 +185,7 @@ enum Magic {
     Jpeg,
     Png,
     Webp,
+    Gif,
     Wav,
     Mp3,
     Mp4,
@@ -210,6 +211,9 @@ fn sniff_bytes(h: &[u8]) -> Option<Magic> {
     }
     if h.len() >= 8 && h[..8] == PNG_SIG {
         return Some(Magic::Png);
+    }
+    if h.len() >= 6 && (&h[..6] == b"GIF87a" || &h[..6] == b"GIF89a") {
+        return Some(Magic::Gif);
     }
     if h.len() >= 12 && &h[..4] == b"RIFF" {
         let form = &h[8..12];
@@ -281,6 +285,132 @@ pub fn gc_temp() {
             }
         }
     }
+}
+
+/// Saute une suite de sous-blocs GIF `[len][data]…` terminée par un octet nul.
+/// Renvoie l'index JUSTE APRÈS le terminateur.
+fn gif_skip_subblocks(data: &[u8], mut i: usize) -> Result<usize, String> {
+    loop {
+        if i >= data.len() {
+            return Err("GIF: sous-bloc tronqué".into());
+        }
+        let n = data[i] as usize;
+        i += 1;
+        if n == 0 {
+            return Ok(i);
+        }
+        i = i.checked_add(n).ok_or("GIF: sous-bloc hors limites")?;
+        if i > data.len() {
+            return Err("GIF: sous-bloc tronqué".into());
+        }
+    }
+}
+
+/// Taille d'une table de couleurs GIF d'après l'octet « packed » du descripteur.
+fn gif_table_size(packed: u8) -> usize {
+    3usize << ((packed & 0x07) + 1) // 3 octets × 2^(N+1) entrées
+}
+
+/// GIF : retire les extensions de COMMENTAIRE (0xFE), de TEXTE (0x01) et d'APPLICATION
+/// non essentielles (XMP d'Adobe, profils ICC, tags d'éditeur…), puis tronque tout ce qui
+/// suit le trailer — même piège que le trailer JPEG, on peut y cacher une charge utile.
+///
+/// GARDE IMPÉRATIVEMENT, sous peine de casser l'image :
+/// - `0xF9` Graphic Control Extension : durée d'affichage et transparence de CHAQUE image.
+///   La retirer transforme une animation en diaporama instantané.
+/// - Application Extension `NETSCAPE2.0` / `ANIMEXTS1.0` : compteur de boucles. La retirer
+///   fait jouer l'animation UNE seule fois au lieu de boucler — le défaut le plus visible
+///   qu'un « nettoyage » de GIF puisse introduire.
+fn clean_gif(data: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    if data.len() < 13 || (&data[..6] != b"GIF87a" && &data[..6] != b"GIF89a") {
+        return Err("GIF: en-tête invalide".into());
+    }
+    let mut out = Vec::with_capacity(data.len());
+    out.extend_from_slice(&data[..13]); // en-tête + Logical Screen Descriptor
+    let mut i = 13usize;
+    if data[10] & 0x80 != 0 {
+        // Table de couleurs globale
+        let fin = i
+            .checked_add(gif_table_size(data[10]))
+            .ok_or("GIF: table globale hors limites")?;
+        if fin > data.len() {
+            return Err("GIF: table globale tronquée".into());
+        }
+        out.extend_from_slice(&data[i..fin]);
+        i = fin;
+    }
+    let mut change = false;
+    loop {
+        if i >= data.len() {
+            return Err("GIF: fin inattendue (trailer manquant)".into());
+        }
+        match data[i] {
+            0x3B => {
+                out.push(0x3B);
+                if i + 1 < data.len() {
+                    change = true; // charge utile cachée après le trailer
+                }
+                break;
+            }
+            0x21 => {
+                if i + 1 >= data.len() {
+                    return Err("GIF: extension tronquée".into());
+                }
+                let label = data[i + 1];
+                let debut = i;
+                let apres_label = i + 2;
+                let garder = match label {
+                    0xF9 => true, // timing / transparence — vital
+                    0xFE | 0x01 => false, // commentaire, texte : métadonnées
+                    0xFF => {
+                        // Extension d'application : bloc d'identification de 11 octets.
+                        apres_label < data.len()
+                            && data[apres_label] == 11
+                            && apres_label + 12 <= data.len()
+                            && matches!(
+                                &data[apres_label + 1..apres_label + 9],
+                                b"NETSCAPE" | b"ANIMEXTS"
+                            )
+                    }
+                    _ => false, // label inconnu : on ne le propage pas
+                };
+                let fin = gif_skip_subblocks(data, apres_label)?;
+                if garder {
+                    out.extend_from_slice(&data[debut..fin]);
+                } else {
+                    change = true;
+                }
+                i = fin;
+            }
+            0x2C => {
+                // Descripteur d'image : 10 octets, puis table locale optionnelle,
+                // puis taille de code LZW, puis les sous-blocs de données.
+                let debut = i;
+                if i + 10 > data.len() {
+                    return Err("GIF: descripteur d'image tronqué".into());
+                }
+                let packed = data[i + 9];
+                let mut j = i + 10;
+                if packed & 0x80 != 0 {
+                    j = j
+                        .checked_add(gif_table_size(packed))
+                        .ok_or("GIF: table locale hors limites")?;
+                    if j > data.len() {
+                        return Err("GIF: table locale tronquée".into());
+                    }
+                }
+                if j >= data.len() {
+                    return Err("GIF: données d'image tronquées".into());
+                }
+                j += 1; // LZW minimum code size
+                let fin = gif_skip_subblocks(data, j)?;
+                out.extend_from_slice(&data[debut..fin]);
+                i = fin;
+            }
+            b => return Err(format!("GIF: bloc inconnu 0x{b:02X}")),
+        }
+    }
+    Ok(if change { Some(out) } else { None })
 }
 
 type Cleaner = fn(&[u8]) -> Result<Option<Vec<u8>>, String>;
@@ -1062,12 +1192,89 @@ mod tests {
         }
     }
 
+    /// GIF minimal 1×1 : en-tête + LSD (table globale de 6 octets) puis les blocs fournis,
+    /// terminés par le trailer. Sert à construire des cas de test lisibles.
+    fn gif(blocs: &[&[u8]], apres_trailer: &[u8]) -> Vec<u8> {
+        let mut d = b"GIF89a".to_vec();
+        d.extend_from_slice(&[1, 0, 1, 0, 0x80, 0, 0]); // 1×1, table globale (2 entrées)
+        d.extend_from_slice(&[0, 0, 0, 255, 255, 255]); // la table elle-même
+        for b in blocs {
+            d.extend_from_slice(b);
+        }
+        d.push(0x3B); // trailer
+        d.extend_from_slice(apres_trailer);
+        d
+    }
+    /// Une image complète : descripteur 1×1 sans table locale + données LZW.
+    const GIF_IMAGE: &[u8] = &[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0x02, 0x02, 0x44, 0x01, 0x00];
+    /// Extension de contrôle graphique (timing/transparence) — doit être PRÉSERVÉE.
+    const GIF_GCE: &[u8] = &[0x21, 0xF9, 0x04, 0x00, 0x0A, 0x00, 0x00, 0x00];
+    /// Boucle NETSCAPE2.0 — doit être PRÉSERVÉE, sinon l'animation ne boucle plus.
+    const GIF_LOOP: &[u8] = &[
+        0x21, 0xFF, 0x0B, b'N', b'E', b'T', b'S', b'C', b'A', b'P', b'E', b'2', b'.', b'0', 0x03,
+        0x01, 0x00, 0x00, 0x00,
+    ];
+
     #[test]
-    fn prepare_bytes_gif_avertit_au_lieu_de_se_taire() {
-        // GIF est dans la liste blanche de mimes de net.rs mais n'a pas de nettoyeur :
-        // il DOIT produire un avertissement visible, jamais un Untouched silencieux.
-        let d = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;".to_vec();
-        assert!(matches!(prepare_bytes(&d), BytesPrep::Skipped(_)));
+    fn gif_retire_commentaires_xmp_et_trailer() {
+        let commentaire: &[u8] = &[
+            0x21, 0xFE, 0x0D, b'S', b'E', b'C', b'R', b'E', b'T', b'C', b'O', b'M', b'M', b'E',
+            b'N', b'T', 0x00,
+        ];
+        // Extension d'application « XMP Data » d'Adobe : métadonnées, à retirer.
+        let xmp: &[u8] = &[
+            0x21, 0xFF, 0x0B, b'X', b'M', b'P', b' ', b'D', b'a', b't', b'a', b'X', b'M', b'P',
+            0x04, b'G', b'P', b'S', b'!', 0x00,
+        ];
+        let d = gif(&[GIF_LOOP, commentaire, xmp, GIF_GCE, GIF_IMAGE], b"HIDDENPAYLOAD");
+        let out = clean_gif(&d).unwrap().expect("doit changer");
+        let hay = |n: &[u8]| out.windows(n.len()).any(|w| w == n);
+        assert!(!hay(b"SECRETCOMMENT"), "commentaire non retiré");
+        assert!(!hay(b"XMP Data"), "bloc XMP non retiré");
+        assert!(!hay(b"HIDDENPAYLOAD"), "charge utile après le trailer non tronquée");
+        // Ce qui rend le GIF ANIMÉ doit survivre intact.
+        assert!(hay(b"NETSCAPE2.0"), "boucle retirée : l'animation ne bouclerait plus");
+        assert!(hay(&[0x21, 0xF9]), "contrôle graphique retiré : timing cassé");
+        assert!(out.ends_with(&[0x3B]), "doit finir sur le trailer");
+    }
+
+    #[test]
+    fn gif_propre_reste_untouched() {
+        // Aucune métadonnée : ne pas réécrire le fichier pour rien.
+        let d = gif(&[GIF_LOOP, GIF_GCE, GIF_IMAGE], b"");
+        assert!(clean_gif(&d).unwrap().is_none());
+    }
+
+    #[test]
+    fn gif_malforme_erreur_sans_paniquer() {
+        // Le nettoyage tourne sur un fichier choisi par l'utilisateur : il ne doit JAMAIS
+        // paniquer (une panique dans spawn_blocking ferait échouer l'envoi sans explication).
+        assert!(clean_gif(b"GIF89a").is_err()); // tronqué avant le LSD
+        assert!(clean_gif(b"pas un gif du tout").is_err());
+        // Longueur de sous-bloc qui déborde du tampon.
+        let d = gif(&[&[0x21, 0xFE, 0xFF, b'x']], b"");
+        assert!(clean_gif(&d).is_err());
+        // Table globale annoncée mais absente.
+        assert!(clean_gif(b"GIF89a\x01\x00\x01\x00\xF7\x00\x00").is_err());
+    }
+
+    #[test]
+    fn prepare_bytes_nettoie_aussi_les_gif() {
+        // Le chemin IMAGE INLINE doit avoir exactement la même couverture que le chemin
+        // fichier : c'est toute la raison d'être de `prepare_bytes`.
+        let commentaire: &[u8] = &[0x21, 0xFE, 0x06, b'S', b'E', b'C', b'R', b'E', b'T', 0x00];
+        let d = gif(&[GIF_LOOP, commentaire, GIF_GCE, GIF_IMAGE], b"");
+        match prepare_bytes(&d) {
+            BytesPrep::Cleaned(v) => {
+                assert!(!v.windows(6).any(|w| w == b"SECRET"), "commentaire encore présent");
+                assert!(v.windows(11).any(|w| w == b"NETSCAPE2.0"), "boucle perdue");
+            }
+            autre => panic!("un GIF commenté doit être nettoyé, pas {}", match autre {
+                BytesPrep::Untouched => "ignoré",
+                BytesPrep::Skipped(_) => "sauté",
+                _ => "en échec",
+            }),
+        }
     }
 
     #[test]
