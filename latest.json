@@ -1,11 +1,11 @@
 {
-  "version": "0.36.1",
-  "notes": "Ameliorations et corrections.",
-  "pub_date": "2026-07-24T23:59:00.139Z",
+  "version": "0.37.0",
+  "notes": "Correctifs de securite : metadonnees des images du chat, controle d'acces au demarrage, protections anti-saturation.",
+  "pub_date": "2026-07-25T16:53:35.636Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRWJES21OamFxR2xJWjRpelkrTFlUZ1JydEJhUHFpU1NYMlZ1R3h6bndWaVR2Qko4SzVpdkRVUWVsSDBmZGlNbWtsd0Q5aUhNSGJpNDVFRlhpeDJlS3cwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0OTM3NTM4CWZpbGU6Z2hvc3QtbGlua18wLjM2LjFfeDY0LXNldHVwLmV4ZQpZMXJVeUtOR3hzYlcyRUVJOG9jMi9MZERrc2xsYUdkakJISDB4VTVPMzNjUXBNa25xKzF4UkhTa1Y2WTVWQ2FybmJUQ0F6b2lDWmErcU1lNHJrbHRCQT09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.36.1_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVdLT1VqZDJjeXZ0TVFoVXRqQVhDWG53NCtZR2JTRzN0dXduS3lhQTVvNVV1SjRZKzR0TUQyYnJESmlqOHJ2Ymdhcm1TTVBySldLS1N4QzlBMEw5dVFVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0OTk4NDE0CWZpbGU6Z2hvc3QtbGlua18wLjM3LjBfeDY0LXNldHVwLmV4ZQpTdWlKNEdYL0dZeGRuRWlqZWRlbXBJazRjUUhnUkV0TzhLUjlYd3Q0VVJJMjZMYUxEaHE3RzRsT2JrRVpEbno0LzBuVnNQVnZ2VC8rbjJZZFpkOThEdz09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.37.0_x64-setup.exe"
     }
   }
 }
