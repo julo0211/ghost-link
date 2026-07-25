@@ -1,11 +1,11 @@
 {
-  "version": "0.37.2",
-  "notes": "Les images et GIF glisses s'affichent directement dans la conversation, sans atterrir dans les telechargements du destinataire.",
-  "pub_date": "2026-07-25T18:48:54.527Z",
+  "version": "0.37.3",
+  "notes": "Deposer un fichier le prepare a l'envoi ; c'est le bouton Envoyer qui le declenche. Les images et GIF continuent de s'afficher directement dans la conversation.",
+  "pub_date": "2026-07-25T18:57:12.127Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVJkVmsvMURyMWUzKzcyRW1CeEozVUxDK256N01XYTBlR0wzODBwZkoxUXdkUlFnUWRFOTg2YTREVlZSU0R3d2ljSHdySmdoclFpcHhhWHVLYzJ3a1FrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MDA1MzMzCWZpbGU6Z2hvc3QtbGlua18wLjM3LjJfeDY0LXNldHVwLmV4ZQpSWEJYRVJlanlXNVc3a29IREYxcTNQRzN2bzVEQTRBZEZJVGlxVmNxd1ZVLzA3MEl3K0dHZU5kT2d1RlBKaTZiRnZ3SE1WVjhLZzNISTNtc2xaTG9CZz09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.37.2_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVg5RkdORUgvN1pkSmpKTHQ4SE5ucXZuU1lnVEgvbmsrWlVLcm9rREljTFlYLzM2WUh1aTAvZitTalQzUUtPMHBhMldDenl0SXFqdkp4VGdzWFgvd0FFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MDA1ODMxCWZpbGU6Z2hvc3QtbGlua18wLjM3LjNfeDY0LXNldHVwLmV4ZQpjTWx1TVNadldqdUgwSVpPc3lLNHIrK1FMdVV1V2NqN215ZnRyZUNtMWJBd3M1MlVVNDYvSDVzbFN3WS95Znd6MHppbzE3NnhPbTBQR1p5eVMxWFlDdz09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.37.3_x64-setup.exe"
     }
   }
 }
