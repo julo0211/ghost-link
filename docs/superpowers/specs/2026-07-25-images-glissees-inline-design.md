@@ -59,6 +59,16 @@ Dans le gestionnaire `tauri://drag-drop`, après le routage par vue déjà en pl
 
 - **Le fichier n'est pas une image** (`guessImageMime` → `null`) : comportement actuel,
   inchangé (remplissage de la zone, envoi au clic).
+
+> **INVARIANT** — un dépôt ne déclenche un envoi de FICHIER que dans un seul cas : une image
+> trop lourde dont l'utilisateur vient de confirmer le repli. Partout ailleurs, déposer
+> **prépare** l'envoi ; c'est le clic sur « Envoyer » qui l'ordonne. Une image ≤ 5 Mo part
+> d'elle-même parce qu'elle s'affiche dans la conversation au lieu d'atterrir chez le
+> destinataire — ce n'est pas la même chose.
+>
+> Violé une première fois à l'implémentation : la queue « envoi fichier » était partagée
+> entre le cas confirmé et le cas ordinaire, si bien que déposer un PDF l'envoyait
+> immédiatement. Les deux branches doivent rester **séparées**, pas factorisées.
 - **Image ou GIF ≤ 5 Mo** : lecture des octets via `read_image_bytes`, puis `send_img`
   (1-à-1) ou `send_gimg` (groupe), et bulle locale. Les métadonnées sont nettoyées par
   `clean_inline_img`, déjà en place — aucun travail supplémentaire.

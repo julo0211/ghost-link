@@ -58,12 +58,18 @@ async function deposer1a1(p: string, mime: string | null): Promise<void> {
       }
       return;
     }
+    // Image trop lourde : l'envoi en fichier vient d'être explicitement confirmé, donc on
+    // le lance. On passe par le bouton pour réutiliser toute son UI (débit, annulation).
     if (!accepteRepliFichier(baseName(p))) return;
+    setFile(p);
+    $<HTMLButtonElement>("#btnSend").click();
+    return;
   }
-  // Fichier ordinaire, ou image trop lourde dont l'envoi vient d'être confirmé : on remplit
-  // la zone et on déclenche le bouton, pour réutiliser toute son UI (débit, annulation).
+  // Fichier ordinaire : on PRÉPARE l'envoi, on ne le déclenche pas. Déposer un fichier
+  // n'est pas un ordre d'envoi — c'est le clic sur « Envoyer » qui l'est. Seules les images
+  // partent d'elles-mêmes, parce qu'elles s'affichent dans la conversation au lieu
+  // d'atterrir chez le destinataire.
   setFile(p);
-  $<HTMLButtonElement>("#btnSend").click();
 }
 
 /** Dépôt dans un groupe. Même règle, mais `send_gimg` / `send_gfile` — et pas d'import de
@@ -95,15 +101,20 @@ async function deposerGroupe(p: string, mime: string | null): Promise<void> {
       }
       return;
     }
+    // Image trop lourde et envoi confirmé : la confirmation EST l'ordre d'envoi.
     if (!accepteRepliFichier(baseName(p))) return;
+    $<HTMLInputElement>("#groupFilePath").value = p;
+    invoke("send_gfile", { members: g.members, path: p })
+      .then(() => {
+        log("📎 Fichier envoyé au groupe : " + baseName(p));
+        $<HTMLInputElement>("#groupFilePath").value = "";
+      })
+      .catch((e) => log("Fichier groupe : " + e));
+    return;
   }
+  // Fichier ordinaire : on PRÉPARE l'envoi, on ne le déclenche pas (cf. deposer1a1).
   $<HTMLInputElement>("#groupFilePath").value = p;
-  invoke("send_gfile", { members: g.members, path: p })
-    .then(() => {
-      log("📎 Fichier envoyé au groupe : " + baseName(p));
-      $<HTMLInputElement>("#groupFilePath").value = "";
-    })
-    .catch((e) => log("Fichier groupe : " + e));
+  log("📎 « " + baseName(p) + " » prêt pour le groupe — clique « 📎 Envoyer ».");
 }
 
 /** Vrai si la section `[data-view="<nom>"]` est actuellement AFFICHÉE.
