@@ -2,7 +2,7 @@
 
 import { invoke, listen } from "./tauri.js";
 import { $, log, fmt, etaStr, baseName, addImgBubble, clampLabel, playPing, trimTextBubbles } from "./dom.js";
-import { S, myName, memberName, isDeclaredLabel } from "./state.js";
+import { S, myName, memberName, isDeclaredLabel, loadGroups } from "./state.js";
 import { paintConvoUnread } from "./session.js";
 
 // Images/GIF inline (Task 3.4) : au-delà, pas de chemin fichier disponible pour
@@ -16,6 +16,94 @@ function guessImageMime(name: string): string | null {
   if (n.endsWith(".webp")) return "image/webp";
   if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
   return null;
+}
+
+/** Octets d'une image DÉPOSÉE sur la fenêtre.
+ *
+ *  Rust n'autorise cette lecture que parce que le système lui a signalé le dépôt (registre
+ *  `DroppedPaths`) : un chemin que l'utilisateur n'a pas glissé reste illisible. `null` =
+ *  illisible ou trop volumineuse pour la lecture bornée — l'appelant se replie sur le fichier. */
+async function lireImageDeposee(p: string): Promise<number[] | null> {
+  try {
+    return await invoke("read_image_bytes", { path: p });
+  } catch {
+    return null; // l'appelant explique et propose le repli — pas d'échec muet
+  }
+}
+
+/** Demande confirmation avant qu'une image trop lourde ne devienne un FICHIER chez le pair.
+ *  C'est le seul cas où un dépôt d'image atterrit dans les Téléchargements de quelqu'un :
+ *  il ne doit pas se produire dans le dos de l'utilisateur. */
+function accepteRepliFichier(nom: string): boolean {
+  const ok = confirm(
+    "« " +
+      nom +
+      " » dépasse 5 Mo : trop lourde pour s'afficher dans la conversation.\n\n" +
+      "L'envoyer en fichier ? Elle atterrira dans les Téléchargements de ton correspondant.",
+  );
+  if (!ok) log("Envoi annulé — « " + nom + " » n'a pas été envoyée.");
+  return ok;
+}
+
+/** Dépôt dans une conversation 1-à-1 : image/GIF → inline, tout le reste → fichier. */
+async function deposer1a1(p: string, mime: string | null): Promise<void> {
+  if (mime) {
+    const bytes = await lireImageDeposee(p);
+    if (bytes && bytes.length <= MAX_INLINE_IMG) {
+      try {
+        await invoke("send_img", { author: myName(), name: baseName(p), mime, data: bytes });
+        addImgBubble($("#chatLog"), URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: mime })), "me");
+      } catch (e) {
+        log("Image : " + e);
+      }
+      return;
+    }
+    if (!accepteRepliFichier(baseName(p))) return;
+  }
+  // Fichier ordinaire, ou image trop lourde dont l'envoi vient d'être confirmé : on remplit
+  // la zone et on déclenche le bouton, pour réutiliser toute son UI (débit, annulation).
+  setFile(p);
+  $<HTMLButtonElement>("#btnSend").click();
+}
+
+/** Dépôt dans un groupe. Même règle, mais `send_gimg` / `send_gfile` — et pas d'import de
+ *  groups.ts : tout ce qu'il faut (le groupe ouvert, ses membres) vit déjà dans state.ts. */
+async function deposerGroupe(p: string, mime: string | null): Promise<void> {
+  const g = loadGroups().find((x) => x.id === S.openGroupId);
+  if (!g) {
+    log("Ouvre un groupe avant d'y déposer un fichier.");
+    return;
+  }
+  if (mime) {
+    const bytes = await lireImageDeposee(p);
+    if (bytes && bytes.length <= MAX_INLINE_IMG) {
+      try {
+        await invoke("send_gimg", {
+          members: g.members,
+          gid: g.id,
+          author: myName(),
+          name: baseName(p),
+          mime,
+          data: bytes,
+        });
+        // L'utilisateur a pu changer de groupe pendant les await : ne pas écrire ma bulle
+        // dans le journal d'un AUTRE groupe (même garde que sendImageGroup).
+        if (S.openGroupId !== g.id) return;
+        addImgBubble($("#groupChatLog"), URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: mime })), "me");
+      } catch (e) {
+        log("Image de groupe : " + e);
+      }
+      return;
+    }
+    if (!accepteRepliFichier(baseName(p))) return;
+  }
+  $<HTMLInputElement>("#groupFilePath").value = p;
+  invoke("send_gfile", { members: g.members, path: p })
+    .then(() => {
+      log("📎 Fichier envoyé au groupe : " + baseName(p));
+      $<HTMLInputElement>("#groupFilePath").value = "";
+    })
+    .catch((e) => log("Fichier groupe : " + e));
 }
 
 /** Vrai si la section `[data-view="<nom>"]` est actuellement AFFICHÉE.
@@ -359,19 +447,21 @@ export function initTransfer(): void {
       log("Un seul fichier à la fois — « " + baseName(paths[0]) + " » sélectionné, " + (paths.length - 1) + " ignoré(s).");
     }
     const p = paths[0];
+    // Une image ou un GIF déposé s'affiche INLINE, exactement comme un Ctrl+V : il ne part
+    // pas en fichier et n'atterrit pas dans les Téléchargements du destinataire. Tout autre
+    // type de fichier garde le transfert classique.
+    const mime = guessImageMime(p);
     // Le glisser-déposer est GLOBAL à la fenêtre, mais #drop et #filePath vivent dans la
     // section [data-view="session"] (le 1-à-1). Sans ce routage, déposer un fichier alors
     // qu'un groupe est ouvert — ou qu'aucune conversation n'est active — remplissait une
     // zone MASQUÉE : l'événement partait bien, rien n'apparaissait, et l'utilisateur
-    // concluait que le glisser-déposer était cassé. Le groupe n'avait par ailleurs AUCUN
-    // glisser-déposer, son seul moyen de désigner un fichier étant la saisie du chemin.
+    // concluait que le glisser-déposer était cassé.
     if (vueAffichee("group")) {
-      $<HTMLInputElement>("#groupFilePath").value = p;
-      log("📎 « " + baseName(p) + " » prêt pour le groupe — clique « 📎 Envoyer ».");
+      void deposerGroupe(p, mime);
       return;
     }
     if (vueAffichee("session")) {
-      setFile(p);
+      void deposer1a1(p, mime);
       return;
     }
     // Ne jamais absorber un dépôt en silence : dire pourquoi il n'a rien fait.

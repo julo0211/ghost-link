@@ -18,6 +18,44 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 /// Mise à jour téléchargée en attente d'installation.
 struct PendingUpdate(std::sync::Mutex<Option<Update>>);
 
+/// Chemins que l'utilisateur a PHYSIQUEMENT déposés sur la fenêtre.
+///
+/// Sert d'autorisation de lecture pour l'affichage inline d'une image glissée. La WebView
+/// n'a aucun accès disque (capabilities réduites à `core:default` + `updater:default`) et
+/// `read_image_bytes` est confiné au dossier de réception : sans ce registre, afficher une
+/// image glissée exigerait de rouvrir une primitive de lecture arbitraire.
+///
+/// Il n'est alimenté QUE par l'événement de glisser-déposer du système. Aucune commande
+/// n'y écrit, donc un script de la page ne peut pas y ajouter un chemin de son choix — la
+/// distinction tient précisément à cela. C'est le motif que Tauri applique lui-même à son
+/// `Scopes` (tauri-2.11.2/src/manager/window.rs:232-240), reproduit ici en local plutôt
+/// qu'en important tout `tauri-plugin-fs`.
+#[derive(Default)]
+struct DroppedPaths(std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>);
+
+/// Au-delà, on purge : un utilisateur qui glisse en boucle ne doit pas faire enfler l'état,
+/// et une autorisation n'a aucune raison de survivre longtemps au geste qui l'a créée.
+const MAX_DROPPED: usize = 32;
+
+impl DroppedPaths {
+    fn remember(&self, paths: &[std::path::PathBuf]) {
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if s.len() + paths.len() > MAX_DROPPED {
+            s.clear();
+        }
+        for p in paths {
+            // Canonicaliser à l'enregistrement ET à la consultation : les deux côtés
+            // doivent comparer la même forme, sinon l'autorisation ne correspond jamais.
+            if let Ok(c) = p.canonicalize() {
+                s.insert(c);
+            }
+        }
+    }
+    fn contains(&self, p: &std::path::Path) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).contains(p)
+    }
+}
+
 #[tauri::command]
 fn perm_code(state: State<'_, Net>) -> String {
     net::perm_code(state.inner())
@@ -155,28 +193,42 @@ async fn send_gimg(app: tauri::AppHandle, state: State<'_, Net>, members: Vec<St
 /// s'exécutant dans la vue. Le seul appel légitime (ui/src/transfer.ts) passe un chemin
 /// que NOUS venons de fabriquer et d'émettre dans `ghost-recv-done` : il est toujours
 /// dans le dossier de réception, le confinement ne coûte donc rien fonctionnellement.
-/// Résout `path` en garantissant qu'il reste À L'INTÉRIEUR de `dossier`.
+/// Résout `path` et vérifie qu'il est autorisé à la lecture. Deux voies, une seule règle :
+/// l'utilisateur doit avoir désigné ce fichier, d'une façon ou d'une autre.
 ///
-/// `canonicalize()` résout liens, jonctions, « .. » et casse : la comparaison de préfixe
-/// porte donc sur le chemin RÉEL et non sur la chaîne fournie par le JS. Extrait de la
-/// commande pour être TESTABLE — c'est un contrôle de sécurité sur le chemin critique du
-/// rendu d'images reçues, il ne doit pas pouvoir casser sans qu'un test le dise.
-fn confiner_dans(dossier: &str, path: &str) -> Result<std::path::PathBuf, String> {
-    let racine = std::path::PathBuf::from(dossier)
-        .canonicalize()
-        .map_err(|e| format!("dossier de réception illisible : {e}"))?;
+/// 1. Il l'a **déposé** sur la fenêtre (registre `DroppedPaths`, alimenté par l'OS) ;
+/// 2. ou c'est un fichier **reçu**, donc sous le dossier de réception (aperçu inline).
+///
+/// `canonicalize()` résout liens, jonctions, « .. » et casse des deux côtés : la comparaison
+/// porte sur le chemin RÉEL et jamais sur la chaîne fournie par le JS. Extrait de la commande
+/// pour être TESTABLE — c'est un contrôle de sécurité dont l'échec est invisible côté UI.
+fn chemin_autorise(
+    dossier: &str,
+    path: &str,
+    deposes: &DroppedPaths,
+) -> Result<std::path::PathBuf, String> {
     let cible = std::path::Path::new(path)
         .canonicalize()
         .map_err(|e| e.to_string())?;
+    if deposes.contains(&cible) {
+        return Ok(cible);
+    }
+    let racine = std::path::PathBuf::from(dossier)
+        .canonicalize()
+        .map_err(|e| format!("dossier de réception illisible : {e}"))?;
     if !cible.starts_with(&racine) {
-        return Err("chemin hors du dossier de réception".into());
+        return Err("chemin non autorisé : ni déposé sur la fenêtre, ni dans le dossier de réception".into());
     }
     Ok(cible)
 }
 
 #[tauri::command]
-async fn read_image_bytes(state: State<'_, Net>, path: String) -> Result<Vec<u8>, String> {
-    let cible = confiner_dans(&net::get_download_dir(&state.settings), &path)?;
+async fn read_image_bytes(
+    state: State<'_, Net>,
+    deposes: State<'_, DroppedPaths>,
+    path: String,
+) -> Result<Vec<u8>, String> {
+    let cible = chemin_autorise(&net::get_download_dir(&state.settings), &path, deposes.inner())?;
     let meta = std::fs::metadata(&cible).map_err(|e| e.to_string())?;
     if !meta.is_file() {
         return Err("pas un fichier régulier".into());
@@ -642,12 +694,24 @@ fn main() {
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // Mémoriser les chemins réellement déposés par l'utilisateur. Observateur PUR :
+        // Tauri émet `tauri://drag-drop` vers la WebView depuis son propre gestionnaire
+        // (manager/window.rs:248), indépendamment de ce hook — le glisser-déposer de l'UI
+        // n'est donc pas affecté.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                if let Some(d) = window.try_state::<DroppedPaths>() {
+                    d.remember(paths);
+                }
+            }
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             let net = tauri::async_runtime::block_on(net::start(handle))
                 .expect("démarrage du réseau iroh impossible");
             app.manage(net);
             app.manage(PendingUpdate(std::sync::Mutex::new(None)));
+            app.manage(DroppedPaths::default());
             app.manage(audio::Voice::default());
             app.manage(audio::Call::default());
             app.manage(audio::GroupCall::default());
@@ -703,35 +767,81 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{confiner_dans, signed_file_name};
+    use super::{chemin_autorise, signed_file_name, DroppedPaths, MAX_DROPPED};
 
-    // ---- Confinement du rendu d'images reçues ----
-    // Test de NON-RÉGRESSION du cas nominal : le durcissement ne doit pas casser le rendu
-    // inline d'une image reçue par le flux fichier (glisser-déposer). Côté UI l'erreur est
-    // avalée par un `.catch()`, donc une régression ici serait TOTALEMENT silencieuse.
+    // ---- Autorisation de lecture pour l'affichage d'images ----
+    // Le cas NOMINAL compte autant que le refus : côté UI un échec de lecture ne produit
+    // qu'une ligne de Journal, donc une régression ici serait quasi invisible.
+
+    fn dossier(nom: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(nom);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+    fn fichier(d: &std::path::Path, nom: &str) -> std::path::PathBuf {
+        let f = d.join(nom);
+        std::fs::write(&f, b"x").unwrap();
+        f
+    }
 
     #[test]
-    fn confinement_accepte_un_fichier_du_dossier_de_reception() {
-        let dir = std::env::temp_dir().join("gl-confine-ok");
-        std::fs::create_dir_all(&dir).unwrap();
-        let f = dir.join("photo reçue.jpg");
-        std::fs::write(&f, b"x").unwrap();
-        let r = confiner_dans(&dir.to_string_lossy(), &f.to_string_lossy());
-        assert!(r.is_ok(), "un fichier DU dossier doit passer, or : {r:?}");
+    fn autorise_un_fichier_du_dossier_de_reception() {
+        let d = dossier("gl-auth-recv");
+        let f = fichier(&d, "photo reçue.jpg");
+        let vide = DroppedPaths::default();
+        let r = chemin_autorise(&d.to_string_lossy(), &f.to_string_lossy(), &vide);
+        assert!(r.is_ok(), "un fichier DU dossier de réception doit passer, or : {r:?}");
         let _ = std::fs::remove_file(&f);
     }
 
     #[test]
-    fn confinement_refuse_un_fichier_hors_du_dossier() {
-        let dir = std::env::temp_dir().join("gl-confine-ko");
-        std::fs::create_dir_all(&dir).unwrap();
-        let dehors = std::env::temp_dir().join("gl-secret.txt");
-        std::fs::write(&dehors, b"x").unwrap();
-        assert!(confiner_dans(&dir.to_string_lossy(), &dehors.to_string_lossy()).is_err());
-        // Et la traversée explicite, qui est le vrai vecteur.
-        let traverse = format!("{}\\..\\gl-secret.txt", dir.to_string_lossy());
-        assert!(confiner_dans(&dir.to_string_lossy(), &traverse).is_err());
-        let _ = std::fs::remove_file(&dehors);
+    fn autorise_un_fichier_depose_hors_du_dossier() {
+        // C'est TOUTE la raison d'être du registre : afficher inline une image glissée
+        // depuis n'importe où, sans rouvrir une lecture arbitraire.
+        let recv = dossier("gl-auth-recv2");
+        let ailleurs = dossier("gl-auth-ailleurs");
+        let f = fichier(&ailleurs, "glissee.gif");
+        let deposes = DroppedPaths::default();
+        deposes.remember(std::slice::from_ref(&f));
+        let r = chemin_autorise(&recv.to_string_lossy(), &f.to_string_lossy(), &deposes);
+        assert!(r.is_ok(), "un fichier DÉPOSÉ doit passer, or : {r:?}");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn refuse_un_fichier_ni_depose_ni_recu() {
+        let recv = dossier("gl-auth-recv3");
+        let ailleurs = dossier("gl-auth-ailleurs3");
+        let secret = fichier(&ailleurs, "identity.key");
+        let vide = DroppedPaths::default();
+        assert!(
+            chemin_autorise(&recv.to_string_lossy(), &secret.to_string_lossy(), &vide).is_err(),
+            "un chemin ni déposé ni reçu ne doit JAMAIS être lisible"
+        );
+        // La traversée explicite reste refusée elle aussi.
+        let traverse = format!("{}\\..\\gl-auth-ailleurs3\\identity.key", recv.to_string_lossy());
+        assert!(chemin_autorise(&recv.to_string_lossy(), &traverse, &vide).is_err());
+        let _ = std::fs::remove_file(&secret);
+    }
+
+    #[test]
+    fn le_registre_reste_borne() {
+        let d = dossier("gl-auth-borne");
+        let deposes = DroppedPaths::default();
+        let mut tous = Vec::new();
+        for i in 0..(MAX_DROPPED + 5) {
+            let f = fichier(&d, &format!("f{i}.png"));
+            deposes.remember(std::slice::from_ref(&f));
+            tous.push(f);
+        }
+        let n = deposes.0.lock().unwrap().len();
+        assert!(n <= MAX_DROPPED, "registre non borné : {n} entrées");
+        // Et le dernier déposé reste autorisé — purger ne doit pas casser le geste en cours.
+        let dernier = tous.last().unwrap();
+        assert!(deposes.contains(&dernier.canonicalize().unwrap()));
+        for f in tous {
+            let _ = std::fs::remove_file(f);
+        }
     }
 
     /// Signature RÉELLE publiée dans latest.json pour v0.36.1 (clé publique du dépôt).
