@@ -127,8 +127,11 @@ export interface Events {
 
   "ghost-chat": { text: string; name: string };
   "ghost-chat-img": { author?: string; name?: string; mime: string; dataB64: string };
-  "ghost-freq": { name?: string; code?: string };
-  "ghost-faccept": { name?: string; code?: string };
+  // `from` = remote_id AUTHENTIFIÉ de la connexion ; `code` = code permanent AUTO-DÉCLARÉ
+  // par l'émetteur. Les deux diffèrent légitimement quand un pas-encore-ami compose depuis
+  // son identité éphémère — `code` n'est donc jamais une preuve, seulement une déclaration.
+  "ghost-freq": { name?: string; code?: string; from?: string };
+  "ghost-faccept": { name?: string; code?: string; from?: string };
 
   "update-progress": { chunk: number; total: number };
 

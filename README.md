@@ -2,7 +2,7 @@
 
 **Partage de fichiers et messagerie, directement d'un appareil à l'autre — chiffré de bout en bout, sans serveur.**
 
-Tes fichiers ne passent jamais en clair par un serveur : la connexion va **de toi à ton ami, directement** (ou via un relais aveugle chiffré si la connexion directe est impossible). Ton identité, c'est une clé qui reste sur ton appareil.
+Tes fichiers ne passent jamais en clair par un serveur : la connexion va **de toi à ton ami, directement**. Quand une connexion directe est impossible, le trafic transite par un **relais public opéré par [number0](https://n0.computer)** : il ne peut **pas** lire ce qui passe (chiffré de bout en bout), mais il voit ton adresse IP et ton identité publique. Ton identité, c'est une clé qui reste sur ton appareil.
 
 ---
 
@@ -49,16 +49,33 @@ Tu peux aussi basculer entre **thème clair et sombre** avec le bouton 🌙 / �
 
 ## Confidentialité & sécurité
 
-- **Chiffrement de bout en bout** : fichiers et messages sont chiffrés par le canal sécurisé (QUIC / TLS 1.3), liés aux clés des deux pairs. Personne au milieu ne peut lire.
-- **Aucun stockage serveur** : rien de ce que tu envoies n'est conservé ailleurs que chez ton destinataire.
-- **Ton identité reste chez toi** : ta clé privée ne quitte jamais ton appareil.
-- **Vérifie un contact** : compare son **empreinte** (onglet Identité) avec ce qu'il t'annonce, pour être sûr de parler à la bonne personne.
+### Ce qui est garanti
+
+- **Chiffrement de bout en bout** : fichiers, messages, voix et vidéo sont chiffrés par le canal sécurisé (QUIC / TLS 1.3), liés aux clés des deux pairs. L'identité du pair est vérifiée cryptographiquement à chaque connexion : **personne au milieu ne peut lire ni se faire passer pour ton ami**.
+- **Aucun contenu stocké ailleurs** : rien de ce que tu envoies n'est conservé sur un serveur — ni tes fichiers, ni tes messages, ni ton historique.
+- **Ton identité reste chez toi** : ta clé privée ne quitte jamais ton appareil (chiffrée au repos sous Windows).
+- **Métadonnées retirées avant envoi** : photos (EXIF/GPS), documents et vidéos sont **nettoyés automatiquement** avant de partir — l'original sur ton disque n'est jamais modifié. Ce qui n'a pas pu être nettoyé est **signalé** dans le Journal, jamais passé sous silence.
+- **Vérifie un contact** : compare son **empreinte** (onglet Identité) avec ce qu'il t'annonce de vive voix. C'est la seule façon d'être certain que le code que tu enregistres est bien le sien.
+
+### Ce qu'il faut savoir (les limites, dites franchement)
+
+- **Ton adresse IP est visible de ton pair.** C'est inhérent au pair-à-pair : la connexion est directe.
+- **Des relais tiers voient des métadonnées.** L'app utilise les relais et l'annuaire publics de number0. Ils ne voient **jamais le contenu**, mais ils apprennent ton adresse IP, ton identité publique et le moment où tu es en ligne. Ce n'est pas configurable pour l'instant.
+- **La vidéo par caméra ouvre une connexion WebRTC** qui contacte un serveur STUN public (Google) et expose ton IP aux membres du groupe. L'app **te le demande explicitement** avant. Le **partage d'écran natif**, lui, ne contacte aucun serveur tiers — c'est le chemin recommandé.
+- **Ton code permanent ne peut pas être révoqué.** Qui l'a peut savoir quand tu es en ligne (sauf si tu actives « N'accepter que les amis »). Utilise le code éphémère pour un échange ponctuel.
+- **Le vote d'exclusion d'un groupe est indicatif.** Sans serveur, personne ne peut forcer un client malveillant à se retirer : les clients honnêtes l'ignorent, c'est tout.
+- **Perdre ton appareil, c'est perdre ton identité.** Il n'existe pas encore d'export de la clé.
 
 ---
 
-## À venir
+## Fonctionnalités
 
-- **Chat vocal** en direct (en préparation).
+- **Transfert de fichiers** volumineux, multi-flux, avec débit, annulation et vérification d'intégrité.
+- **Chat** texte et **images/GIF** en ligne (glisser-déposer ou Ctrl+V).
+- **Appel vocal** 1-à-1 et **en groupe**.
+- **Partage d'écran ou de fenêtre**, en natif (sans WebRTC ni STUN), avec choix du nombre d'images par seconde et de la résolution.
+- **Groupes** décentralisés : chat, appel, invitations, exclusion par vote.
+- **Thèmes** clair/sombre et quatre identités visuelles.
 
 ---
 

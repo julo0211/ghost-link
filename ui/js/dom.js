@@ -6,12 +6,21 @@ export function $(s) {
     return document.querySelector(s);
 }
 /** Ajoute une ligne au journal de l'app. */
+/** Lignes conservées dans le Journal. Sans plafond il grandit indéfiniment : plusieurs
+ *  événements sont pilotés par le RÉSEAU (demandes d'ami, offres de fichier, avertissements
+ *  de métadonnées, exclusions), donc un pair bavard fait enfler le DOM pour toute la
+ *  session. 500 lignes couvrent très largement un diagnostic. */
+const MAX_LOG_LIGNES = 500;
 export function log(m) {
     const d = document.createElement("div");
     d.textContent = "• " + m;
     const box = document.getElementById("log");
-    if (box)
-        box.prepend(d);
+    if (!box)
+        return;
+    box.prepend(d);
+    // prepend() : les plus anciennes sont EN BAS, on coupe donc par la fin.
+    while (box.childElementCount > MAX_LOG_LIGNES)
+        box.lastElementChild?.remove();
 }
 /** Formate un nombre d'octets en o/Ko/Mo/Go/To. */
 export function fmt(b) {
@@ -203,12 +212,66 @@ export function clearImgBlobs(box) {
     while (list.length)
         URL.revokeObjectURL(list.pop());
 }
+/** Nombre max. de bulles IMAGE conservées dans un conteneur de chat.
+ *
+ *  Sans plafond, la mémoire du rendu croît sans borne et rien ne la libère : les images
+ *  reçues sont des data: (~1,33× les octets du fil, jusqu'à 8 Mio chacun) et Chromium en
+ *  garde en plus le bitmap DÉCODÉ, dont la taille dépend des DIMENSIONS et pas du poids —
+ *  un PNG de 300 Ko peut déclarer 16000×16000 et coûter ~1 Go. Le tampon texte est déjà
+ *  borné à 200 (S.groupMsgs) ; les images n'y sont pas, et le conteneur n'est vidé qu'au
+ *  changement de groupe — c'est-à-dire jamais, pour qui reste sur un seul groupe.
+ *
+ *  Note : élaguer une bulle dont l'image est ouverte en plein écran révoque son blob:.
+ *  La visionneuse retombe alors sur son repli canvas (openImgViewer retient la vignette
+ *  déjà décodée par clôture) — ne pas supprimer ce repli. */
+const MAX_IMG_BUBBLES = 24;
+/** Retire les bulles image les plus anciennes au-delà de MAX_IMG_BUBBLES, en libérant
+ *  leurs blob:. Ne touche PAS aux bulles texte, qui ont leur propre plafond. */
+function trimImgBubbles(box) {
+    const bulles = box.querySelectorAll('[data-img="1"]');
+    const trop = bulles.length - MAX_IMG_BUBBLES;
+    if (trop <= 0)
+        return;
+    const list = imgBlobs.get(box);
+    for (let i = 0; i < trop; i++) {
+        const vieille = bulles[i];
+        const src = vieille.dataset.src || "";
+        if (src.startsWith("blob:")) {
+            URL.revokeObjectURL(src);
+            // Retirer du registre aussi : sinon la liste grossit indéfiniment et clearImgBlobs
+            // re-révoquerait des URL mortes (inoffensif, mais c'est une fuite de chaînes).
+            if (list) {
+                const j = list.indexOf(src);
+                if (j >= 0)
+                    list.splice(j, 1);
+            }
+        }
+        vieille.remove();
+    }
+}
+/** Bulles TEXTE conservées dans un conteneur de chat. Le tampon de groupe (S.groupMsgs)
+ *  est déjà plafonné à 200, mais il ne borne que le REJEU : pendant une session, le DOM
+ *  grandit sans limite à chaque message reçu. Le 1-à-1 n'avait aucun plafond du tout. */
+const MAX_TEXT_BUBBLES = 300;
+/** Élague les bulles TEXTE les plus anciennes. Ignore les bulles image, qui ont leur
+ *  propre plafond (elles coûtent bien plus cher et se libèrent différemment). */
+export function trimTextBubbles(box) {
+    const bulles = box.querySelectorAll(".msg:not([data-img])");
+    const trop = bulles.length - MAX_TEXT_BUBBLES;
+    for (let i = 0; i < trop; i++)
+        bulles[i].remove();
+}
 /** Ajoute une bulle image dans un conteneur de chat (data-URI ou blob-URL).
  *  Mirroir de la structure `.msg`/`.me`/`.them` des bulles texte (addMsg /
  *  addGroupMsgDom), avec un <img> au lieu d'un noeud texte. */
 export function addImgBubble(box, src, who, author, from, unverified) {
     const m = document.createElement("div");
     m.className = "msg " + (who === "me" ? "me" : "them");
+    // Marqueur d'élagage porté par un ATTRIBUT DE DONNÉES et non par une classe : le
+    // contrat DOM est strict et le CSS cible .msg.me / .msg.them — ajouter une classe
+    // risquerait d'accrocher une règle de style existante.
+    m.dataset.img = "1";
+    m.dataset.src = src;
     if (who !== "me" && author && author.trim()) {
         const au = document.createElement("div");
         au.className = "auth" + (unverified ? " unverified" : "");
@@ -235,5 +298,7 @@ export function addImgBubble(box, src, who, author, from, unverified) {
     img.onclick = () => openImgViewer(src, img);
     m.appendChild(img);
     box.appendChild(m);
+    // AVANT le scroll : élaguer après aurait calculé scrollHeight sur une hauteur périmée.
+    trimImgBubbles(box);
     box.scrollTop = box.scrollHeight;
 }

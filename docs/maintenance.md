@@ -35,19 +35,44 @@ de signature pour la session, puis lance `cargo tauri build`. Résultat dans
 > cargo tauri build
 > ```
 
-## Clé de signature
+## Clé de signature — POINT DE DÉFAILLANCE UNIQUE
 
 - Générée une fois avec `cargo tauri signer generate -w ~/.tauri/ghostlink.key`.
-- La **clé publique** est dans `src-tauri/tauri.conf.json` (`plugins.updater.pubkey`).
+- La **clé publique** est dans `src-tauri/tauri.conf.json` (`plugins.updater.pubkey`), et elle est
+  **compilée dans chaque binaire distribué**. Un client installé n'accepte QUE des mises à jour
+  signées par cette clé-là.
 - La **clé privée** (`~/.tauri/ghostlink.key`) + son mot de passe sont **secrets** : jamais commités
-  (`.gitignore` exclut `*.key`). Les perdre = ne plus pouvoir publier de mises à jour.
+  (`.gitignore` exclut `*.key`).
+
+⚠️ **Conséquence à mesurer** : perdre la clé privée ou son mot de passe, c'est perdre définitivement
+la capacité de mettre à jour le parc déjà installé — y compris pour un correctif de sécurité. Il n'y
+a **aucune procédure de rotation** : les clients existants n'accepteraient pas une nouvelle clé. La
+seule issue serait de demander à chaque utilisateur de réinstaller à la main.
+
+**À faire une fois, maintenant** :
+
+1. Copier `~/.tauri/ghostlink.key` sur **deux supports hors ligne distincts** (clé USB chiffrée,
+   coffre-fort de mots de passe qui accepte les pièces jointes…). Pas dans un dossier synchronisé
+   en clair.
+2. Déposer le mot de passe dans un gestionnaire de mots de passe — il ne doit pas vivre uniquement
+   dans la tête du mainteneur.
+3. **Vérifier la sauvegarde en conditions réelles** (une sauvegarde non testée n'en est pas une) :
+   `.\scripts\build-signed.ps1` en pointant la copie doit produire un `.sig` à côté de l'installeur.
 
 ## Publier une nouvelle version
 
-1. **Bumper la version** (strictement supérieure) dans :
+1. **Bumper la version** (strictement supérieure) dans les **4** emplacements — `scripts/release.ps1`
+   vérifie leur cohérence et refuse de publier s'ils divergent :
    - `src-tauri/tauri.conf.json` (`version`)
    - `src-tauri/Cargo.toml` (`version`)
-   - `ui/index.html` (pied de page, cosmétique)
+   - `package.json` (`version`)
+   - `ui/src/main.ts` (constante `UI_BUILD`)
+
+   Puis `npm install --package-lock-only` pour reporter la version dans `package-lock.json`, et
+   `npm run build` (le TypeScript **n'est pas** compilé automatiquement par Tauri).
+
+   ⚠️ **Ne jamais republier un numéro déjà distribué** : l'updater compare les versions, pas les
+   binaires. Une seconde `0.35.0` ne pourrait pas atteindre les clients déjà en `0.35.0`.
 
 2. **Build signé** : `.\scripts\build-signed.ps1`
 

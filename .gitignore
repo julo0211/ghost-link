@@ -5,6 +5,19 @@
 *.key
 *.key.pub
 
+# Autres porteurs de secrets, par précaution (aucun n'a jamais été commité — vérifié
+# sur l'intégralité de l'historique, cf. AUDIT-2026-07-25-COMPLET.md).
+*.pem
+*.pfx
+*.p12
+*.jks
+*.keystore
+*.ppk
+.env
+.env.*
+id_rsa
+id_ed25519
+
 # Node
 node_modules/
 

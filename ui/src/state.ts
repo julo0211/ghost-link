@@ -245,13 +245,24 @@ const fpFailed = new Set<string>();
  *  elle-même : elle factorise les trois barreaux BAS de l'échelle, chaque site d'appel
  *  gardant son premier barreau (nom d'ami pour la connexion entrante, nom déclaré pour
  *  la demande d'ami). No-op si un surnom/nom d'ami existe déjà. */
+/** Forme COURTE d'une empreinte, pour un usage d'ÉTIQUETTE (chat, listes, bannières).
+ *
+ *  `fingerprint` fait désormais 8 groupes (128 bits) parce qu'elle sert de vérification
+ *  hors bande. Ce n'est pas une bonne étiquette : elle casserait la mise en page des
+ *  bulles et des vignettes. On n'affiche donc que les 4 premiers groupes — exactement ce
+ *  qui était affiché avant, donc zéro changement visuel. La vérification, elle, se fait
+ *  sur l'empreinte ENTIÈRE (écran Réglages / fiche d'ami), jamais sur cette étiquette. */
+export function fpLabel(full: string): string {
+  return full.split("-").slice(0, 4).join("-");
+}
+
 export async function ensureFpLabel(code: string, after?: () => void): Promise<void> {
   if (!code || S.fpCache[code] || fpInFlight.has(code) || fpFailed.has(code)) return;
   if (loadAliases()[code]) return;
   if (loadFriends().some((x) => x.code === code && x.name)) return;
   fpInFlight.add(code);
   try {
-    S.fpCache[code] = await invoke("fingerprint", { code });
+    S.fpCache[code] = fpLabel(await invoke("fingerprint", { code }));
     if (after) after();
   } catch {
     fpFailed.add(code); // cache négatif : ne pas re-tenter en boucle

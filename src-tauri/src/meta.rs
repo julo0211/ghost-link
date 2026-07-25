@@ -18,7 +18,16 @@
 //           contient les données de décodage).
 // - PDF   : dictionnaire /Info, /Metadata XMP du catalogue, /ID (via lopdf).
 // - OOXML (docx/xlsx/pptx…) : docProps/core.xml, app.xml, custom.xml blanchis.
-// - ODF (odt/ods/odp…) : meta.xml blanchi.
+// - ODF (odt/ods/odp…) : meta.xml ET settings.xml blanchis (ce dernier porte le nom
+//           d'imprimante et le blob DEVMODE — souvent nom de service, de site ou de machine).
+//
+// DEUX POINTS D'ENTRÉE, MÊME CONTRAT :
+// - `prepare(path)`      : chemin FICHIER (envoi de fichier, glisser-déposer).
+// - `prepare_bytes(data)`: chemin IMAGE INLINE du chat (🖼️ et Ctrl+V), qui n'expose aucun
+//           chemin de fichier. Couvre JPEG/PNG/WebP ; le GIF reste non nettoyé et le SIGNALE.
+//           Ce second point d'entrée manquait : coller une photo transmettait son EXIF/GPS
+//           intact alors que la MÊME photo glissée était nettoyée, et le Journal restait
+//           muet — donc l'utilisateur lisait l'absence de message comme « rien à nettoyer ».
 //
 // LIMITES ASSUMÉES (v1) :
 // - Fail-open : si le nettoyage échoue ou n'est pas pris en charge, l'ORIGINAL part
@@ -125,6 +134,52 @@ pub fn prepare(path: &Path) -> Prep {
     }
 }
 
+/// Résultat du nettoyage d'une image de chat fournie sous forme d'OCTETS.
+/// Pendant de `Prep`, sans chemin : un `File` issu du sélecteur ou du presse-papiers
+/// n'expose aucun chemin de fichier, il n'y a donc pas de copie temporaire à écrire.
+pub enum BytesPrep {
+    /// Octets nettoyés : ce sont EUX qu'il faut envoyer.
+    Cleaned(Vec<u8>),
+    /// Aucune métadonnée trouvée : envoyer les octets d'origine.
+    Untouched,
+    /// Format porteur de métadonnées CONNU mais non nettoyable : envoyer + avertir.
+    Skipped(&'static str),
+    /// Nettoyage tenté mais échoué : envoyer + avertir.
+    Failed(String),
+}
+
+/// Nettoie une image de chat inline à partir de ses octets. BLOQUANT (spawn_blocking).
+///
+/// Le format est déduit des MAGIC BYTES et jamais du mime déclaré par la WebView :
+/// ce mime vient de `File.type`, c'est-à-dire du système de fichiers du poste, il est
+/// donc renommable et ne prouve rien. Même couverture que `prepare` pour JPEG/PNG/WebP.
+///
+/// Contrat identique au chemin fichier : on n'échoue JAMAIS l'envoi pour un nettoyage
+/// raté, mais on ne se tait jamais non plus (cf. LIMITES ASSUMÉES en tête de module).
+pub fn prepare_bytes(data: &[u8]) -> BytesPrep {
+    if data.len() as u64 > MAX_IN_MEMORY {
+        return BytesPrep::Skipped("trop volumineux pour le nettoyage");
+    }
+    // GIF n'a pas de nettoyeur (extensions d'application, commentaires, XMP) : il est
+    // dans la liste blanche des mimes acceptés par net.rs, il faut donc le traiter
+    // explicitement ici — sinon il tomberait dans « format non reconnu », message
+    // trompeur pour un format que l'app accepte volontairement.
+    if data.len() >= 6 && (&data[..6] == b"GIF87a" || &data[..6] == b"GIF89a") {
+        return BytesPrep::Skipped("format à métadonnées non nettoyable pour l'instant");
+    }
+    let cleaner: Cleaner = match sniff_bytes(data) {
+        Some(Magic::Jpeg) => clean_jpeg,
+        Some(Magic::Png) => clean_png,
+        Some(Magic::Webp) => clean_webp,
+        _ => return BytesPrep::Skipped("format d'image non reconnu"),
+    };
+    match cleaner(data) {
+        Ok(None) => BytesPrep::Untouched,
+        Ok(Some(v)) => BytesPrep::Cleaned(v),
+        Err(e) => BytesPrep::Failed(e),
+    }
+}
+
 /// Formats détectés par magic bytes quand l'extension ne dit rien de fiable.
 enum Magic {
     Jpeg,
@@ -143,7 +198,13 @@ fn sniff_magic(path: &Path) -> Option<Magic> {
     let mut f = fs::File::open(path).ok()?;
     let mut buf = [0u8; 16];
     let n = f.read(&mut buf).ok()?;
-    let h = &buf[..n];
+    sniff_bytes(&buf[..n])
+}
+
+/// Même reconnaissance, mais sur des octets déjà en mémoire (chat inline : un `File`
+/// du presse-papiers ou du sélecteur n'expose AUCUN chemin). Un seul jeu de règles
+/// pour les deux chemins — les dupliquer serait la garantie qu'ils divergent.
+fn sniff_bytes(h: &[u8]) -> Option<Magic> {
     if h.len() >= 2 && h[0] == 0xFF && h[1] == 0xD8 {
         return Some(Magic::Jpeg); // FFD8 (JPEG SOI)
     }
@@ -754,28 +815,23 @@ fn clean_pdf_file(path: &Path, size: u64) -> Prep {
             let _ = fs::remove_file(&tmp);
             Prep::Skipped("PDF trop coûteux à décompresser — nettoyage sauté")
         }
-        // Impossible de lancer le sous-processus (current_exe/spawn en échec, rare) : repli
-        // in-process protégé par catch_unwind (contient les paniques ; l'OOM ne reste possible
-        // que dans ce cas résiduel).
-        None => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| clean_pdf_inner(path, &tmp))) {
-            Ok(Ok(PdfOutcome::Cleaned)) => Prep::Cleaned(tmp),
-            Ok(Ok(PdfOutcome::Untouched)) => {
-                let _ = fs::remove_file(&tmp);
-                Prep::Untouched
-            }
-            Ok(Ok(PdfOutcome::Signed)) => {
-                let _ = fs::remove_file(&tmp);
-                Prep::Skipped("PDF signé — nettoyage sauté pour préserver la signature")
-            }
-            Ok(Err(e)) => {
-                let _ = fs::remove_file(&tmp);
-                Prep::Failed(format!("PDF: {e}"))
-            }
-            Err(_) => {
-                let _ = fs::remove_file(&tmp);
-                Prep::Failed("PDF: parseur en échec (fichier malformé)".to_string())
-            }
-        },
+        // Impossible de lancer le sous-processus (current_exe/spawn en échec, rare).
+        //
+        // Il y avait ici un repli IN-PROCESS protégé par catch_unwind. Il a été retiré :
+        // catch_unwind rattrape les paniques, PAS un débordement de pile. Or lopdf 0.34 est
+        // exactement vulnérable à ça sur des objets profondément imbriqués
+        // (RUSTSEC-2026-0187), et sous Windows un débordement termine le processus par
+        // STATUS_STACK_OVERFLOW — sans dépilage, donc sans rattrapage possible. Le repli
+        // transformait donc un cas déjà dégradé en crash de toute l'application, sur un
+        // fichier fourni par l'utilisateur. Toute la raison d'être du sous-processus isolé
+        // (voir le commentaire plus haut) était d'éviter précisément cela.
+        //
+        // Un Skipped VISIBLE respecte le contrat du module : le transfert n'échoue pas,
+        // l'utilisateur est prévenu que les métadonnées n'ont pas été retirées.
+        None => {
+            let _ = fs::remove_file(&tmp);
+            Prep::Skipped("PDF : nettoyage isolé indisponible — métadonnées non retirées")
+        }
     }
 }
 
@@ -881,6 +937,13 @@ const BLANK_CORE: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes
 const BLANK_APP: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"/>"#;
 const BLANK_CUSTOM: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"/>"#;
 const BLANK_ODF_META: &str = r#"<?xml version="1.0" encoding="UTF-8"?><office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" office:version="1.2"><office:meta/></office:document-meta>"#;
+/// Un document ODF ne range pas toutes ses métadonnées identifiantes dans `meta.xml`.
+/// `settings.xml`, réécrit par LibreOffice à CHAQUE enregistrement, contient la
+/// configuration d'impression du document : `PrinterName` (en entreprise, très souvent
+/// le nom du service, de l'étage ou du site) et `PrinterSetup`, un blob DEVMODE base64
+/// qui porte fréquemment le nom de machine ou de domaine. Sans ce blanchiment, l'app
+/// annonçait « 🧹 Métadonnées retirées » pour un ODF dont ces champs partaient intacts.
+const BLANK_ODF_SETTINGS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><office:document-settings xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:config="urn:oasis:names:tc:opendocument:xmlns:config:1.0" office:version="1.2"><office:settings/></office:document-settings>"#;
 
 fn clean_zip_doc(path: &Path, size: u64, kind: ZipDoc) -> Prep {
     if size > MAX_IN_MEMORY {
@@ -919,7 +982,11 @@ fn clean_zip_inner(path: &Path, out: &Path, kind: ZipDoc) -> Result<bool, String
                 "docProps/custom.xml" => Some(BLANK_CUSTOM),
                 _ => None,
             },
-            ZipDoc::Odf => (name == "meta.xml").then_some(BLANK_ODF_META),
+            ZipDoc::Odf => match name.as_str() {
+                "meta.xml" => Some(BLANK_ODF_META),
+                "settings.xml" => Some(BLANK_ODF_SETTINGS),
+                _ => None,
+            },
         };
         match replacement {
             Some(xml) => {
@@ -968,6 +1035,50 @@ mod tests {
         assert!(!hay(&out, b"MOTIONVIDEO"));
         assert!(hay(&out, b"JFIF"));
         assert!(out.ends_with(&[0xFF, 0xD9]));
+    }
+
+    // ---- Chemin IMAGE INLINE (chat) : mêmes garanties que le chemin fichier ----
+    // Ces trois tests verrouillent la correction du trou de confidentialité où une photo
+    // collée dans le chat partait avec son EXIF/GPS alors que la même photo glissée sur
+    // la fenêtre était nettoyée. Ils échouent si `prepare_bytes` cesse d'être appelé sur
+    // le bon nettoyeur, ou s'il redevient silencieux sur un format non pris en charge.
+
+    #[test]
+    fn prepare_bytes_strips_exif_like_the_file_path() {
+        let mut d = vec![0xFF, 0xD8];
+        d.extend(seg(0xE0, b"JFIF\0rest"));
+        d.extend(seg(0xE1, b"Exif\0\0SECRETGPS"));
+        d.extend(seg(0xDB, &[0u8; 4]));
+        d.extend(seg(0xDA, &[1, 2]));
+        d.extend_from_slice(&[0x12, 0xFF, 0x00, 0x34, 0xFF, 0xD9]);
+        d.extend_from_slice(b"MOTIONVIDEO");
+        match prepare_bytes(&d) {
+            BytesPrep::Cleaned(v) => {
+                let hay = |h: &[u8], n: &[u8]| h.windows(n.len()).any(|w| w == n);
+                assert!(!hay(&v, b"SECRETGPS"), "EXIF encore présent");
+                assert!(!hay(&v, b"MOTIONVIDEO"), "trailer encore présent");
+            }
+            _ => panic!("un JPEG avec EXIF doit être nettoyé, pas ignoré"),
+        }
+    }
+
+    #[test]
+    fn prepare_bytes_gif_avertit_au_lieu_de_se_taire() {
+        // GIF est dans la liste blanche de mimes de net.rs mais n'a pas de nettoyeur :
+        // il DOIT produire un avertissement visible, jamais un Untouched silencieux.
+        let d = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;".to_vec();
+        assert!(matches!(prepare_bytes(&d), BytesPrep::Skipped(_)));
+    }
+
+    #[test]
+    fn prepare_bytes_ignore_le_mime_et_suit_les_magic_bytes() {
+        // Un PNG propre reste Untouched même si la WebView l'annonce en image/jpeg :
+        // le routage ne doit dépendre que du contenu réel.
+        let mut d = PNG_SIG.to_vec();
+        d.extend(png_chunk(b"IHDR", &[0u8; 13]));
+        d.extend(png_chunk(b"IDAT", &[1, 2, 3]));
+        d.extend(png_chunk(b"IEND", &[]));
+        assert!(matches!(prepare_bytes(&d), BytesPrep::Untouched));
     }
 
     #[test]
@@ -1221,6 +1332,51 @@ mod tests {
                 let _ = fs::remove_file(tmp);
             }
             _ => panic!("le docx aurait dû être nettoyé"),
+        }
+        let _ = fs::remove_file(src);
+    }
+
+    #[test]
+    fn odf_blanchit_aussi_settings_xml() {
+        // meta.xml n'est PAS la seule entrée identifiante d'un ODF : settings.xml porte
+        // le nom d'imprimante et le blob DEVMODE. Le test vérifie l'absence des chaînes
+        // dans les octets FINAUX du zip (et pas seulement dans l'entrée remplacée) —
+        // c'est le piège classique : recopier l'entrée d'origine en doublon.
+        let dir = std::env::temp_dir().join("ghostlink-clean-test");
+        let _ = fs::create_dir_all(&dir);
+        let src = dir.join("in.odt");
+        {
+            let f = fs::File::create(&src).unwrap();
+            let mut w = zip::ZipWriter::new(f);
+            let o = zip::write::SimpleFileOptions::default();
+            w.start_file("mimetype", o).unwrap();
+            w.write_all(b"application/vnd.oasis.opendocument.text").unwrap();
+            w.start_file("meta.xml", o).unwrap();
+            w.write_all(b"<office:document-meta><dc:creator>Jules SECRET</dc:creator></office:document-meta>")
+                .unwrap();
+            w.start_file("settings.xml", o).unwrap();
+            w.write_all(
+                b"<office:document-settings><config:config-item config:name=\"PrinterName\">IMPRIMANTE-COMPTA-3E-ETAGE</config:config-item></office:document-settings>",
+            )
+            .unwrap();
+            w.start_file("content.xml", o).unwrap();
+            w.write_all(b"<office:document-content>bonjour</office:document-content>").unwrap();
+            w.finish().unwrap();
+        }
+        match clean_zip_doc(&src, fs::metadata(&src).unwrap().len(), ZipDoc::Odf) {
+            Prep::Cleaned(tmp) => {
+                let brut = fs::read(&tmp).unwrap();
+                let contient = |n: &[u8]| brut.windows(n.len()).any(|w| w == n);
+                assert!(!contient(b"IMPRIMANTE-COMPTA-3E-ETAGE"), "nom d'imprimante encore présent");
+                assert!(!contient(b"SECRET"), "auteur encore présent");
+                // Le CONTENU doit être intact : on nettoie les métadonnées, pas le document.
+                let mut z = zip::ZipArchive::new(fs::File::open(&tmp).unwrap()).unwrap();
+                let mut doc = String::new();
+                std::io::Read::read_to_string(&mut z.by_name("content.xml").unwrap(), &mut doc).unwrap();
+                assert!(doc.contains("bonjour"));
+                let _ = fs::remove_file(tmp);
+            }
+            _ => panic!("l'odt aurait dû être nettoyé"),
         }
         let _ = fs::remove_file(src);
     }

@@ -1,6 +1,6 @@
 // Groupes : channel multi-pairs (chat), appel de groupe (audio), vidéo (WebRTC), fichiers.
 import { invoke, listen } from "./tauri.js";
-import { $, log, fmt, addImgBubble, clearImgBlobs, clampLabel, playPing } from "./dom.js";
+import { $, log, fmt, addImgBubble, clearImgBlobs, clampLabel, playPing, trimTextBubbles } from "./dom.js";
 import { S, PINV, GDECL, iceConfig, nativeVideoWanted, loadGroups, saveGroups, loadFriends, friendsOnly, memberName, isDeclaredLabel, saveGains, saveSGains, myName, } from "./state.js";
 import { showTab } from "./session.js";
 // Pas de cycle : friends.ts n'importe que tauri/dom/state/session, jamais groups.ts.
@@ -302,9 +302,32 @@ function saveMyVote(gid, target, on) {
 function onlineMemberCount(g) {
     return 1 + g.members.filter((c) => S.meshOnline.has(c)).length; // + moi
 }
-function kickQuorum(g) {
+/** Dénominateur du quorum MÉMORISÉ par cible (clé « gid|cible »), le temps que des votes
+ *  vivent. Sans lui, numérateur et dénominateur ne sont pas sur la même horloge : un vote
+ *  vaut KICK_TTL (5 min) alors que l'effectif en ligne est relu à CHAQUE dépouillement, et
+ *  le re-gossip de ghost-mesh-up rejoue une tally à chaque reconnexion. Deux membres sur
+ *  six pouvaient donc voter, attendre que la salle se vide, se reconnecter — quorum retombé
+ *  à 2 — et faire appliquer l'exclusion chez TOUS les clients honnêtes sans avoir jamais
+ *  atteint 60 % d'un effectif réel.
+ *
+ *  PORTÉE ASSUMÉE : ceci ferme « voter puis attendre le creux ». Voter directement pendant
+ *  un creux reste possible — c'est la sémantique voulue (60 % des présents au vote). */
+const kickDenom = {};
+function kickQuorum(g, target) {
+    const live = onlineMemberCount(g);
     // 60 % des en-ligne, plancher à 2 (jamais d'exclusion « solo »).
-    return Math.max(2, Math.ceil(0.6 * onlineMemberCount(g)));
+    if (!target)
+        return Math.max(2, Math.ceil(0.6 * live));
+    const k = kickKey(g.id, target);
+    if (!Object.keys(S.kickVotes[k] || {}).length) {
+        // Plus aucun vote en vie : le prochain repart de l'effectif du moment.
+        delete kickDenom[k];
+        return Math.max(2, Math.ceil(0.6 * live));
+    }
+    // Tant que des votes courent, le dénominateur ne peut que MONTER : quitter la salle
+    // ne doit jamais abaisser la barre d'un vote déjà entamé.
+    kickDenom[k] = Math.max(kickDenom[k] || 0, live);
+    return Math.max(2, Math.ceil(0.6 * kickDenom[k]));
 }
 function recordKickVote(gid, target, voter) {
     const key = kickKey(gid, target);
@@ -327,6 +350,7 @@ function applyKick(g, target) {
     s.add(target);
     saveKicked(g.id, s);
     delete S.kickVotes[kickKey(g.id, target)];
+    delete kickDenom[kickKey(g.id, target)]; // sinon le dénominateur survivrait à la cible
     renderGroups();
     if (S.openGroupId === g.id)
         refreshGroupCounts();
@@ -336,7 +360,10 @@ function applyKick(g, target) {
 }
 function tallyKick(g, target) {
     const n = Object.keys(S.kickVotes[kickKey(g.id, target)] || {}).length;
-    const q = kickQuorum(g);
+    // `target` est INDISPENSABLE ici : il est optionnel dans la signature, donc l'ancien
+    // appel `kickQuorum(g)` compilerait sans erreur et le dénominateur mémorisé ne servirait
+    // jamais — le correctif serait un no-op silencieux.
+    const q = kickQuorum(g, target);
     if (n >= q) {
         if (target === S.myCode) {
             // C'est MOI qui suis exclu : quitter le groupe et le dire (sinon je resterais
@@ -549,6 +576,9 @@ function addGroupMsgDom(author, text, who, from) {
     b.textContent = text;
     m.appendChild(b);
     box.appendChild(m);
+    // S.groupMsgs est plafonné à 200, mais ce plafond ne borne que le REJEU : sans ceci le
+    // DOM grandit à chaque message reçu pendant toute la session. Élaguer AVANT le scroll.
+    trimTextBubbles(box);
     box.scrollTop = box.scrollHeight;
 }
 function renderGroupMsgs() {
@@ -1315,7 +1345,7 @@ function removeStreamFromPcs(stream) {
 function videoPrivacyOk() {
     if (localStorage.getItem("ghostlink_video_ok") === "1")
         return true;
-    const ok = confirm("⚠️ Confidentialité — la caméra et le partage d'écran ouvrent une connexion vidéo DIRECTE (WebRTC) : ton adresse IP devient visible par les membres du groupe, et un serveur STUN public (Google) est contacté. Le chat, les fichiers et la voix restent relayés. Activer la vidéo quand même ?");
+    const ok = confirm("⚠️ Confidentialité — la vidéo WebRTC (caméra, et partage d'écran si le partage natif est désactivé) ouvre une connexion DIRECTE : ton adresse IP devient visible par les membres du groupe, et un serveur STUN public (Google) est contacté. Cela vaut aussi bien quand tu ÉMETS que quand tu REÇOIS le flux d'un membre. Le chat, les fichiers et la voix restent relayés. Activer la vidéo WebRTC quand même ?");
     if (ok)
         localStorage.setItem("ghostlink_video_ok", "1");
     return ok;
@@ -2092,7 +2122,14 @@ export function initGroups() {
             log("Code permanent indisponible — ré-essaie dans une seconde.");
             return;
         }
-        const id = "g" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+        // 64 bits d'aléa CRYPTOGRAPHIQUE. L'ancienne forme (Date.now + Math.random) ne
+        // donnait que ~26 bits non cryptographiques préfixés d'un horodatage devinable :
+        // un gid était devinable. Le modèle de sécurité reste « c'est l'appartenance qui
+        // fait foi, pas le gid » — mais un identifiant devinable n'a aucune raison d'être.
+        // Le format est libre (rien ne le parse) : les groupes existants restent valides.
+        const alea = new Uint8Array(8);
+        crypto.getRandomValues(alea);
+        const id = "g" + Array.from(alea, (b) => b.toString(16).padStart(2, "0")).join("");
         const full = [S.myCode, ...selected];
         saveGroups([...loadGroups(), { id, name, members: selected }]);
         $("#groupName").value = "";
@@ -2311,8 +2348,18 @@ export function initGroups() {
         pushGroupMsg(p.group, p.author || "", p.text || "", "them", p.from);
     });
     listen("ghost-gchat-img", (e) => {
+        // Le cast en ligne doit porter `from`, comme celui de ghost-gchat (la déclaration
+        // dans tauri.ts ne suffit pas à elle seule à typer `p.from` sur l'union).
         const p = e.payload || {};
-        if (!p.group || !loadGroups().some((x) => x.id === p.group))
+        const g = loadGroups().find((x) => x.id === p.group);
+        if (!p.group || !g)
+            return;
+        // DURCISSEMENT : même contrôle que ghost-gchat ci-dessus, qui manquait ICI. Sans lui,
+        // un membre exclu par vote continue d'INJECTER DES IMAGES alors que son texte est
+        // filtré : applyKick ne touche pas Settings.friends, donc le maillage l'accepte
+        // toujours (GroupHandler::accept n'exige que l'amitié). C'était le chemin le plus
+        // coûteux des deux — une image force un décodage bitmap, pas seulement un nœud texte.
+        if (p.from && !g.members.includes(p.from) && p.from !== S.myCode)
             return;
         // Contrairement au texte (pushGroupMsg), les images ne sont pas conservées
         // dans S.groupMsgs (pas d'historique par groupe) : on ne rend que si CE
@@ -2493,6 +2540,14 @@ export function initGroups() {
         // Une candidate ICE tardive (après stopVideo) ne doit pas RESSUSCITER un pc supprimé :
         // n'ouvrir un pc que sur une description ; une candidate sans pc existant est ignorée.
         if (msg.candidate && !S.pcs[peer])
+            return;
+        // Le consentement de confidentialité couvrait UNIQUEMENT l'émission (startCam /
+        // startScreen) : un membre pouvait donc forcer la négociation et obtenir mon IP sans
+        // qu'aucune invite n'apparaisse jamais. On l'exige maintenant aussi à l'OUVERTURE d'un
+        // pc entrant. Coût nul pour qui a déjà accepté : videoPrivacyOk lit ghostlink_video_ok
+        // et ne redemande pas. Refus = aucun pc, aucune answer — l'émetteur expire côté ICE,
+        // exactement comme face à un pair hors appel aujourd'hui.
+        if (!S.pcs[peer] && !videoPrivacyOk())
             return;
         const st = getPc(peer);
         const pc = st.pc;

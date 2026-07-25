@@ -1,7 +1,7 @@
 // Transfert de fichiers 1-à-1 (envoi/réception + accord) + chat texte + glisser-déposer.
 
 import { invoke, listen } from "./tauri.js";
-import { $, log, fmt, etaStr, baseName, addImgBubble, clampLabel, playPing } from "./dom.js";
+import { $, log, fmt, etaStr, baseName, addImgBubble, clampLabel, playPing, trimTextBubbles } from "./dom.js";
 import { S, myName, memberName, isDeclaredLabel } from "./state.js";
 import { paintConvoUnread } from "./session.js";
 
@@ -20,7 +20,18 @@ function guessImageMime(name: string): string | null {
 
 function setFile(path: string): void {
   $<HTMLInputElement>("#filePath").value = path;
-  $("#drop").innerHTML = '<span class="big">📄</span> ' + baseName(path);
+  // Le nom de fichier est une DONNÉE : il ne doit pas atteindre un parseur HTML. C'était
+  // le seul `innerHTML` du dépôt à concaténer une valeur variable — tout le reste du code
+  // suit déjà le motif « gabarit statique + textContent ». Sous Windows `<` et `>` sont
+  // interdits dans un nom, mais le code est multi-plateforme et rien ne garantit que ce
+  // chemin restera alimenté par le seul glisser-déposer local.
+  const box = $("#drop");
+  box.textContent = "";
+  const ico = document.createElement("span");
+  ico.className = "big";
+  ico.textContent = "📄";
+  box.appendChild(ico);
+  box.appendChild(document.createTextNode(" " + baseName(path)));
 }
 
 // Chat (texte chiffré par le canal iroh)
@@ -56,6 +67,9 @@ function addMsg(text: string, who: string, author?: string): void {
   m.appendChild(b);
   m.appendChild(t);
   c.appendChild(m);
+  // Le chat 1-à-1 n'avait AUCUN plafond (contrairement au groupe, dont le tampon est
+  // borné à 200) : le DOM grandissait indéfiniment. Élaguer AVANT le scroll.
+  trimTextBubbles(c);
   c.scrollTop = c.scrollHeight;
 }
 /** Un message 1-à-1 vient d'arriver : bip, puis compteur de non-lu si je ne suis pas en

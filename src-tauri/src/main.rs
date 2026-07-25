@@ -96,30 +96,108 @@ async fn send_kick(state: State<'_, Net>, members: Vec<String>, gid: String, tar
     net::send_kick(state.inner(), members, &gid, &target, &voter).await.map_err(|e| e.to_string())
 }
 
+/// Nettoie les métadonnées d'une image de chat AVANT envoi, et rend le résultat visible.
+///
+/// Sans ceci, coller une photo dans le chat transmettait son EXIF/GPS intact alors que
+/// la MÊME photo glissée sur la fenêtre partait nettoyée — et le Journal restait muet,
+/// donc l'utilisateur lisait l'absence de message comme « rien à nettoyer ». C'était
+/// exactement l'échec silencieux que l'en-tête de meta.rs s'interdit.
+///
+/// Même contrat que `net::prepare_meta` côté fichier : on n'échoue JAMAIS l'envoi pour
+/// un nettoyage raté, mais on ne se tait jamais non plus. L'événement émis est celui que
+/// le listener `ghost-meta` de transfer.ts affiche déjà — rien à changer côté UI.
+async fn clean_inline_img(app: &tauri::AppHandle, name: &str, data: Vec<u8>) -> Vec<u8> {
+    let src = data.clone();
+    let prep = tokio::task::spawn_blocking(move || meta::prepare_bytes(&src))
+        .await
+        .unwrap_or_else(|e| meta::BytesPrep::Failed(format!("préparation interrompue: {e}")));
+    match prep {
+        meta::BytesPrep::Cleaned(v) => {
+            let _ = app.emit("ghost-meta", serde_json::json!({ "name": name, "status": "cleaned" }));
+            v
+        }
+        meta::BytesPrep::Untouched => data,
+        meta::BytesPrep::Skipped(info) => {
+            let _ = app.emit("ghost-meta", serde_json::json!({ "name": name, "status": "skipped", "info": info }));
+            data
+        }
+        meta::BytesPrep::Failed(info) => {
+            let _ = app.emit("ghost-meta", serde_json::json!({ "name": name, "status": "failed", "info": info }));
+            data
+        }
+    }
+}
+
 #[tauri::command]
-async fn send_img(state: State<'_, Net>, author: String, name: String, mime: String, data: Vec<u8>) -> Result<(), String> {
+async fn send_img(app: tauri::AppHandle, state: State<'_, Net>, author: String, name: String, mime: String, data: Vec<u8>) -> Result<(), String> {
     let slot = state.slot.clone();
+    let data = clean_inline_img(&app, &name, data).await;
     net::send_img(&slot, &author, &name, &mime, &data).await.map_err(|e| e.to_string())
 }
 
+// Arguments nombreux mais imposés par le contrat UI (Tauri mappe chaque champ JSON sur un
+// paramètre) : les regrouper dans une struct changerait la forme de l'appel côté TypeScript.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
-async fn send_gimg(state: State<'_, Net>, members: Vec<String>, gid: String, author: String, name: String, mime: String, data: Vec<u8>) -> Result<(), String> {
+async fn send_gimg(app: tauri::AppHandle, state: State<'_, Net>, members: Vec<String>, gid: String, author: String, name: String, mime: String, data: Vec<u8>) -> Result<(), String> {
+    let data = clean_inline_img(&app, &name, data).await;
     net::send_gimg(state.inner(), members, &gid, &author, &name, &mime, &data).await.map_err(|e| e.to_string())
 }
 
-/// Repli grosse image : lire les octets d'un fichier reçu (borné) pour rendu inline via blob.
+/// Repli grosse image : lire les octets d'un fichier REÇU (borné) pour rendu inline via blob.
+///
+/// CONFINEMENT AU DOSSIER DE RÉCEPTION — indispensable. Les capabilities de l'app sont
+/// volontairement minimales (`core:default` + `updater:default` : ni plugin `fs`, ni
+/// `shell`, ni `dialog`), donc la WebView n'a AUCUN accès disque générique. Sans la
+/// vérification ci-dessous, cette commande réintroduisait à elle seule exactement la
+/// capacité que cette configuration interdit : une primitive de lecture arbitraire
+/// (identity.key, documents, profils d'autres applications), exploitable par tout script
+/// s'exécutant dans la vue. Le seul appel légitime (ui/src/transfer.ts) passe un chemin
+/// que NOUS venons de fabriquer et d'émettre dans `ghost-recv-done` : il est toujours
+/// dans le dossier de réception, le confinement ne coûte donc rien fonctionnellement.
 #[tauri::command]
-async fn read_image_bytes(path: String) -> Result<Vec<u8>, String> {
-    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+async fn read_image_bytes(state: State<'_, Net>, path: String) -> Result<Vec<u8>, String> {
+    // canonicalize() résout liens, jonctions, « .. » et casse : la comparaison de préfixe
+    // porte sur le chemin RÉEL, jamais sur la chaîne fournie par le JS.
+    let dossier = std::path::PathBuf::from(net::get_download_dir(&state.settings))
+        .canonicalize()
+        .map_err(|e| format!("dossier de réception illisible : {e}"))?;
+    let cible = std::path::Path::new(&path)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    if !cible.starts_with(&dossier) {
+        return Err("chemin hors du dossier de réception".into());
+    }
+    let meta = std::fs::metadata(&cible).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("pas un fichier régulier".into());
+    }
     if meta.len() > 32 * 1024 * 1024 {
         return Err("image trop grande".into()); // borne
     }
-    std::fs::read(&path).map_err(|e| e.to_string())
+    std::fs::read(&cible).map_err(|e| e.to_string())
 }
 
+/// Définit le dossier de réception. Chaîne vide = revenir au défaut (Téléchargements).
+///
+/// Le chemin vient du JS et devient la RACINE d'écriture de tous les fichiers reçus.
+/// `sanitize()` protège le NOM du fichier, pas la racine : sans validation ici, un script
+/// dans la vue pouvait pointer le dossier Démarrage de l'utilisateur et transformer le
+/// prochain fichier reçu en exécution à l'ouverture de session.
 #[tauri::command]
-fn set_download_dir(state: State<'_, Net>, path: String) {
-    net::set_download_dir(&state.settings, &path);
+fn set_download_dir(state: State<'_, Net>, path: String) -> Result<(), String> {
+    let p = path.trim();
+    if !p.is_empty() {
+        let chemin = std::path::Path::new(p);
+        if !chemin.is_absolute() {
+            return Err("le dossier doit être un chemin absolu".into());
+        }
+        if !chemin.is_dir() {
+            return Err("ce dossier n'existe pas".into());
+        }
+    }
+    net::set_download_dir(&state.settings, p);
+    Ok(())
 }
 
 #[tauri::command]
@@ -433,7 +511,39 @@ fn app_version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
+/// Nom de fichier annoncé dans le « trusted comment » de la signature minisign.
+///
+/// Ce commentaire est couvert par la signature GLOBALE (minisign signe
+/// `signature || trusted_comment`) : il est AUTHENTIFIÉ, donc infalsifiable sans la clé
+/// privée. Format produit par tauri :
+///   `trusted comment: timestamp:1784937538\tfile:ghost-link_0.36.1_x64-setup.exe`
+fn signed_file_name(signature_b64: &str) -> Option<String> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(signature_b64.trim())
+        .ok()?;
+    let txt = String::from_utf8(raw).ok()?;
+    let line = txt.lines().find(|l| l.starts_with("trusted comment:"))?;
+    line.split('\t')
+        .find_map(|f| f.trim().strip_prefix("file:"))
+        .map(|s| s.trim().to_string())
+}
+
 /// Cherche une mise à jour. Renvoie la version disponible (ou null), et la garde en attente.
+///
+/// SÉCURITÉ — liaison version ↔ binaire. La signature minisign prouve seulement que ces
+/// octets ont été signés UN JOUR par nous ; elle ne dit RIEN du numéro de version annoncé,
+/// qui est un champ libre de `latest.json`. Quiconque obtient un droit d'écriture sur les
+/// releases GitHub (compte compromis, jeton `gh` volé) — SANS posséder la clé de signature
+/// — pouvait donc republier un ancien installeur légitimement signé sous un numéro élevé,
+/// et faire redescendre tout le parc sur une version vulnérable, en `installMode: passive`,
+/// c'est-à-dire sans interaction. Le nom de fichier du « trusted comment », lui, est
+/// authentifié : on exige qu'il corresponde à la version annoncée.
+///
+/// FAIL-OPEN DÉLIBÉRÉ si le commentaire est illisible : un futur changement de format
+/// minisign ne doit pas figer les mises à jour de tout le parc (le correctif passerait
+/// lui-même par une mise à jour...). Ce n'est pas une brèche : la vraie vérification de
+/// signature du plugin s'exécute de toute façon au téléchargement et rejette les octets.
 #[tauri::command]
 async fn check_update(
     app: tauri::AppHandle,
@@ -445,6 +555,18 @@ async fn check_update(
         .check()
         .await
         .map_err(|e| e.to_string())?;
+    if let Some(u) = update.as_ref() {
+        if let Some(fichier) = signed_file_name(&u.signature) {
+            if !fichier.contains(&u.version) {
+                return Err(format!(
+                    "mise à jour refusée : le binaire signé est « {fichier} », qui ne correspond pas \
+                     à la version annoncée {}. Signale-le — cela ressemble à un rejeu d'un ancien \
+                     installeur sous un faux numéro de version.",
+                    u.version
+                ));
+            }
+        }
+    }
     let version = update.as_ref().map(|u| u.version.clone());
     *pending.0.lock().unwrap_or_else(|e| e.into_inner()) = update;
     Ok(version)
@@ -568,4 +690,41 @@ fn main() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signed_file_name;
+
+    /// Signature RÉELLE publiée dans latest.json pour v0.36.1 (clé publique du dépôt).
+    /// Sert de référence de format : si tauri change la forme du « trusted comment »,
+    /// ce test échoue et signale que le contrôle anti-rejeu est devenu inopérant.
+    const SIG_REELLE: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRWJES21OamFxR2xJWjRpelkrTFlUZ1JydEJhUHFpU1NYMlZ1R3h6bndWaVR2Qko4SzVpdkRVUWVsSDBmZGlNbWtsd0Q5aUhNSGJpNDVFRlhpeDJlS3cwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0OTM3NTM4CWZpbGU6Z2hvc3QtbGlua18wLjM2LjFfeDY0LXNldHVwLmV4ZQpZMXJVeUtOR3hzYlcyRUVJOG9jMi9MZERrc2xsYUdkakJISDB4VTVPMzNjUXBNa25xKzF4UkhTa1Y2WTVWQ2FybmJUQ0F6b2lDWmErcU1lNHJrbHRCQT09";
+
+    #[test]
+    fn extrait_le_nom_de_fichier_signe() {
+        assert_eq!(
+            signed_file_name(SIG_REELLE).as_deref(),
+            Some("ghost-link_0.36.1_x64-setup.exe")
+        );
+    }
+
+    #[test]
+    fn le_rejeu_d_un_ancien_binaire_est_detectable() {
+        // C'est TOUT le contrôle : le nom de fichier signé porte 0.36.1, donc annoncer
+        // « 99.0.0 » dans latest.json avec cette signature-là ne peut pas passer.
+        let fichier = signed_file_name(SIG_REELLE).unwrap();
+        assert!(!fichier.contains("99.0.0"), "le rejeu doit être refusé");
+        assert!(fichier.contains("0.36.1"), "la version légitime doit passer");
+    }
+
+    #[test]
+    fn signature_illisible_ne_bloque_pas_les_mises_a_jour() {
+        // Fail-open délibéré : un format inattendu ne doit pas figer le parc, la vraie
+        // vérification de signature s'exécutant de toute façon au téléchargement.
+        assert!(signed_file_name("pas du base64 !!").is_none());
+        assert!(signed_file_name("").is_none());
+        // Base64 valide mais sans « trusted comment » : pas de nom → pas de blocage.
+        assert!(signed_file_name("aGVsbG8gd29ybGQ=").is_none());
+    }
 }

@@ -4,7 +4,7 @@
 
 [package]
 name = "ghost-link"
-version = "0.36.1"
+version = "0.37.0"
 edition = "2021"
 
 [build-dependencies]
@@ -34,6 +34,9 @@ lopdf = "0.34"
 # zopfli (+bumpalo), inutile pour écrire quelques petites entrées XML de remplacement.
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 base64 = "0.22.1"
+# Effacement des copies de la clé d'identité en RAM (net.rs). Crate minuscule, sans
+# dépendance transitive : aucun risque de conflit avec le sha2 épinglé par iroh.
+zeroize = "1"
 
 # Chiffrement de la clé d'identité au repos (DPAPI) — Windows uniquement.
 [target.'cfg(windows)'.dependencies]

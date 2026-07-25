@@ -15,6 +15,7 @@ use iroh::{
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
+use zeroize::Zeroize;
 
 pub const ALPN: &[u8] = b"ghost-link/file/0";
 // Protocole léger de présence : si la connexion s'établit, le pair est en ligne.
@@ -57,6 +58,13 @@ const GKIND_GIMG: u8 = 11; // image inline de groupe (octets)
 const VIDEO_FRAME_MAX: usize = 8 * 1024 * 1024;
 /// Borne dure d'allocation pour une image inline reçue (spec : inline ≤ 5 Mo côté UI).
 const MAX_IMG_WIRE: usize = 8 * 1024 * 1024;
+/// Demandes de connexion entrantes SIMULTANÉMENT en attente de réponse de l'utilisateur.
+/// Chacune retient une connexion QUIC, une tâche et une entrée de map pendant 45 s.
+/// 8 : très au-dessus de tout usage réel (l'UI n'affiche qu'une bannière à la fois), très
+/// en dessous de ce qu'un attaquant faisant tourner ses identités peut empiler.
+/// Compromis assumé : un attaquant peut occuper les 8 créneaux et retarder une demande
+/// légitime de 45 s — bien préférable à une application figée.
+const MAX_PENDING_INCOMING: usize = 8;
 
 #[derive(Default)]
 pub struct ConnState {
@@ -103,7 +111,10 @@ impl Settings {
     fn recv_dir(&self) -> PathBuf {
         self.download_dir
             .lock()
-            .unwrap()
+            // Anti-poison, comme partout ailleurs dans le fichier : un `unwrap()` nu ici
+            // ferait paniquer TOUTE réception ultérieure si un thread panique un jour en
+            // tenant ce verrou. C'était le seul site du module à ne pas le faire.
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
             .unwrap_or_else(|| dirs::download_dir().unwrap_or_else(std::env::temp_dir))
     }
@@ -169,6 +180,20 @@ impl ProtocolHandler for Ghost {
             let _ = self.app.emit("ghost-refused", &peer);
             return Ok(());
         }
+        // Plafond de demandes SIMULTANÉES en attente. L'anti-spam ci-dessus est indexé sur
+        // `peer` = remote_id, or fabriquer une identité iroh est gratuit : un attaquant qui
+        // fait tourner ses clés le contourne intégralement. Chaque connexion armait alors
+        // 45 s d'attente, une entrée de HashMap et un événement `ghost-incoming` (repeinture
+        // + un invoke `fingerprint` chacun) — de quoi rendre la fenêtre inutilisable.
+        // On refuse EN SILENCE au-delà du plafond : émettre un événement remplacerait un
+        // flot de tâches par un flot d'événements, c'est-à-dire le même déni de service.
+        {
+            let n = self.incoming.pending.lock().unwrap_or_else(|e| e.into_inner()).len();
+            if n >= MAX_PENDING_INCOMING {
+                connection.close(0u32.into(), b"busy");
+                return Ok(());
+            }
+        }
         // Demander l'autorisation à l'utilisateur (toujours), avec délai de 45 s.
         let id = self.incoming.counter.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
@@ -201,11 +226,33 @@ impl ProtocolHandler for Ghost {
 }
 
 /// Handler de présence : ne fait rien — une poignée de main réussie suffit à prouver qu'on est en ligne.
-#[derive(Debug, Clone)]
-pub struct Presence;
+///
+/// DURCISSEMENT : cet ALPN était le seul des trois à n'appliquer NI le filtre « amis
+/// uniquement » NI l'anti-spam. Conséquence : quiconque détenait le code permanent pouvait
+/// sonder la présence indéfiniment — même retiré des amis, même avec l'isolement activé —
+/// et reconstituer les horaires de présence devant la machine en interrogeant toutes les
+/// 30 s. C'est exactement la métadonnée que le produit promet de ne pas laisser fuir, et
+/// il n'existe aucune révocation du code permanent (seul l'éphémère tourne).
+///
+/// Aucun changement pour la majorité des utilisateurs : `allows()` renvoie `true` quand le
+/// filtre est désactivé, ce qui est le défaut. Le durcissement ne s'applique qu'à ceux qui
+/// ont explicitement coché la case — c'est précisément son intention affichée.
+#[derive(Clone)]
+pub struct Presence {
+    pub settings: Settings,
+}
+
+impl std::fmt::Debug for Presence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Presence")
+    }
+}
 
 impl ProtocolHandler for Presence {
-    async fn accept(&self, _connection: Connection) -> Result<(), AcceptError> {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        if !self.settings.allows(&connection.remote_id().to_string()) {
+            connection.close(0u32.into(), b"not-a-friend");
+        }
         Ok(())
     }
 }
@@ -268,18 +315,31 @@ fn load_or_create_secret() -> SecretKey {
             }
         }
     }
-    if let Ok(bytes) = std::fs::read(&path) {
+    if let Ok(mut bytes) = std::fs::read(&path) {
         // Priorité au format chiffré (DPAPI) ; sinon ancien format clair (32 octets) → migration.
-        if let Some(arr) = decrypt_key(&bytes) {
-            return SecretKey::from_bytes(&arr);
+        if let Some(mut arr) = decrypt_key(&bytes) {
+            let sk = SecretKey::from_bytes(&arr);
+            // Effacer la copie déchiffrée : `SecretKey` garde la sienne pour la vie du
+            // processus (rien à y faire ici), mais ce tampon-ci, lui, part au recyclage
+            // du tas et peut finir dans le fichier d'échange, l'hibernation ou un
+            // vidage mémoire. Gain modeste et honnête : sous Windows un processus du
+            // même utilisateur peut déjà lire notre mémoire — ce n'est pas ce modèle
+            // d'attaquant que l'on vise, mais les traces qui SURVIVENT au processus.
+            arr.zeroize();
+            bytes.zeroize();
+            return sk;
         }
         if bytes.len() == 32 {
+            // Chemin de MIGRATION : ici `bytes` contient la clé EN CLAIR.
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
             let sk = SecretKey::from_bytes(&arr);
+            arr.zeroize();
+            bytes.zeroize();
             save_secret(&path, &sk); // ré-écrit la clé chiffrée
             return sk;
         }
+        bytes.zeroize();
     }
     let sk = SecretKey::generate();
     save_secret(&path, &sk);
@@ -292,8 +352,14 @@ fn save_secret(path: &Path, sk: &SecretKey) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let data = encrypt_key(&sk.to_bytes());
-    if std::fs::write(path, &data).is_ok() {
+    let mut clair = sk.to_bytes();
+    let mut data = encrypt_key(&clair);
+    clair.zeroize();
+    // Si DPAPI a échoué, `data` EST la clé en clair (repli assumé plus bas) : dans ce cas
+    // l'effacer après écriture évite au moins d'en laisser une copie sur le tas.
+    let ecrit = std::fs::write(path, &data).is_ok();
+    data.zeroize();
+    if ecrit {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -368,6 +434,10 @@ fn decrypt_key(stored: &[u8]) -> Option<[u8; 32]> {
         } else {
             None
         };
+        // Le tampon LocalAlloc rendu par CryptUnprotectData contient la clé EN CLAIR.
+        // LocalFree ne l'écrase pas : sans ce write_bytes, ces 32 octets restent tels
+        // quels dans le tas recyclé par le processus.
+        std::ptr::write_bytes(out_blob.pbData, 0, out_blob.cbData as usize);
         let _ = LocalFree(out_blob.pbData as *mut core::ffi::c_void);
         res
     }
@@ -420,18 +490,85 @@ pub fn set_download_dir(settings: &Settings, path: &str) {
 pub fn get_download_dir(settings: &Settings) -> String {
     settings.recv_dir().to_string_lossy().to_string()
 }
+/// Fichier mémorisant le CONTRÔLE D'ACCÈS (filtre « amis uniquement » + carnet).
+///
+/// Ces deux valeurs ne vivaient que dans le localStorage de la WebView et n'étaient
+/// poussées vers Rust qu'à l'évaluation du module `main.js`. Or les routeurs iroh
+/// acceptent dès `setup()`, avant même que la WebView soit chargée : pendant toute la
+/// fenêtre de démarrage, `allows()` renvoyait `true` pour n'importe qui alors que
+/// l'utilisateur avait coché « n'accepter que les amis ». Le dossier de réception, lui,
+/// était déjà persisté — le réglage de SÉCURITÉ était le seul à ne pas l'être.
+fn access_path() -> PathBuf {
+    let base = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
+    base.join("ghost-link").join("access.json")
+}
+
+/// Relit le contrôle d'accès. Fichier absent = première exécution : on garde le
+/// comportement historique (ouvert). Fichier présent mais ILLISIBLE = l'utilisateur a
+/// configuré quelque chose que l'on n'arrive pas à relire : on échoue du côté FERMÉ
+/// (filtre actif, carnet vide) le temps que la WebView repousse ses réglages. Échouer
+/// ouvert dans ce cas rouvrirait exactement le trou que l'on ferme.
+fn load_access() -> (bool, HashSet<String>) {
+    let raw = match std::fs::read_to_string(access_path()) {
+        Ok(r) => r,
+        Err(_) => return (false, HashSet::new()),
+    };
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return (true, HashSet::new()),
+    };
+    let only = v.get("only_friends").and_then(|b| b.as_bool()).unwrap_or(true);
+    let friends: HashSet<String> = v
+        .get("friends")
+        .and_then(|f| f.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    (only, friends)
+}
+
+/// Écrit l'état courant du contrôle d'accès. Best-effort : un échec d'écriture ne doit
+/// jamais empêcher le réglage de prendre effet EN MÉMOIRE pour la session en cours.
+fn save_access(settings: &Settings) {
+    let path = access_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let friends: Vec<String> = settings
+        .friends
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect();
+    let v = serde_json::json!({
+        "only_friends": settings.only_friends.load(Ordering::SeqCst),
+        "friends": friends,
+    });
+    let _ = std::fs::write(&path, v.to_string());
+}
+
 pub fn set_only_friends(settings: &Settings, on: bool) {
     settings.only_friends.store(on, Ordering::SeqCst);
+    save_access(settings);
 }
 pub fn set_friends(settings: &Settings, codes: Vec<String>) {
-    let mut s = settings.friends.lock().unwrap_or_else(|e| e.into_inner());
-    s.clear();
-    for c in codes {
-        let c = c.trim();
-        if !c.is_empty() {
-            s.insert(c.to_string());
+    {
+        let mut s = settings.friends.lock().unwrap_or_else(|e| e.into_inner());
+        s.clear();
+        for c in codes {
+            let c = c.trim();
+            if !c.is_empty() {
+                s.insert(c.to_string());
+            }
         }
     }
+    save_access(settings);
 }
 
 /// Réponse de l'utilisateur à une offre de fichier entrante (true = accepter, false = refuser).
@@ -501,7 +638,12 @@ fn build_router(
                 video_rx: video_rx.clone(),
             },
         )
-        .accept(PRESENCE_ALPN, Presence)
+        .accept(
+            PRESENCE_ALPN,
+            Presence {
+                settings: settings.clone(),
+            },
+        )
         .spawn()
 }
 
@@ -569,16 +711,61 @@ async fn write_lp32_bytes<W: AsyncWriteExt + Unpin>(send: &mut W, b: &[u8]) -> a
     send.write_all(b).await?;
     Ok(())
 }
-async fn read_lp32_bytes<R: AsyncReadExt + Unpin>(recv: &mut R, max: usize) -> anyhow::Result<Vec<u8>> {
+/// Budget d'images inline EN VOL, pour tout le processus.
+///
+/// La borne unitaire (MAX_IMG_WIRE) était correcte mais ne bornait QUE l'image courante :
+/// chaque flux bidi est traité dans son propre `tokio::spawn`, et quinn autorise 100 flux
+/// bidi concurrents par défaut (iroh ne réduit pas ce réglage). Un pair pouvait donc faire
+/// allouer ~100 × 8 Mio d'un coup. 96 Mio ≈ 4 images de 8 Mio avec leur amplification
+/// (octets bruts + base64 ≈ ×1,33 + sérialisation JSON de l'événement, soit ~×3) : très
+/// au-dessus de tout usage légitime — deux personnes qui collent une image en même temps
+/// passent sans s'en apercevoir — et très en dessous du pic actuel.
+const MAX_IMG_INFLIGHT: u64 = 96 * 1024 * 1024;
+static IMG_INFLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Réservation RAII : le budget est rendu quoi qu'il arrive (fin normale, `?`, panique).
+/// Un fetch_add/fetch_sub manuel oublierait forcément un des chemins de sortie.
+struct ImgBudget(u64);
+impl ImgBudget {
+    fn acquire(n: u64) -> Option<Self> {
+        let mut cur = IMG_INFLIGHT.load(Ordering::SeqCst);
+        loop {
+            if cur + n > MAX_IMG_INFLIGHT {
+                return None;
+            }
+            match IMG_INFLIGHT.compare_exchange(cur, cur + n, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some(ImgBudget(n)),
+                Err(c) => cur = c,
+            }
+        }
+    }
+}
+impl Drop for ImgBudget {
+    fn drop(&mut self) {
+        IMG_INFLIGHT.fetch_sub(self.0, Ordering::SeqCst);
+    }
+}
+
+/// Lit une image inline : borne unitaire AVANT allocation, puis réservation du budget
+/// global tenue jusqu'à la fin du traitement (l'appelant garde la garde dans son tuple).
+async fn read_img_bytes<R: AsyncReadExt + Unpin>(recv: &mut R) -> anyhow::Result<(Vec<u8>, ImgBudget)> {
     let mut l = [0u8; 4];
     recv.read_exact(&mut l).await?;
     let n = u32::from_be_bytes(l) as usize;
-    if n == 0 || n > max {
+    if n == 0 || n > MAX_IMG_WIRE {
         anyhow::bail!("image trop grande"); // borne AVANT alloc
     }
+    let budget = ImgBudget::acquire(n as u64 * 3)
+        .ok_or_else(|| anyhow::anyhow!("trop d'images en vol"))?;
     let mut b = vec![0u8; n];
-    recv.read_exact(&mut b).await?;
-    Ok(b)
+    // Délai OBLIGATOIRE : le budget est retenu pendant toute la lecture. Sans lui, un pair
+    // qui annonce 8 Mio puis envoie un octet par seconde assécherait le budget GLOBAL et
+    // couperait les images de tout le monde — un déni de service moins cher que celui
+    // qu'on corrige. 30 s couvrent très largement 8 Mio sur un lien utilisable.
+    tokio::time::timeout(std::time::Duration::from_secs(30), recv.read_exact(&mut b))
+        .await
+        .map_err(|_| anyhow::anyhow!("image trop lente"))??;
+    Ok((b, budget))
 }
 fn mime_ok(m: &str) -> bool {
     matches!(m, "image/png" | "image/jpeg" | "image/gif" | "image/webp")
@@ -787,7 +974,7 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, video_rx:
                             }
                         }
                     } else if kind[0] == GKIND_GIMG {
-                        let parsed: anyhow::Result<(String, String, String, String, Vec<u8>)> = async {
+                        let parsed: anyhow::Result<(String, String, String, String, Vec<u8>, ImgBudget)> = async {
                             let gid = read_lp16(&mut recv).await?;
                             let author = read_lp16(&mut recv).await?;
                             let name = read_lp16(&mut recv).await?;
@@ -795,11 +982,14 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, video_rx:
                             if !mime_ok(&mime) {
                                 anyhow::bail!("mime refusé");
                             }
-                            let data = read_lp32_bytes(&mut recv, MAX_IMG_WIRE).await?;
-                            Ok((gid, author, name, mime, data))
+                            let (data, budget) = read_img_bytes(&mut recv).await?;
+                            Ok((gid, author, name, mime, data, budget))
                         }
                         .await;
-                        if let Ok((gid, author, name, mime, data)) = parsed {
+                        // `_budget` est nommé pour vivre jusqu'à la fin du bloc : c'est
+                        // l'emit (base64 + sérialisation) qui coûte le plus de mémoire, le
+                        // rendre avant serait compter faux. `_b` le libérerait aussitôt.
+                        if let Ok((gid, author, name, mime, data, _budget)) = parsed {
                             use base64::Engine;
                             let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                             let _ = a.emit("ghost-gchat-img", serde_json::json!({ "group": gid, "author": author, "name": name, "mime": mime, "dataB64": b64, "from": from }));
@@ -1449,6 +1639,15 @@ pub async fn start(app: AppHandle) -> anyhow::Result<Net> {
     if let Some(dir) = load_download_dir() {
         *settings.download_dir.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir);
     }
+    // Contrôle d'accès relu AVANT la construction des routeurs (ligne ~1459) : ceux-ci
+    // acceptent des connexions dès qu'ils existent, bien avant que la WebView ait pu
+    // pousser quoi que ce soit. Sans ceci, « amis uniquement » restait inactif pendant
+    // toute la fenêtre de démarrage.
+    {
+        let (only, friends) = load_access();
+        settings.only_friends.store(only, Ordering::SeqCst);
+        *settings.friends.lock().unwrap_or_else(|e| e.into_inner()) = friends;
+    }
     let incoming = Incoming::default();
     let mesh: Mesh = Arc::new(StdMutex::new(HashMap::new()));
     let connecting: Connecting = Arc::new(StdMutex::new(HashSet::new()));
@@ -1646,6 +1845,10 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                 let cancel = recv_cancel.clone();
                 let settings = settings.clone();
                 let inbounds = inbounds.clone();
+                // Identité AUTHENTIFIÉE du pair (remote_id, garantie par le TLS d'iroh).
+                // Les demandes d'ami portent un code PERMANENT auto-déclaré : l'UI doit
+                // pouvoir comparer les deux, sinon elle enregistre un code arbitraire.
+                let from = peer.clone();
                 tokio::spawn(async move {
                     // Premier octet : type de flux (1 = fichier, 2 = chat).
                     let mut kind = [0u8; 1];
@@ -1681,18 +1884,19 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                     }
                     if kind[0] == KIND_IMG {
                         // [u16 author][u16 name][u16 mime][u32 data]
-                        let parsed: anyhow::Result<(String, String, String, Vec<u8>)> = async {
+                        let parsed: anyhow::Result<(String, String, String, Vec<u8>, ImgBudget)> = async {
                             let author = read_lp16(&mut recv).await?;
                             let name = read_lp16(&mut recv).await?;
                             let mime = read_lp16(&mut recv).await?;
                             if !mime_ok(&mime) {
                                 anyhow::bail!("mime refusé");
                             }
-                            let data = read_lp32_bytes(&mut recv, MAX_IMG_WIRE).await?;
-                            Ok((author, name, mime, data))
+                            let (data, budget) = read_img_bytes(&mut recv).await?;
+                            Ok((author, name, mime, data, budget))
                         }
                         .await;
-                        if let Ok((author, name, mime, data)) = parsed {
+                        // Voir la note du chemin de groupe : la garde doit survivre à l'emit.
+                        if let Ok((author, name, mime, data, _budget)) = parsed {
                             use base64::Engine;
                             let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                             let _ = a.emit("ghost-chat-img", serde_json::json!({ "author": author, "name": name, "mime": mime, "dataB64": b64 }));
@@ -1723,7 +1927,14 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                         .await
                         .unwrap_or_default();
                         let ev = if kind[0] == KIND_FREQ { "ghost-freq" } else { "ghost-faccept" };
-                        let _ = a.emit(ev, serde_json::json!({ "name": name, "code": code }));
+                        // `from` = remote_id : la SEULE identité authentifiée par le TLS.
+                        // `code` reste auto-déclaré par l'émetteur — il n'est PAS une preuve.
+                        // TOUS les messages de groupe (GKIND_*) portent déjà `from` ; les
+                        // demandes d'ami étaient les seules à ne pas le faire, alors que ce
+                        // sont elles qui alimentent la liste blanche pilotant `allows()` et
+                        // `GroupHandler::accept`. Ajout PUR : aucun octet du protocole ne
+                        // change, donc un pair v0.36.x reste parfaitement interopérable.
+                        let _ = a.emit(ev, serde_json::json!({ "name": name, "code": code, "from": from }));
                         return;
                     }
                     if kind[0] == KIND_CALL_START || kind[0] == KIND_CALL_STOP {
@@ -2241,18 +2452,74 @@ pub async fn send_call_stop(slot: &Slot) -> anyhow::Result<()> {
     send_kind_only(slot, KIND_CALL_STOP).await
 }
 
-/// Empreinte lisible d'un code (8 premiers octets de SHA-256, en 4 groupes hex).
+/// Empreinte lisible d'un code (16 premiers octets de SHA-256, en 8 groupes hex).
+///
+/// C'est le SEUL mécanisme de vérification d'identité hors bande du produit (« compare-la
+/// de vive voix »). À 8 octets, une SECONDE PRÉIMAGE — fabriquer une identité dont
+/// l'empreinte affichée est identique à celle d'une cible — ne coûtait que 2^64 essais,
+/// à portée d'un attaquant disposant de moyens. 16 octets ferment le sujet définitivement.
+///
+/// Extension GRACIEUSE : les 8 premiers octets sont inchangés, donc une empreinte déjà
+/// notée par un utilisateur reste un PRÉFIXE valide de la nouvelle. Aucune compatibilité
+/// de protocole en jeu — l'empreinte est calculée localement et ne circule jamais sur le
+/// fil. Les ÉTIQUETTES d'affichage restent tronquées à 4 groupes côté UI (fpLabel).
 pub fn fingerprint(code: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(code.trim().to_lowercase().as_bytes());
     let out = h.finalize();
-    let hex: String = out.iter().take(8).map(|b| format!("{:02X}", b)).collect();
+    let hex: String = out.iter().take(16).map(|b| format!("{:02X}", b)).collect();
     hex.as_bytes()
         .chunks(4)
         .filter_map(|c| std::str::from_utf8(c).ok())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+/// Caractères Unicode de FORMATAGE ou invisibles que `char::is_control()` ne couvre pas.
+///
+/// `is_control()` ne teste que la catégorie Cc (C0/C1). La catégorie Cf passe donc
+/// entière — dont U+202E RIGHT-TO-LEFT OVERRIDE, qui INVERSE le rendu de la fin du nom :
+/// `facture\u{202E}cod.exe` s'affiche « facturexe.doc » dans la bannière d'acceptation.
+/// Or cette bannière EST le contrôle de sécurité : c'est le seul moment où l'utilisateur
+/// décide qu'un fichier venu du réseau touche son disque. Les invisibles (ZWSP, BOM,
+/// soft hyphen) servent, eux, à fabriquer deux noms visuellement identiques.
+fn est_trompeur(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}'                // SOFT HYPHEN
+        | '\u{200B}'..='\u{200F}' // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        | '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO
+        | '\u{2060}'..='\u{2064}' // WORD JOINER et opérateurs invisibles
+        | '\u{2066}'..='\u{2069}' // isolates LRI/RLI/FSI/PDI
+        | '\u{FEFF}'              // BOM / ZWNBSP
+    )
+}
+
+/// Noms de périphériques DOS : sous Windows ils désignent un périphérique dans N'IMPORTE
+/// quel dossier, y compris suffixés (`NUL.txt`, `COM3.jpg`). Ils ne contiennent aucun
+/// caractère interdit, donc aucun filtre par caractère ne les attrape.
+const PERIPHERIQUES_DOS: [&str; 24] = [
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4", "COM5",
+    "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
+    "LPT8", "LPT9",
+];
+
+fn est_peripherique_dos(nom: &str) -> bool {
+    // Windows regarde le radical avant le premier point, espaces de fin ignorés.
+    let base = nom.split('.').next().unwrap_or(nom).trim_end_matches(' ');
+    PERIPHERIQUES_DOS.iter().any(|p| base.eq_ignore_ascii_case(p))
+}
+
+/// Tronque sur une FRONTIÈRE DE CARACTÈRE (jamais au milieu d'un UTF-8 multi-octets).
+fn tronque_octets(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut fin = max;
+    while fin > 0 && !s.is_char_boundary(fin) {
+        fin -= 1;
+    }
+    s[..fin].to_string()
 }
 
 fn sanitize(name: &str) -> String {
@@ -2262,15 +2529,30 @@ fn sanitize(name: &str) -> String {
         .unwrap_or("fichier");
     let cleaned: String = base
         .chars()
-        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .filter(|c| {
+            !c.is_control()
+                && !est_trompeur(*c)
+                && !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        })
         .collect();
     // Windows ignore les points/espaces de fin → on les retire (collisions / noms pièges).
     let cleaned = cleaned.trim().trim_end_matches(['.', ' ']).to_string();
+    // Borner la longueur : le pair annonce le nom sur 2 octets, donc jusqu'à 65 535.
+    // 200 octets laissent la place au suffixe « (9999) » d'unique_path sous la limite
+    // NTFS de 255. Tronquer AVANT le test de vacuité, et re-retirer les points/espaces
+    // que la troncature peut ré-exposer en fin de chaîne.
+    let cleaned = tronque_octets(&cleaned, 200)
+        .trim_end_matches(['.', ' '])
+        .to_string();
     if cleaned.is_empty() {
-        "fichier".to_string()
-    } else {
-        cleaned
+        return "fichier".to_string();
     }
+    if est_peripherique_dos(&cleaned) {
+        // Préfixer plutôt que rejeter : l'utilisateur a accepté CE fichier, il doit
+        // arriver — mais jamais sur un port série ou sur la console.
+        return format!("_{cleaned}");
+    }
+    cleaned
 }
 
 fn unique_path(dir: &Path, name: &str) -> PathBuf {
@@ -2321,5 +2603,67 @@ mod tests {
         // Et rester sous ce que la WebView sait consommer (~3,5 Mo/s, mesure exp3),
         // sinon on relaie plus vite qu'elle ne décode et la latence s'effondre.
         assert!(super::RELAY_RATE <= 3_670_016, "au-delà de ~3,5 Mio/s la WebView décroche");
+    }
+
+    // ---- sanitize : le nom vient du PAIR, c'est une entrée hostile ----
+
+    #[test]
+    fn sanitize_coupe_la_traversee_de_repertoire() {
+        // Non-régression du comportement historique : ces cas étaient déjà couverts.
+        assert_eq!(super::sanitize("../../evil"), "evil");
+        assert_eq!(super::sanitize(r"..\..\evil"), "evil");
+        assert_eq!(super::sanitize("/etc/passwd"), "passwd");
+        assert_eq!(super::sanitize(r"C:\Windows\System32\evil.dll"), "evil.dll");
+        // Flux de données alternatif NTFS.
+        assert_eq!(super::sanitize("rapport.txt:cache.exe"), "rapport.txtcache.exe");
+        // Rien d'exploitable ne doit jamais donner un nom vide.
+        assert_eq!(super::sanitize(".."), "fichier");
+        assert_eq!(super::sanitize("   "), "fichier");
+    }
+
+    #[test]
+    fn sanitize_retire_le_maquillage_d_extension_bidi() {
+        // U+202E inverse le rendu : « facturexe.doc » à l'écran, .exe sur le disque.
+        let piege = "facture\u{202E}cod.exe";
+        let out = super::sanitize(piege);
+        assert!(!out.contains('\u{202E}'), "le RLO doit être retiré : {out:?}");
+        assert_eq!(out, "facturecod.exe");
+        // Invisibles : deux noms visuellement identiques ne doivent pas être possibles.
+        assert_eq!(super::sanitize("fac\u{200B}ture.pdf"), "facture.pdf");
+        assert_eq!(super::sanitize("\u{FEFF}note.txt"), "note.txt");
+    }
+
+    #[test]
+    fn sanitize_neutralise_les_peripheriques_dos() {
+        // Aucun de ces noms ne contient de caractère interdit : seul un test dédié
+        // les attrape. Écrire dessus peut bloquer la tâche de réception ou émettre
+        // les octets du pair sur un port série réellement présent.
+        assert_eq!(super::sanitize("CON"), "_CON");
+        assert_eq!(super::sanitize("nul"), "_nul");
+        assert_eq!(super::sanitize("COM3.jpg"), "_COM3.jpg");
+        assert_eq!(super::sanitize("LPT1.txt"), "_LPT1.txt");
+        // Un nom normal qui COMMENCE par ces lettres ne doit pas être touché.
+        assert_eq!(super::sanitize("console.log"), "console.log");
+        assert_eq!(super::sanitize("nullable.rs"), "nullable.rs");
+    }
+
+    #[test]
+    fn sanitize_borne_la_longueur_sans_couper_un_caractere() {
+        // Le pair annonce le nom sur 2 octets : jusqu'à 65 535.
+        let long = "é".repeat(40_000) + ".txt";
+        let out = super::sanitize(&long);
+        assert!(out.len() <= 200, "longueur non bornée : {}", out.len());
+        // Doit rester de l'UTF-8 valide (troncature sur frontière de caractère) :
+        // le simple fait que `out` soit un String le prouve, mais on vérifie le contenu.
+        assert!(out.chars().all(|c| c == 'é'), "troncature au milieu d'un caractère");
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn sanitize_preserve_les_noms_legitimes() {
+        // Accents, emoji, CJK, espaces internes : aucun n'est en catégorie Cf.
+        assert_eq!(super::sanitize("Rapport été 2026.pdf"), "Rapport été 2026.pdf");
+        assert_eq!(super::sanitize("photo 🎉.png"), "photo 🎉.png");
+        assert_eq!(super::sanitize("報告書.docx"), "報告書.docx");
     }
 }

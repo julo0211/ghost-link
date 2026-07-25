@@ -10,6 +10,7 @@ import {
   myName,
   memberName,
   ensureFpLabel,
+  fpLabel,
   loadAliases,
   setAlias,
   relabelPeer,
@@ -179,7 +180,9 @@ export async function loadFingerprints(): Promise<void> {
   for (const f of a) {
     if (!S.fpCache[f.code]) {
       try {
-        S.fpCache[f.code] = await invoke("fingerprint", { code: f.code });
+        // fpCache = ÉTIQUETTE (4 groupes). L'empreinte ENTIÈRE, celle qui sert à la
+        // vérification de vive voix, est affichée par showFp / #myFp.
+        S.fpCache[f.code] = fpLabel(await invoke("fingerprint", { code: f.code }));
         changed = true;
       } catch {
         /* ignore */
@@ -269,8 +272,19 @@ export function initFriends(): void {
     // Premier barreau PROPRE à ce site : le nom DÉCLARÉ porté par la demande. Les barreaux
     // bas (empreinte → code court) sont factorisés dans memberName/ensureFpLabel — les deux
     // échelles inline (ici et session.ts) ne partageaient QUE ces barreaux-là.
+    // Le `code` de la demande est AUTO-DÉCLARÉ : rien ne prouve que l'émetteur le possède
+    // (il diffère légitimement du remote_id quand un pas-encore-ami compose en éphémère,
+    // donc on ne peut PAS exiger l'égalité sans casser la fonctionnalité). Ce qu'on peut —
+    // et doit — faire, c'est montrer QUEL code va entrer dans la liste blanche : c'est lui
+    // qui pilotera ensuite `allows()` et l'accès au maillage de groupe. Sans cela, accepter
+    // une demande inscrivait un code que l'utilisateur n'avait jamais vu.
     const paint = (): void => {
-      $("#freqText").textContent = memberName(S.pendingFreqCode, S.pendingFreqName) + " veut t'ajouter en ami.";
+      const emp = S.fpCache[S.pendingFreqCode] || shortId(S.pendingFreqCode);
+      $("#freqText").textContent =
+        memberName(S.pendingFreqCode, S.pendingFreqName) +
+        " veut t'ajouter en ami — empreinte " +
+        emp +
+        ". Compare-la de vive voix avant d'accepter.";
     };
     paint();
     void ensureFpLabel(S.pendingFreqCode, paint);
@@ -312,6 +326,20 @@ export function initFriends(): void {
     pending.delete(S.currentPeer);
     savePendingFreqOut(pending);
     saveMutual(code, nm);
-    log("Ami ajouté (mutuel) ✓" + (nm ? " — " + nm : ""));
+    // Ce chemin est AUTOMATIQUE (aucune bannière, aucun clic) : c'est le seul endroit où un
+    // code entre dans la liste blanche sans que l'utilisateur voie quoi que ce soit. On nomme
+    // donc explicitement l'identité inscrite. `from` (remote_id authentifié) permet en outre
+    // de distinguer le cas fort — le pair a composé avec l'identité même qu'il fait
+    // enregistrer — du cas ordinaire où le code reste une simple déclaration.
+    const from = e.payload && e.payload.from ? e.payload.from : "";
+    const verifie = !!from && from === code;
+    void ensureFpLabel(code, () => {});
+    log(
+      "Ami ajouté (mutuel) ✓" +
+        (nm ? " — " + nm : "") +
+        " — empreinte " +
+        (S.fpCache[code] || shortId(code)) +
+        (verifie ? " (identité de la connexion, vérifiée)" : " (code déclaré — vérifie-le de vive voix)"),
+    );
   });
 }
