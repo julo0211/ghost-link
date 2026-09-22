@@ -748,7 +748,7 @@ fn main() {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .values()
-                        .map(|(_, c)| c.clone())
+                        .map(|e| e.conn.clone())
                         .collect();
                     tauri::async_runtime::block_on(async move {
                         if let Some(c) = net::current(&slot).await {

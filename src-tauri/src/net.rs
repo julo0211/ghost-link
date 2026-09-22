@@ -73,9 +73,56 @@ pub struct ConnState {
 }
 pub type Slot = Arc<Mutex<ConnState>>;
 
-/// Maillage de groupe : code permanent du pair → (jeton unique, connexion).
-pub type Mesh = Arc<StdMutex<HashMap<String, (u64, Connection)>>>;
+/// Une connexion de maillage, avec ce qu'il faut pour départager une numérotation croisée.
+pub struct MeshEntry {
+    /// Jeton unique : seule la tâche qui l'a obtenu peut retirer l'entrée en partant.
+    pub token: u64,
+    pub conn: Connection,
+    /// Instant d'admission : seule une connexion RÉCENTE peut être en course avec une autre.
+    since: std::time::Instant,
+    /// true = c'est nous qui avons composé.
+    outgoing: bool,
+}
+
+/// Maillage de groupe : code permanent du pair → sa connexion.
+pub type Mesh = Arc<StdMutex<HashMap<String, MeshEntry>>>;
 static MESH_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Fenêtre dans laquelle deux connexions de SENS OPPOSÉS vers le même pair sont une
+/// numérotation croisée, et non une reconnexion légitime après une coupure.
+const GLARE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Admet (ou non) une connexion de maillage. Renvoie le jeton si elle devient LA connexion
+/// du pair, `None` si elle doit être fermée comme doublon (celle en place est gardée).
+///
+/// RÉGRESSION CORRIGÉE (reproduite : experiences-audit-2026-09-22, `glare` → 27 essais sur
+/// 30 où tout meurt). Deux membres qui se composent en même temps obtiennent deux connexions
+/// croisées. On remplaçait inconditionnellement l'entrée par la dernière arrivée en fermant
+/// l'autre : selon l'ordre, chacun gardait la connexion que l'autre venait de fermer — les
+/// DEUX mouraient, en silence, et personne ne recomposait. Départage DÉTERMINISTE : on garde
+/// la connexion composée par le plus petit identifiant, les deux côtés font donc le même
+/// choix (`glare_fix` → 30/30). Hors fenêtre de course, ou si la connexion en place est déjà
+/// morte, on remplace comme avant : c'est une reconnexion après coupure.
+fn mesh_admit(mesh: &Mesh, peer: &str, conn: &Connection, outgoing: bool, me: &str) -> Option<u64> {
+    let mut m = mesh.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = m.get(peer) {
+        let croisee = e.outgoing != outgoing
+            && e.since.elapsed() < GLARE_WINDOW
+            && e.conn.close_reason().is_none();
+        // Minuscules des deux côtés : l'ordre doit être le même chez les deux pairs, et
+        // l'ordre ASCII des majuscules hexadécimales ne suit pas celui des chiffres.
+        let je_suis_le_plus_petit = me.trim().to_lowercase() < peer.trim().to_lowercase();
+        if croisee && outgoing != je_suis_le_plus_petit {
+            return None;
+        }
+    }
+    let token = MESH_SEQ.fetch_add(1, Ordering::SeqCst);
+    let entry = MeshEntry { token, conn: conn.clone(), since: std::time::Instant::now(), outgoing };
+    if let Some(old) = m.insert(peer.to_string(), entry) {
+        old.conn.close(0u32.into(), b"reconnect");
+    }
+    Some(token)
+}
 
 /// Canal binaire vers la WebView pour la vidéo native reçue (video_receive_attach).
 /// Un seul récepteur : le dernier attach (rechargement de page) remplace le précédent.
@@ -237,6 +284,10 @@ impl ProtocolHandler for Ghost {
 /// Aucun changement pour la majorité des utilisateurs : `allows()` renvoie `true` quand le
 /// filtre est désactivé, ce qui est le défaut. Le durcissement ne s'applique qu'à ceux qui
 /// ont explicitement coché la case — c'est précisément son intention affichée.
+///
+/// ⚠️ Ce refus n'a d'effet que parce que `probe` lit la RAISON de fermeture : ce handler ne
+/// s'exécute qu'après la poignée de main, que le sondeur a déjà réussie (voir `probe`). Seul,
+/// il ne cachait rien (v0.37.0 → v0.37.3). La raison « not-a-friend » est donc un contrat.
 #[derive(Clone)]
 pub struct Presence {
     pub settings: Settings,
@@ -617,6 +668,7 @@ fn build_router(
     incoming: &Incoming,
     mesh: &Mesh,
     video_rx: &VideoRx,
+    me: &str,
 ) -> Router {
     Router::builder(endpoint.clone())
         .accept(
@@ -636,6 +688,7 @@ fn build_router(
                 mesh: mesh.clone(),
                 settings: settings.clone(),
                 video_rx: video_rx.clone(),
+                me: me.to_string(),
             },
         )
         .accept(
@@ -655,6 +708,8 @@ pub struct GroupHandler {
     pub mesh: Mesh,
     pub settings: Settings,
     pub video_rx: VideoRx,
+    /// Notre code PERMANENT : sert au départage d'une numérotation croisée (mesh_admit).
+    pub me: String,
 }
 impl std::fmt::Debug for GroupHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -670,7 +725,13 @@ impl ProtocolHandler for GroupHandler {
             connection.close(0u32.into(), b"not-a-friend");
             return Ok(());
         }
-        run_mesh_conn(self.app.clone(), self.mesh.clone(), self.settings.clone(), self.video_rx.clone(), peer, connection).await;
+        match mesh_admit(&self.mesh, &peer, &connection, false, &self.me) {
+            Some(token) => {
+                run_mesh_conn(self.app.clone(), self.mesh.clone(), self.settings.clone(), self.video_rx.clone(), peer, connection, token).await
+            }
+            // Numérotation croisée perdue au départage : l'autre sens est la connexion gardée.
+            None => connection.close(0u32.into(), b"duplicate"),
+        }
         Ok(())
     }
 }
@@ -854,16 +915,9 @@ async fn recv_video_frames(
     }
 }
 
-/// Boucle de réception d'une connexion de maillage (un pair du groupe).
-async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, video_rx: VideoRx, peer: String, connection: Connection) {
-    let token = MESH_SEQ.fetch_add(1, Ordering::SeqCst);
-    if let Some((_, old)) = mesh
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(peer.clone(), (token, connection.clone()))
-    {
-        old.close(0u32.into(), b"reconnect");
-    }
+/// Boucle de réception d'une connexion de maillage (un pair du groupe). `token` = celui
+/// rendu par `mesh_admit` : la connexion est DÉJÀ inscrite au maillage.
+async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, video_rx: VideoRx, peer: String, connection: Connection, token: u64) {
     let _ = app.emit("ghost-mesh-up", &peer);
     let inbounds: Inbounds = Arc::new(StdMutex::new(HashMap::new()));
 
@@ -1050,7 +1104,7 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, video_rx:
     uni_task.abort();
     {
         let mut m = mesh.lock().unwrap_or_else(|e| e.into_inner());
-        if m.get(&peer).map(|(t, _)| *t == token).unwrap_or(false) {
+        if m.get(&peer).map(|e| e.token == token).unwrap_or(false) {
             m.remove(&peer);
         }
     }
@@ -1062,15 +1116,15 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, video_rx:
 /// connexion apparaisse plutôt que d'en ouvrir une 2ᵉ (qui fermerait la 1ʳᵉ et
 /// pouvait faire perdre l'invitation portée par cette connexion).
 async fn ensure_mesh(net: &Net, code: &str) -> anyhow::Result<Connection> {
-    if let Some((_, c)) = net.mesh.lock().unwrap_or_else(|e| e.into_inner()).get(code) {
-        return Ok(c.clone());
+    if let Some(e) = net.mesh.lock().unwrap_or_else(|e| e.into_inner()).get(code) {
+        return Ok(e.conn.clone());
     }
     // Réserver le dial, ou attendre brièvement qu'un dial concurrent aboutisse.
     let mut waited = 0u64;
     loop {
         {
-            if let Some((_, c)) = net.mesh.lock().unwrap_or_else(|e| e.into_inner()).get(code) {
-                return Ok(c.clone());
+            if let Some(e) = net.mesh.lock().unwrap_or_else(|e| e.into_inner()).get(code) {
+                return Ok(e.conn.clone());
             }
             let mut connecting = net.connecting.lock().unwrap_or_else(|e| e.into_inner());
             if !connecting.contains(code) {
@@ -1098,13 +1152,27 @@ async fn ensure_mesh(net: &Net, code: &str) -> anyhow::Result<Connection> {
     .await;
     net.connecting.lock().unwrap_or_else(|e| e.into_inner()).remove(code);
     let conn = dialed?;
+    let me = net.perm.id().to_string();
+    let Some(token) = mesh_admit(&net.mesh, code, &conn, true, &me) else {
+        // Le pair nous a composés au même instant et SA connexion a gagné le départage :
+        // c'est elle qu'on utilise (fermer la nôtre sans rien rendre ferait perdre
+        // l'invitation que l'appelant s'apprête à envoyer).
+        conn.close(0u32.into(), b"duplicate");
+        return net
+            .mesh
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(code)
+            .map(|e| e.conn.clone())
+            .ok_or_else(|| anyhow::anyhow!("connexion de groupe perdue pendant l'ouverture"));
+    };
     let app = net.app.clone();
     let mesh = net.mesh.clone();
     let settings = net.settings.clone();
     let video_rx = net.video_rx.clone();
     let peer = code.to_string();
     let c2 = conn.clone();
-    tokio::spawn(async move { run_mesh_conn(app, mesh, settings, video_rx, peer, c2).await });
+    tokio::spawn(async move { run_mesh_conn(app, mesh, settings, video_rx, peer, c2, token).await });
     Ok(conn)
 }
 
@@ -1132,6 +1200,7 @@ pub async fn open_group(net: &Net, members: Vec<String>) {
         let settings = net.settings.clone();
         let video_rx = net.video_rx.clone();
         let connecting = net.connecting.clone();
+        let me = net.perm.id().to_string();
         tokio::spawn(async move {
             let id: EndpointId = match code.parse() {
                 Ok(i) => i,
@@ -1154,7 +1223,11 @@ pub async fn open_group(net: &Net, members: Vec<String>) {
                 }
             };
             connecting.lock().unwrap_or_else(|e| e.into_inner()).remove(&code);
-            run_mesh_conn(app, mesh, settings, video_rx, code, conn).await;
+            match mesh_admit(&mesh, &code, &conn, true, &me) {
+                Some(token) => run_mesh_conn(app, mesh, settings, video_rx, code, conn, token).await,
+                // Numérotation croisée perdue au départage : la connexion du pair est gardée.
+                None => conn.close(0u32.into(), b"duplicate"),
+            }
         });
     }
 }
@@ -1171,7 +1244,7 @@ pub async fn send_gchat(
         let m = net.mesh.lock().unwrap_or_else(|e| e.into_inner());
         members
             .iter()
-            .filter_map(|code| m.get(code.trim()).map(|(_, c)| c.clone()))
+            .filter_map(|code| m.get(code.trim()).map(|e| e.conn.clone()))
             .collect()
     };
     for conn in targets {
@@ -1190,7 +1263,7 @@ pub async fn send_gchat(
 pub async fn send_gimg(net: &Net, members: Vec<String>, gid: &str, author: &str, name: &str, mime: &str, data: &[u8]) -> anyhow::Result<()> {
     let targets: Vec<Connection> = {
         let m = net.mesh.lock().unwrap_or_else(|e| e.into_inner());
-        members.iter().filter_map(|c| m.get(c.trim()).map(|(_, c)| c.clone())).collect()
+        members.iter().filter_map(|c| m.get(c.trim()).map(|e| e.conn.clone())).collect()
     };
     for conn in targets {
         if let Ok((mut send, _r)) = conn.open_bi().await {
@@ -1220,7 +1293,7 @@ pub async fn send_gmembers(
         let m = net.mesh.lock().unwrap_or_else(|e| e.into_inner());
         members
             .iter()
-            .filter_map(|code| m.get(code.trim()).map(|(_, c)| c.clone()))
+            .filter_map(|code| m.get(code.trim()).map(|e| e.conn.clone()))
             .collect()
     };
     for conn in targets {
@@ -1248,7 +1321,7 @@ pub async fn send_kick(
         let m = net.mesh.lock().unwrap_or_else(|e| e.into_inner());
         members
             .iter()
-            .filter_map(|code| m.get(code.trim()).map(|(_, c)| c.clone()))
+            .filter_map(|code| m.get(code.trim()).map(|e| e.conn.clone()))
             .collect()
     };
     for conn in targets {
@@ -1293,7 +1366,7 @@ pub fn group_conns(net: &Net, members: &[String]) -> Vec<(String, Connection)> {
         .iter()
         .filter_map(|code| {
             let code = code.trim();
-            m.get(code).map(|(_, c)| (code.to_string(), c.clone()))
+            m.get(code).map(|e| (code.to_string(), e.conn.clone()))
         })
         .collect()
 }
@@ -1304,7 +1377,7 @@ pub async fn send_gcall(net: &Net, members: Vec<String>, gid: &str) -> anyhow::R
         let m = net.mesh.lock().unwrap_or_else(|e| e.into_inner());
         members
             .iter()
-            .filter_map(|code| m.get(code.trim()).map(|(_, c)| c.clone()))
+            .filter_map(|code| m.get(code.trim()).map(|e| e.conn.clone()))
             .collect()
     };
     for conn in targets {
@@ -1321,7 +1394,7 @@ pub async fn send_gcall(net: &Net, members: Vec<String>, gid: &str) -> anyhow::R
 pub async fn send_voice_presence(net: &Net, members: Vec<String>, gid: &str, in_call: bool) -> anyhow::Result<()> {
     let targets: Vec<Connection> = {
         let m = net.mesh.lock().unwrap_or_else(|e| e.into_inner());
-        members.iter().filter_map(|c| m.get(c.trim()).map(|(_, c)| c.clone())).collect()
+        members.iter().filter_map(|c| m.get(c.trim()).map(|e| e.conn.clone())).collect()
     };
     for conn in targets {
         if let Ok((mut send, _r)) = conn.open_bi().await {
@@ -1336,7 +1409,7 @@ pub async fn send_voice_presence(net: &Net, members: Vec<String>, gid: &str, in_
 
 /// Envoie un message de signalisation WebRTC (vidéo) à UN pair précis du maillage.
 pub async fn send_signal(net: &Net, peer: &str, data: &str) -> anyhow::Result<()> {
-    let conn = net.mesh.lock().unwrap_or_else(|e| e.into_inner()).get(peer.trim()).map(|(_, c)| c.clone());
+    let conn = net.mesh.lock().unwrap_or_else(|e| e.into_inner()).get(peer.trim()).map(|e| e.conn.clone());
     let conn = conn.ok_or_else(|| anyhow::anyhow!("pair non connecté"))?;
     let (mut send, _recv) = conn
         .open_bi()
@@ -1624,6 +1697,7 @@ pub async fn rotate_eph(net: &Net) -> anyhow::Result<String> {
         &net.incoming,
         &net.mesh,
         &net.video_rx,
+        &net.perm.id().to_string(),
     );
     let id = endpoint.addr().id.to_string();
     let mut g = net.eph.lock().await;
@@ -1655,11 +1729,14 @@ pub async fn start(app: AppHandle) -> anyhow::Result<Net> {
 
     // Identité PERMANENTE : clé persistante = code ami stable.
     let perm = build_endpoint(load_or_create_secret()).await?;
-    let _perm_router = build_router(&perm, &app, &slot, &recv_cancel, &settings, &incoming, &mesh, &video_rx);
+    // Le départage du maillage compare TOUJOURS le code permanent (c'est lui que les pairs
+    // composent pour le groupe), y compris dans le routeur éphémère.
+    let me = perm.id().to_string();
+    let _perm_router = build_router(&perm, &app, &slot, &recv_cancel, &settings, &incoming, &mesh, &video_rx, &me);
 
     // Identité ÉPHÉMÈRE : clé aléatoire en mémoire, régénérée à chaque lancement.
     let eph_ep = build_endpoint(SecretKey::generate()).await?;
-    let eph_router = build_router(&eph_ep, &app, &slot, &recv_cancel, &settings, &incoming, &mesh, &video_rx);
+    let eph_router = build_router(&eph_ep, &app, &slot, &recv_cancel, &settings, &incoming, &mesh, &video_rx, &me);
     let eph = Arc::new(Mutex::new(Eph {
         endpoint: eph_ep,
         _router: eph_router,
@@ -1687,7 +1764,20 @@ pub fn video_attach(net: &Net, channel: tauri::ipc::Channel<tauri::ipc::InvokeRe
 }
 
 /// Sonde un ami par son code : tente une connexion légère (ALPN présence) avec un délai borné.
-/// Renvoie true s'il est joignable (donc en ligne), false sinon.
+/// Renvoie true s'il est joignable ET qu'il ne nous a pas refusés, false sinon.
+///
+/// ⚠️ Réussir `connect()` NE suffit PAS à conclure « en ligne et d'accord pour le dire » :
+/// iroh n'appelle le handler du pair (`Presence::accept`, qui applique `allows()`) qu'APRÈS
+/// la fin de la poignée de main (iroh `protocol.rs`, handle_connection), alors que notre
+/// `connect()` rend la main dès NOTRE poignée de main finie — donc toujours avant. Jusqu'en
+/// v0.37.3, ce test seul rendait le filtre « amis uniquement » de la présence inopérant :
+/// un ex-ami voyait toujours « en ligne » (reproduit : experiences-audit-2026-09-22,
+/// `presence`). On attend donc la fermeture et on lit sa raison : « not-a-friend » = refus.
+/// Rien ne change sur le fil : un pair ≤ v0.36 (sans filtre) ferme sans raison → en ligne.
+///
+/// LIMITE ASSUMÉE : un client MODIFIÉ peut toujours déduire la présence de la simple
+/// réussite de la poignée de main. Ceci fait respecter le filtre par l'application standard ;
+/// seul le fait de ne pas divulguer son code permanent protège contre un client hostile.
 pub async fn probe(net: &Net, id_str: &str) -> bool {
     let id: EndpointId = match id_str.trim().parse() {
         Ok(i) => i,
@@ -1695,18 +1785,29 @@ pub async fn probe(net: &Net, id_str: &str) -> bool {
     };
     let addr = EndpointAddr::from(id);
     // On sonde via l'identité permanente (les amis nous connaissent par elle).
-    match tokio::time::timeout(
+    let conn = match tokio::time::timeout(
         std::time::Duration::from_secs(3),
         net.perm.connect(addr, PRESENCE_ALPN),
     )
     .await
     {
-        Ok(Ok(conn)) => {
-            conn.close(0u32.into(), b"bye");
-            true
-        }
-        _ => false,
-    }
+        Ok(Ok(conn)) => conn,
+        _ => return false,
+    };
+    // Le handler du pair rend la main aussitôt (autorisé) ou ferme avec « not-a-friend »
+    // (refusé) : dans les deux cas la fermeture arrive en un aller-retour. Sans fermeture
+    // sous 1,5 s, on garde le verdict historique (joignable = en ligne).
+    let refuse = match tokio::time::timeout(std::time::Duration::from_millis(1500), conn.closed()).await {
+        Ok(e) => est_refus_de_presence(&e),
+        Err(_) => false,
+    };
+    conn.close(0u32.into(), b"bye");
+    !refuse
+}
+
+/// La fermeture reçue est-elle le refus explicite de `Presence::accept` ?
+fn est_refus_de_presence(e: &iroh::endpoint::ConnectionError) -> bool {
+    matches!(e, iroh::endpoint::ConnectionError::ApplicationClosed(c) if c.reason.as_ref() == b"not-a-friend")
 }
 
 pub async fn connect(net: &Net, input: &str) -> anyhow::Result<String> {
@@ -2603,6 +2704,87 @@ mod tests {
         // Et rester sous ce que la WebView sait consommer (~3,5 Mo/s, mesure exp3),
         // sinon on relaie plus vite qu'elle ne décode et la latence s'effondre.
         assert!(super::RELAY_RATE <= 3_670_016, "au-delà de ~3,5 Mio/s la WebView décroche");
+    }
+
+    // ---- Présence : seul le refus explicite de Presence::accept vaut « hors ligne » ----
+
+    #[test]
+    fn presence_seul_not_a_friend_est_un_refus() {
+        use iroh::endpoint::{ApplicationClose, ConnectionError, VarInt};
+        let ferme = |r: &'static [u8]| {
+            ConnectionError::ApplicationClosed(ApplicationClose {
+                error_code: VarInt::from_u32(0),
+                reason: bytes::Bytes::from_static(r),
+            })
+        };
+        assert!(super::est_refus_de_presence(&ferme(b"not-a-friend")));
+        // Pair autorisé (le handler rend la main → fermeture implicite sans raison) et pair
+        // ≤ v0.36 (sans filtre) : tous deux doivent rester « en ligne ».
+        assert!(!super::est_refus_de_presence(&ferme(b"")));
+        assert!(!super::est_refus_de_presence(&ferme(b"bye")));
+        assert!(!super::est_refus_de_presence(&ConnectionError::TimedOut));
+    }
+
+    // ---- Maillage : départage d'une numérotation croisée (mesh_admit) ----
+    // Vraies connexions QUIC locales (sans relais ni annuaire) : c'est l'ordre d'arrivée réel
+    // de deux connexions croisées qui tuait le maillage (reproduit 27/30, cf. mesh_admit).
+
+    async fn ep_local() -> iroh::Endpoint {
+        iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .alpns(vec![super::GROUP_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    /// Ouvre une connexion `de` → `vers` ; renvoie (vue du composeur, vue de l'accepteur).
+    async fn relier(de: &iroh::Endpoint, vers: &iroh::Endpoint) -> (iroh::endpoint::Connection, iroh::endpoint::Connection) {
+        let composer = async { de.connect(vers.addr(), super::GROUP_ALPN).await.unwrap() };
+        let accepter = async { vers.accept().await.unwrap().await.unwrap() };
+        tokio::join!(composer, accepter)
+    }
+
+    #[tokio::test]
+    async fn maillage_croise_les_deux_cotes_gardent_la_meme_connexion() {
+        let (a, b) = (ep_local().await, ep_local().await);
+        let (ida, idb) = (a.id().to_string(), b.id().to_string());
+        let (x_chez_a, x_chez_b) = relier(&a, &b).await; // X : composée par A
+        let (y_chez_b, y_chez_a) = relier(&b, &a).await; // Y : composée par B
+        let (mesh_a, mesh_b) = (super::Mesh::default(), super::Mesh::default());
+        // Ordres d'arrivée OPPOSÉS de part et d'autre : exactement le cas où l'ancien code
+        // faisait garder à chacun la connexion que l'autre venait de fermer.
+        assert!(super::mesh_admit(&mesh_a, &idb, &x_chez_a, true, &ida).is_some());
+        let _ = super::mesh_admit(&mesh_a, &idb, &y_chez_a, false, &ida);
+        assert!(super::mesh_admit(&mesh_b, &ida, &y_chez_b, true, &idb).is_some());
+        let _ = super::mesh_admit(&mesh_b, &ida, &x_chez_b, false, &idb);
+        let a_garde_x = mesh_a.lock().unwrap()[&idb].outgoing;
+        let b_garde_x = !mesh_b.lock().unwrap()[&ida].outgoing;
+        assert_eq!(a_garde_x, b_garde_x, "les deux côtés doivent garder la MÊME connexion");
+        assert_eq!(a_garde_x, ida < idb, "la connexion gardée est celle du plus petit identifiant");
+        a.close().await;
+        b.close().await;
+    }
+
+    #[tokio::test]
+    async fn maillage_une_connexion_morte_est_toujours_remplacee() {
+        let (a, b) = (ep_local().await, ep_local().await);
+        let (ida, idb) = (a.id().to_string(), b.id().to_string());
+        let (x_chez_a, _x_chez_b) = relier(&a, &b).await;
+        let (_y_chez_b, y_chez_a) = relier(&b, &a).await;
+        // Côté A : la connexion en place est la PRÉFÉRÉE, la nouvelle la non préférée.
+        let (en_place, en_place_sortante, nouvelle, nouvelle_sortante) =
+            if ida < idb { (x_chez_a, true, y_chez_a, false) } else { (y_chez_a, false, x_chez_a, true) };
+        let mesh = super::Mesh::default();
+        assert!(super::mesh_admit(&mesh, &idb, &en_place, en_place_sortante, &ida).is_some());
+        // Vivante et récente : doublon d'une numérotation croisée → refusée.
+        assert!(super::mesh_admit(&mesh, &idb, &nouvelle, nouvelle_sortante, &ida).is_none());
+        // Morte (le pair a redémarré, le réseau a changé) : c'est une reconnexion → acceptée,
+        // sinon le pair resterait exclu jusqu'au délai d'inactivité de 3 min.
+        en_place.close(0u32.into(), b"test");
+        assert!(super::mesh_admit(&mesh, &idb, &nouvelle, nouvelle_sortante, &ida).is_some());
+        a.close().await;
+        b.close().await;
     }
 
     // ---- sanitize : le nom vient du PAIR, c'est une entrée hostile ----
