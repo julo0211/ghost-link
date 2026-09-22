@@ -18,8 +18,9 @@
 // - MP3   : ID3v2 (en-tête + pied), ID3v1, APEv2.
 // - MP4/MOV/M4A : atomes udta/meta (GPS ©xyz, tags iTunes) renommés « free » ET
 //           contenu mis à ZÉRO pendant la copie — aucun offset ne bouge, donc aucune
-//           table (stco/co64) à réécrire. PAS appliqué aux HEIC/HEIF (leur « meta »
-//           contient les données de décodage).
+//           table (stco/co64) à réécrire. PAS appliqué aux HEIC/HEIF/AVIF (leur « meta »
+//           contient les données de décodage) — reconnus par la MARQUE `ftyp`, pas
+//           seulement par l'extension (cf. ftyp_est_heif : un `.HIF` était détruit).
 // - PDF   : dictionnaire /Info, /Metadata XMP du catalogue, /ID (via lopdf).
 // - OOXML (docx/xlsx/pptx…) : docProps/core.xml, app.xml, custom.xml blanchis.
 // - ODF (odt/ods/odp…) : meta.xml ET settings.xml blanchis (ce dernier porte le nom
@@ -113,7 +114,8 @@ pub fn prepare(path: &Path) -> Prep {
         // Métadonnées présentes mais nettoyage non implémenté : prévenir, ne pas se taire.
         // (heic/heif = photos iPhone : EXIF/GPS complet ; RAW constructeurs ; conteneurs
         // vidéo à tags ; formats bureautiques hérités ; svg = XML avec commentaires.)
-        "heic" | "heif" | "tif" | "tiff" | "avi" | "mkv" | "webm" | "flac" | "ogg"
+        // `hif` = HEIF des boîtiers Fujifilm/Canon ; `heics`/`heifs`/`avifs` = séquences.
+        "heic" | "heif" | "hif" | "heics" | "heifs" | "avifs" | "tif" | "tiff" | "avi" | "mkv" | "webm" | "flac" | "ogg"
         | "opus" | "aac" | "wma" | "wmv" | "doc" | "xls" | "ppt" | "rtf" | "dng" | "cr2"
         | "cr3" | "nef" | "arw" | "orf" | "rw2" | "raf" | "avif" | "jxl" | "svg" | "mts"
         | "m2ts" | "mpg" | "mpeg" | "flv" | "3g2" | "mka" | "m4b" => {
@@ -124,6 +126,7 @@ pub fn prepare(path: &Path) -> Prep {
         // exactement l'« échec silencieux » que le contrat interdit). Sniffer les magic
         // bytes des formats supportés ; router vers le bon nettoyeur, ou rester VISIBLE.
         _ => match sniff_magic(path) {
+            Some(Magic::Heif) => Prep::Skipped(HEIF_NON_NETTOYABLE),
             Some(Magic::Jpeg) => clean_in_memory(path, size, clean_jpeg),
             Some(Magic::Png) => clean_in_memory(path, size, clean_png),
             Some(Magic::Webp) => clean_in_memory(path, size, clean_webp),
@@ -189,15 +192,58 @@ enum Magic {
     Wav,
     Mp3,
     Mp4,
+    /// ISO-BMFF d'IMAGE (HEIF/HEIC, AVIF) : même `ftyp` qu'un MP4, mais sa boîte `meta` de
+    /// premier niveau décrit l'image elle-même. Le nettoyeur MP4 la mettrait à zéro.
+    Heif,
     Pdf,
     Zip,
 }
+
+const HEIF_NON_NETTOYABLE: &str = "HEIF/AVIF : métadonnées non nettoyables pour l'instant";
+
+/// Marques ISO-BMFF d'un conteneur d'IMAGE (HEIF/HEIC, séquences, AVIF).
+const MARQUES_HEIF: [&[u8; 4]; 12] = [
+    b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs", b"mif1", b"msf1",
+    b"avif", b"avis",
+];
+
+/// Ces octets de tête sont-ils la boîte `ftyp` d'un HEIF/AVIF (marque majeure OU compatible) ?
+///
+/// RÉGRESSION CORRIGÉE (reproduite : experiences-audit-2026-09-22, `heif`) : tout fichier
+/// `....ftyp` partait au nettoyeur MP4 sans que la marque soit lue. Une photo HEIF à extension
+/// inconnue — `.HIF` des boîtiers Fujifilm/Canon, ou sans extension — voyait sa boîte `meta`
+/// (la table des items, indispensable au décodage) renommée `free` et mise à zéro : image
+/// DÉTRUITE, livrée avec « 🧹 Métadonnées retirées ». La règle « pas de nettoyeur MP4 sur un
+/// HEIF » n'était tenue que par l'extension.
+fn ftyp_est_heif(h: &[u8]) -> bool {
+    if h.len() < 12 || &h[4..8] != b"ftyp" {
+        return false;
+    }
+    let est_heif = |m: &[u8]| MARQUES_HEIF.iter().any(|x| &x[..] == m);
+    if est_heif(&h[8..12]) {
+        return true;
+    }
+    // Marques compatibles : de l'octet 16 (après la version mineure) à la fin de la boîte.
+    let fin = (u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize).min(h.len());
+    let mut i = 16;
+    while i + 4 <= fin {
+        if est_heif(&h[i..i + 4]) {
+            return true;
+        }
+        i += 4;
+    }
+    false
+}
+
+/// Octets de tête lus pour reconnaître un format : assez pour la liste des marques
+/// compatibles d'une boîte `ftyp`.
+const SNIFF_LEN: usize = 64;
 
 /// Renifle les premiers octets pour reconnaître un format porteur de métadonnées.
 fn sniff_magic(path: &Path) -> Option<Magic> {
     use std::io::Read;
     let mut f = fs::File::open(path).ok()?;
-    let mut buf = [0u8; 16];
+    let mut buf = [0u8; SNIFF_LEN];
     let n = f.read(&mut buf).ok()?;
     sniff_bytes(&buf[..n])
 }
@@ -232,7 +278,7 @@ fn sniff_bytes(h: &[u8]) -> Option<Magic> {
         return Some(Magic::Zip);
     }
     if h.len() >= 8 && &h[4..8] == b"ftyp" {
-        return Some(Magic::Mp4);
+        return Some(if ftyp_est_heif(h) { Magic::Heif } else { Magic::Mp4 });
     }
     if h.len() >= 3 && &h[..3] == b"ID3" {
         return Some(Magic::Mp3);
@@ -725,6 +771,11 @@ fn mp4_uuid_is_xmp(f: &mut fs::File, pos: u64) -> Result<bool, String> {
 fn clean_mp4_file(path: &Path, size: u64) -> Prep {
     if size > MAX_MP4_COPY {
         return Prep::Skipped("trop volumineux pour le nettoyage");
+    }
+    // Filet : même avec une extension vidéo (`.mp4`, `.mov`…), un HEIF/AVIF ne doit JAMAIS
+    // passer par ce nettoyeur — sa boîte `meta` porte l'image elle-même (cf. ftyp_est_heif).
+    if matches!(sniff_magic(path), Some(Magic::Heif)) {
+        return Prep::Skipped(HEIF_NON_NETTOYABLE);
     }
     match mp4_meta_offsets(path) {
         Err(e) => Prep::Failed(e),
@@ -1631,5 +1682,78 @@ mod tests {
         assert!(!raw.windows(6).any(|w| w == b"SECRET"));
         let _ = fs::remove_file(tmp);
         let _ = fs::remove_file(src);
+    }
+
+    // ---- HEIF/AVIF : jamais le nettoyeur MP4 (sa boîte `meta` EST l'image) ----
+
+    fn bmff(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(typ);
+        v.extend_from_slice(payload);
+        v
+    }
+    /// ftyp(majeure, compatibles) + meta (table des items) + mdat.
+    fn iso_bmff(majeure: &[u8; 4], compatibles: &[u8]) -> Vec<u8> {
+        let mut ftyp = majeure.to_vec();
+        ftyp.extend_from_slice(&0u32.to_be_bytes());
+        ftyp.extend_from_slice(compatibles);
+        let mut meta = vec![0u8; 4];
+        meta.extend(bmff(b"iinf", b"\0\0\0\0ITEM-TABLE-REQUIRED-TO-DECODE"));
+        let mut d = bmff(b"ftyp", &ftyp);
+        d.extend(bmff(b"meta", &meta));
+        d.extend(bmff(b"mdat", b"BITSTREAM"));
+        d
+    }
+
+    #[test]
+    fn heif_a_extension_inconnue_n_est_jamais_detruit() {
+        // Reproduit en v0.37.3 : `.HIF` (Fujifilm/Canon) et sans extension partaient au
+        // nettoyeur MP4 → table des items mise à zéro, image détruite, annoncée nettoyée.
+        let d = std::env::temp_dir().join("gl-heif-test");
+        fs::create_dir_all(&d).unwrap();
+        for (nom, octets) in [
+            ("photo.HIF", iso_bmff(b"heic", b"mif1heic")),
+            ("photo_sans_extension", iso_bmff(b"heic", b"mif1heic")),
+            ("photo.mp4", iso_bmff(b"mif1", b"heic")), // extension vidéo mensongère
+            ("image_avif", iso_bmff(b"avif", b"mif1")),
+            ("compatible_seule", iso_bmff(b"xxxx", b"isommif1")), // marque HEIF en compatible
+        ] {
+            let p = d.join(nom);
+            fs::write(&p, octets).unwrap();
+            match prepare(&p) {
+                Prep::Skipped(_) => {}
+                Prep::Cleaned(tmp) => {
+                    let _ = fs::remove_file(tmp);
+                    panic!("{nom} : un HEIF/AVIF ne doit JAMAIS passer par le nettoyeur MP4");
+                }
+                _ => panic!("{nom} : un HEIF/AVIF doit produire un avertissement visible"),
+            }
+            let _ = fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn un_vrai_mp4_reste_nettoye() {
+        // Le correctif HEIF ne doit pas désactiver le nettoyage des vidéos.
+        assert!(matches!(sniff_bytes(&iso_bmff(b"isom", b"isommp41")), Some(Magic::Mp4)));
+        assert!(matches!(sniff_bytes(&iso_bmff(b"heic", b"mif1")), Some(Magic::Heif)));
+        let d = std::env::temp_dir().join("gl-heif-test");
+        fs::create_dir_all(&d).unwrap();
+        let p = d.join("video.mp4");
+        let mut moov_udta = bmff(b"udta", b"GPS-SECRET");
+        moov_udta = bmff(b"moov", &moov_udta);
+        let mut v = bmff(b"ftyp", b"isom\0\0\0\0isommp41");
+        v.extend(moov_udta);
+        v.extend(bmff(b"mdat", b"FRAMES"));
+        fs::write(&p, v).unwrap();
+        match prepare(&p) {
+            Prep::Cleaned(tmp) => {
+                let out = fs::read(&tmp).unwrap();
+                assert!(!out.windows(10).any(|w| w == b"GPS-SECRET"), "udta doit être mis à zéro");
+                let _ = fs::remove_file(tmp);
+            }
+            _ => panic!("un MP4 avec udta doit toujours être nettoyé"),
+        }
+        let _ = fs::remove_file(p);
     }
 }
