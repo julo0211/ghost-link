@@ -482,6 +482,7 @@ impl Call {
     /// `rt` (handle Tokio) sert à lancer la tâche asynchrone de réception des datagrammes.
     pub fn start(
         &self,
+        app: AppHandle,
         conn: Connection,
         rt: tokio::runtime::Handle,
         cfg: AudioCfg,
@@ -492,6 +493,7 @@ impl Call {
         let out_buf: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
         // 1) Capture micro → 48 kHz → Opus → datagrammes (envoi). Renvoie le taux de SORTIE.
         let out_rate = start_capture_send(
+            app,
             conn.clone(),
             stop.clone(),
             out_buf.clone(),
@@ -518,6 +520,7 @@ impl Call {
 /// Capture le micro, ré-échantillonne vers 48 kHz, encode en Opus, envoie chaque trame en datagramme.
 /// Joue aussi `out_buf` (rempli par la réception). Renvoie le taux d'échantillonnage de SORTIE.
 fn start_capture_send(
+    app: AppHandle,
     conn: Connection,
     stop: Arc<AtomicBool>,
     out_buf: Arc<Mutex<VecDeque<f32>>>,
@@ -563,7 +566,18 @@ fn start_capture_send(
                 let mut framebuf = vec![0f32; in_frame];
                 while !stop.load(Ordering::SeqCst) {
                     if dev_lost.load(Ordering::SeqCst) {
-                        break; // périphérique perdu : couper la capture (plus de zombie)
+                        // Périphérique perdu : couper la capture (plus de zombie) ET le dire
+                        // — sans l'événement, l'UI restait « En appel » sans aucun son.
+                        let _ = app.emit(
+                            "ghost-audio-error",
+                            serde_json::json!({ "scope": "call", "reason": "périphérique audio perdu" }),
+                        );
+                        break;
+                    }
+                    // Connexion fermée (pair parti, session remplacée) : le micro n'a plus
+                    // aucune raison de rester ouvert — l'UI est prévenue par ghost-disconnected.
+                    if conn.close_reason().is_some() {
+                        break;
                     }
                     let got = if let Ok(mut q) = in_buf.lock() {
                         if q.len() >= in_frame {

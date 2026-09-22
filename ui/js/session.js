@@ -166,7 +166,13 @@ export function initSession() {
         S.incomingId = null;
         log("Connexion refusée.");
     };
-    listen("ghost-incoming-cancel", () => {
+    listen("ghost-incoming-cancel", (e) => {
+        // Ne fermer la bannière que si c'est SA demande qui expire. Sans ce test, une demande
+        // A arrivée d'abord puis expirée masquait la bannière de la demande B, plus récente et
+        // toujours en attente — B ne pouvait plus être acceptée (finding ouvert du 25/07).
+        const id = e.payload && e.payload.id;
+        if (id != null && S.incomingId != null && id !== S.incomingId)
+            return;
         $("#incomingBanner").classList.add("hidden");
         S.incomingId = null;
     });

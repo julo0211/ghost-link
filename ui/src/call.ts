@@ -166,6 +166,14 @@ export function initCall(): void {
     invoke("call_stop", { signal: true }).catch(() => {}); // prévient l'appelant du refus
     log("Appel refusé.");
   };
+  // Micro ou haut-parleur perdu en plein appel 1-à-1 (casque débranché) : la capture s'est
+  // arrêtée côté Rust. Sans ce listener, l'UI restait « En appel » sans aucun son.
+  listen("ghost-audio-error", (e) => {
+    if (!e.payload || e.payload.scope !== "call" || !S.inCall) return;
+    invoke("call_stop", { signal: true }).catch(() => {}); // prévenir le pair qu'on a quitté
+    setCallUI(false);
+    log("🎧 Appel coupé : " + e.payload.reason + " — rebranche le périphérique puis rappelle.");
+  });
   listen("ghost-call-stop", async () => {
     hideCallOffer(); // l'appelant a annulé pendant la sonnerie
     if (!S.inCall) return;

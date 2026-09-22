@@ -31,6 +31,7 @@ export interface Commands {
   perm_code: { args: void; ret: string };
   eph_code: { args: void; ret: string };
   rotate_eph_code: { args: void; ret: string };
+  session_is_ephemeral: { args: void; ret: boolean };
   fingerprint: { args: { code: string }; ret: string };
 
   connect: { args: { addr: string }; ret: void };
@@ -110,8 +111,12 @@ export interface Commands {
 // --- Événements émis par Rust : forme du payload reçu ---
 export interface Events {
   "ghost-connected": string;
-  "ghost-disconnected": null;
+  // Porte le code du pair dont la session se termine (net.rs l'a toujours émis ; le type
+  // disait `null`). Émis AUSSI quand une nouvelle connexion remplace la session en cours.
+  "ghost-disconnected": string | null;
   "ghost-refused": string;
+  // Micro/haut-parleur perdu en plein appel (débranché) : `scope` dit QUEL appel est mort.
+  "ghost-audio-error": { scope: "call" | "group"; reason: string };
 
   "ghost-send-await": null;
   "ghost-meta": { name: string; status: "cleaned" | "skipped" | "failed"; info?: string };
@@ -136,7 +141,8 @@ export interface Events {
   "update-progress": { chunk: number; total: number };
 
   "ghost-incoming": { id: number; peer: string };
-  "ghost-incoming-cancel": null;
+  // `id` = la demande qui a expiré ou été refusée (net.rs l'émet depuis toujours).
+  "ghost-incoming-cancel": { id?: number } | null;
 
   "ghost-call-start": null;
   "ghost-call-stop": null;

@@ -70,6 +70,10 @@ const MAX_PENDING_INCOMING: usize = 8;
 pub struct ConnState {
     generation: u64,
     conn: Option<Connection>,
+    /// La session passe par l'identité ÉPHÉMÈRE (entrante sur ce code, ou composée depuis
+    /// lui vers un non-ami). `rotate_eph` doit alors la fermer proprement, sinon elle meurt
+    /// en silence avec l'ancien endpoint (cf. rotate_eph).
+    via_eph: bool,
 }
 pub type Slot = Arc<Mutex<ConnState>>;
 
@@ -195,6 +199,9 @@ pub struct Ghost {
     pub recv_cancel: Arc<AtomicBool>,
     pub settings: Settings,
     pub incoming: Incoming,
+    /// Handler du routeur ÉPHÉMÈRE (et non permanent) : une session acceptée ici vit et
+    /// meurt avec l'endpoint éphémère.
+    pub eph: bool,
 }
 
 impl std::fmt::Debug for Ghost {
@@ -266,6 +273,7 @@ impl ProtocolHandler for Ghost {
             self.recv_cancel.clone(),
             self.settings.clone(),
             connection,
+            self.eph,
         )
         .await;
         Ok(())
@@ -669,6 +677,7 @@ fn build_router(
     mesh: &Mesh,
     video_rx: &VideoRx,
     me: &str,
+    eph: bool,
 ) -> Router {
     Router::builder(endpoint.clone())
         .accept(
@@ -679,6 +688,7 @@ fn build_router(
                 recv_cancel: recv_cancel.clone(),
                 settings: settings.clone(),
                 incoming: incoming.clone(),
+                eph,
             },
         )
         .accept(
@@ -1685,7 +1695,23 @@ pub async fn eph_code(net: &Net) -> String {
     net.eph.lock().await.endpoint.addr().id.to_string()
 }
 
-/// Régénère le code éphémère : nouvel endpoint aléatoire, l'ancien est jeté.
+/// La session 1-à-1 en cours passe-t-elle par l'identité éphémère ?
+pub async fn session_is_ephemeral(net: &Net) -> bool {
+    let g = net.slot.lock().await;
+    g.conn.is_some() && g.via_eph
+}
+
+/// Régénère le code éphémère : nouvel endpoint aléatoire, l'ancien est FERMÉ.
+///
+/// RÉGRESSION CORRIGÉE (reproduite : experiences-audit-2026-09-22, `rotation`). On se
+/// contentait de remplacer `Eph` : l'ancien endpoint était détruit sans `close()`, ce qui
+/// ABANDONNE son socket (iroh `socket.rs`, « Endpoint dropped without calling close ») et
+/// avorte la tâche de son routeur — donc la boucle `run_conn` d'une session entrante. Toute
+/// session passée par ce code mourait EN SILENCE : les envois renvoyaient Ok mais n'arrivaient
+/// plus, dans les deux sens, et l'UI restait « Connecté » (jusqu'à 3 min, ou pour toujours
+/// côté session entrante). Désormais : fermeture PROPRE de la session concernée (l'UI reçoit
+/// `ghost-disconnected`), puis `close()` de l'ancien endpoint — le pair est prévenu en ~1 ms.
+/// Une session passée par l'identité PERMANENTE (un ami) n'est pas touchée.
 pub async fn rotate_eph(net: &Net) -> anyhow::Result<String> {
     let endpoint = build_endpoint(SecretKey::generate()).await?;
     let router = build_router(
@@ -1698,10 +1724,17 @@ pub async fn rotate_eph(net: &Net) -> anyhow::Result<String> {
         &net.mesh,
         &net.video_rx,
         &net.perm.id().to_string(),
+        true,
     );
     let id = endpoint.addr().id.to_string();
-    let mut g = net.eph.lock().await;
-    *g = Eph { endpoint, _router: router };
+    if session_is_ephemeral(net).await {
+        disconnect(&net.app, &net.slot).await;
+    }
+    let ancien = {
+        let mut g = net.eph.lock().await;
+        std::mem::replace(&mut *g, Eph { endpoint, _router: router })
+    };
+    ancien.endpoint.close().await;
     Ok(id)
 }
 
@@ -1732,11 +1765,11 @@ pub async fn start(app: AppHandle) -> anyhow::Result<Net> {
     // Le départage du maillage compare TOUJOURS le code permanent (c'est lui que les pairs
     // composent pour le groupe), y compris dans le routeur éphémère.
     let me = perm.id().to_string();
-    let _perm_router = build_router(&perm, &app, &slot, &recv_cancel, &settings, &incoming, &mesh, &video_rx, &me);
+    let _perm_router = build_router(&perm, &app, &slot, &recv_cancel, &settings, &incoming, &mesh, &video_rx, &me, false);
 
     // Identité ÉPHÉMÈRE : clé aléatoire en mémoire, régénérée à chaque lancement.
     let eph_ep = build_endpoint(SecretKey::generate()).await?;
-    let eph_router = build_router(&eph_ep, &app, &slot, &recv_cancel, &settings, &incoming, &mesh, &video_rx, &me);
+    let eph_router = build_router(&eph_ep, &app, &slot, &recv_cancel, &settings, &incoming, &mesh, &video_rx, &me, true);
     let eph = Arc::new(Mutex::new(Eph {
         endpoint: eph_ep,
         _router: eph_router,
@@ -1866,7 +1899,10 @@ pub async fn connect(net: &Net, input: &str) -> anyhow::Result<String> {
     let slot2 = net.slot.clone();
     let rc = net.recv_cancel.clone();
     let st = net.settings.clone();
-    tokio::spawn(async move { run_conn(app2, slot2, rc, st, conn).await });
+    // Un non-ami a été composé depuis l'identité ÉPHÉMÈRE (cf. plus haut) : la session vit
+    // avec cet endpoint, rotate_eph devra la fermer proprement.
+    let via_eph = !is_friend;
+    tokio::spawn(async move { run_conn(app2, slot2, rc, st, conn, via_eph).await });
     Ok(peer)
 }
 
@@ -1875,6 +1911,7 @@ pub async fn disconnect(app: &AppHandle, slot: &Slot) {
     let peer = {
         let mut g = slot.lock().await;
         g.generation += 1;
+        g.via_eph = false;
         match g.conn.take() {
             Some(c) => {
                 let id = c.remote_id().to_string();
@@ -1924,17 +1961,26 @@ async fn sha256_file(path: &Path, cancel: Option<&Arc<AtomicBool>>) -> anyhow::R
     Ok(arr)
 }
 
-async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, settings: Settings, connection: Connection) {
+async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, settings: Settings, connection: Connection, via_eph: bool) {
     let peer = connection.remote_id().to_string();
-    let mygen = {
+    let (mygen, remplacee) = {
         let mut g = slot.lock().await;
-        if let Some(old) = g.conn.take() {
+        let remplacee = g.conn.take().map(|old| {
             old.close(0u32.into(), b"reconnect");
-        }
+            old.remote_id().to_string()
+        });
         g.generation += 1;
         g.conn = Some(connection.clone());
-        g.generation
+        g.via_eph = via_eph;
+        (g.generation, remplacee)
     };
+    // Une session REMPLACÉE (connexion entrante acceptée pendant une session) doit être vue
+    // comme terminée AVANT que la nouvelle ne commence. Sans cet événement, l'ancienne boucle
+    // sortait sans rien dire (génération périmée) : l'UI gardait l'appel en cours — micro
+    // OUVERT — et l'historique du chat de l'ancien pair dans la conversation du nouveau.
+    if let Some(ancien) = remplacee {
+        let _ = app.emit("ghost-disconnected", &ancien);
+    }
     let _ = app.emit("ghost-connected", &peer);
     let inbounds: Inbounds = Arc::new(StdMutex::new(HashMap::new()));
 
@@ -2248,6 +2294,7 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
     let mut g = slot.lock().await;
     if g.generation == mygen {
         g.conn = None;
+        g.via_eph = false;
         drop(g);
         let _ = app.emit("ghost-disconnected", &peer);
     }

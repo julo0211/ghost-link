@@ -71,6 +71,13 @@ async fn rotate_eph_code(state: State<'_, Net>) -> Result<String, String> {
     net::rotate_eph(state.inner()).await.map_err(|e| e.to_string())
 }
 
+/// Vrai si la session en cours passe par l'identité éphémère : changer de code la coupera
+/// (l'UI demande confirmation avant).
+#[tauri::command]
+async fn session_is_ephemeral(state: State<'_, Net>) -> Result<bool, String> {
+    Ok(net::session_is_ephemeral(state.inner()).await)
+}
+
 #[tauri::command]
 async fn probe(state: State<'_, Net>, id: String) -> Result<bool, String> {
     Ok(net::probe(state.inner(), &id).await)
@@ -301,6 +308,7 @@ fn voice_test_stop(voice: State<'_, audio::Voice>) {
 
 #[tauri::command]
 async fn call_start(
+    app: tauri::AppHandle,
     net: State<'_, Net>,
     call: State<'_, audio::Call>,
     cfg: State<'_, audio::AudioCfg>,
@@ -312,7 +320,7 @@ async fn call_start(
     let c = call.inner().clone();
     let acfg = cfg.inner().clone();
     let rt = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || c.start(conn, rt, acfg))
+    tokio::task::spawn_blocking(move || c.start(app, conn, rt, acfg))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
@@ -724,7 +732,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            perm_code, eph_code, rotate_eph_code, probe, connect, send_file, send_chat, send_freq, send_faccept, open_group, send_gchat, send_ginvite, send_gmembers, send_kick, send_img, send_gimg, read_image_bytes,
+            perm_code, eph_code, rotate_eph_code, session_is_ephemeral, probe, connect, send_file, send_chat, send_freq, send_faccept, open_group, send_gchat, send_ginvite, send_gmembers, send_kick, send_img, send_gimg, read_image_bytes,
             group_call_start, group_call_stop, group_call_mute, group_call_volume, voice_presence, screen_audio_start, screen_audio_stop, screen_audio_gain, send_signal, send_gfile,
             video_share_start, video_share_stop, video_receive_attach, video_list_monitors, video_list_windows,
             fingerprint, app_version, check_update, install_update, set_download_dir,

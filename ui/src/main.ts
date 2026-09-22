@@ -46,6 +46,21 @@ function initIdentity(): void {
     }
   };
   $<HTMLButtonElement>("#btnRotateEph").onclick = async () => {
+    // Changer de code FERME la session qui passe par l'ancien (net::rotate_eph) : le dire
+    // avant, plutôt que de la voir disparaître. Une session avec un ami (code permanent)
+    // n'est pas concernée — d'où la question posée à Rust et non un simple S.currentPeer.
+    try {
+      if (
+        (await invoke("session_is_ephemeral")) &&
+        !confirm("Ta session en cours passe par ton code éphémère.\nChanger de code la COUPERA.\n\nContinuer ?")
+      ) {
+        log("Code éphémère conservé — session en cours préservée.");
+        return;
+      }
+    } catch (e) {
+      log("Rotation : " + e);
+      return;
+    }
     $<HTMLButtonElement>("#btnRotateEph").disabled = true;
     try {
       const c = await invoke("rotate_eph_code");
