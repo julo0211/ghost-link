@@ -77,6 +77,8 @@ export interface Commands {
   group_call_start: { args: { members: string[]; gid: string; announce: boolean }; ret: void };
   group_call_stop: { args: void; ret: void };
   group_call_mute: { args: { on: boolean }; ret: void };
+  // Rattache à l'appel en cours les membres arrivés/reconnectés ; renvoie leur nombre.
+  group_call_sync: { args: { members: string[] }; ret: number };
   group_call_volume: { args: { peer: string; vol: number }; ret: void };
   voice_presence: { args: { members: string[]; gid: string; inCall: boolean }; ret: void };
   screen_audio_start: { args: { members: string[]; pid: number | null }; ret: void };

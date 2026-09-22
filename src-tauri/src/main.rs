@@ -396,6 +396,21 @@ fn group_call_mute(call: State<'_, audio::GroupCall>, on: bool) {
     call.set_mute(on);
 }
 
+/// Rattache à l'appel de groupe EN COURS (voix + son du partage d'écran) les membres
+/// arrivés ou reconnectés depuis son démarrage — appelé par l'UI sur `ghost-mesh-up`.
+/// Renvoie le nombre de pairs (re)rattachés. Sans appel en cours : ne fait rien.
+#[tauri::command]
+fn group_call_sync(
+    net: State<'_, Net>,
+    call: State<'_, audio::GroupCall>,
+    sa: State<'_, audio::ScreenAudio>,
+    members: Vec<String>,
+) -> usize {
+    let conns = net::group_conns(net.inner(), &members);
+    sa.sync_targets(conns.iter().map(|(_, c)| c.clone()).collect());
+    call.sync_peers(conns)
+}
+
 #[tauri::command]
 fn group_call_volume(call: State<'_, audio::GroupCall>, peer: String, vol: f64) {
     call.set_gain(&peer, vol as f32);
@@ -733,7 +748,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             perm_code, eph_code, rotate_eph_code, session_is_ephemeral, probe, connect, send_file, send_chat, send_freq, send_faccept, open_group, send_gchat, send_ginvite, send_gmembers, send_kick, send_img, send_gimg, read_image_bytes,
-            group_call_start, group_call_stop, group_call_mute, group_call_volume, voice_presence, screen_audio_start, screen_audio_stop, screen_audio_gain, send_signal, send_gfile,
+            group_call_start, group_call_stop, group_call_mute, group_call_sync, group_call_volume, voice_presence, screen_audio_start, screen_audio_stop, screen_audio_gain, send_signal, send_gfile,
             video_share_start, video_share_stop, video_receive_attach, video_list_monitors, video_list_windows,
             fingerprint, app_version, check_update, install_update, set_download_dir,
             get_download_dir, set_only_friends, set_friends, voice_test_start, voice_test_stop,

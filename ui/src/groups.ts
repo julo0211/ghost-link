@@ -1985,6 +1985,14 @@ async function startScreenNative(g: Group, target: ShareTarget): Promise<void> {
 
 export function initGroups(): void {
   initNativeVideoRx();
+  // Micro/haut-parleur perdu en plein appel de groupe (casque débranché) : Rust a arrêté la
+  // capture ET l'appel. Avant v0.38 personne n'écoutait cet événement : l'UI restait « En
+  // appel », la pastille « dans le vocal » restait allumée chez les autres, sans aucun son.
+  listen("ghost-audio-error", (e) => {
+    if (!e.payload || e.payload.scope !== "group" || !S.inGroupCall) return;
+    stopGroupCall();
+    log("🎧 Appel de groupe coupé : " + e.payload.reason + " — rebranche le périphérique puis rejoins l'appel.");
+  });
   // L'émetteur natif s'est arrêté sur une ERREUR (encodeur, GPU…) — pas via stop().
   // Pas de garde sur S.localScreenNative : une erreur immédiate peut arriver AVANT
   // que le drapeau soit posé — le message doit sortir dans tous les cas.
@@ -2214,6 +2222,28 @@ export function initGroups(): void {
     if (e.payload) {
       S.meshOnline.add(e.payload);
       flushPInv(e.payload);
+      // Appel de groupe EN COURS : rattacher ce pair (arrivé, ou reconnecté — une connexion
+      // remplacée émet aussi mesh-up). Les destinataires de l'appel étaient figés à son
+      // démarrage : un membre arrivé ensuite n'entendait personne et personne ne
+      // l'entendait, alors que sa pastille « dans le vocal » s'allumait chez tous.
+      // Best-effort : ça AJOUTE un pair, ça ne conditionne jamais rien (leçon n° 1).
+      if (S.inGroupCall && S.groupCallId) {
+        const peer = e.payload;
+        const gc = loadGroups().find((x) => x.id === S.groupCallId);
+        if (gc && gc.members.includes(peer)) {
+          invoke("group_call_sync", { members: gc.members })
+            .then((n) => {
+              if (!n) return;
+              // Le mixeur repart à 100 % pour un pair (re)rattaché : re-pousser SES volumes
+              // persistés (même raison que le re-push après group_call_start).
+              const v = S.groupGains[peer];
+              if (v != null && v !== 100) invoke("group_call_volume", { peer, vol: v / 100 }).catch(() => {});
+              applyStreamGain(peer);
+              log("🔊 " + memberName(peer) + " rattaché à l'appel en cours.");
+            })
+            .catch((err) => log("Appel groupe : rattachement de " + memberName(peer) + " impossible (" + err + ")."));
+        }
+      }
       // VID-1 : si je partage déjà ma cam/écran, pousser la vidéo vers un arrivant tardif.
       // Le partage appartient à l'APPEL (S.groupCallId), pas au groupe affiché : on peut
       // naviguer ailleurs pendant l'appel, donc tester le groupe de l'appel — sinon on

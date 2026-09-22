@@ -681,6 +681,19 @@ async fn receive_voice(
 /// Tampons de mixage par pair : code → (gain, échantillons en attente).
 type Peers = Arc<Mutex<HashMap<String, (f32, VecDeque<f32>)>>>;
 
+/// Connexions VIVANTES d'un appel de groupe : (code du pair, connexion). Partagées entre la
+/// boucle de capture (qui diffuse à toutes) et `sync_peers` (arrivants, reconnexions).
+type Links = Arc<Mutex<Vec<(String, Connection)>>>;
+
+/// Ce qu'il faut pour rattacher un pair à l'appel EN COURS (cf. `sync_peers`).
+#[derive(Clone)]
+struct CallSession {
+    stop: Arc<AtomicBool>,
+    out_rate: u32,
+    my_gen: u64,
+    rt: tokio::runtime::Handle,
+}
+
 /// Appel de groupe en cours : diffuse le micro à tous les pairs et mixe leurs flux.
 #[derive(Clone, Default)]
 pub struct GroupCall {
@@ -693,6 +706,11 @@ pub struct GroupCall {
     /// génération courante — sinon, basculer d'un appel à l'autre effacerait les
     /// indicateurs tout juste allumés par le nouvel appel.
     gen: Arc<AtomicU64>,
+    /// Destinataires de la diffusion. N'était qu'un instantané pris au démarrage : un membre
+    /// arrivé (ou reconnecté) APRÈS n'entendait personne et personne ne l'entendait, alors
+    /// que sa pastille « dans le vocal » s'allumait partout (elle passe par un autre chemin).
+    links: Links,
+    session: Arc<Mutex<Option<CallSession>>>,
 }
 
 impl GroupCall {
@@ -706,6 +724,12 @@ impl GroupCall {
         cfg: AudioCfg,
     ) -> anyhow::Result<()> {
         self.stop();
+        // Génération de CET appel, incrémentée EN PREMIER — avant toute remise à zéro de
+        // l'état partagé. Les tâches d'un appel précédent survivent ~200 ms après stop() ;
+        // incrémenter seulement après l'ouverture des périphériques audio (lente) leur
+        // laissait une fenêtre où elles se croyaient encore l'appel courant et effaçaient
+        // le gain, le tampon ou la connexion d'un pair tout juste rattaché au nouvel appel.
+        let my_gen = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
         self.muted.store(false, Ordering::SeqCst);
         if let Ok(mut p) = self.peers.lock() {
             p.clear();
@@ -716,23 +740,20 @@ impl GroupCall {
         let stop = Arc::new(AtomicBool::new(false));
         let peers = self.peers.clone();
         let act = self.act.clone();
-        let conn_list: Vec<Connection> = conns.iter().map(|(_, c)| c.clone()).collect();
+        *self.links.lock().unwrap_or_else(|e| e.into_inner()) = conns.clone();
         // Capture micro → diffusion à tous + sortie mixée. Renvoie le taux de sortie.
         let out_rate = start_group_capture_mix(
             app.clone(),
-            conn_list,
+            self.links.clone(),
             stop.clone(),
             peers.clone(),
             cfg,
             self.muted.clone(),
             act.clone(),
         )?;
-        // Génération de CET appel : calculée AVANT de lancer les tâches de réception,
-        // pour que chacune ne nettoie l'état d'un pair en sortant QUE si l'appel courant
-        // est toujours le sien (sinon une tâche d'un appel précédent effacerait l'entrée
-        // tout juste recréée par le nouvel appel — gain perdu, tampon jeté).
-        let my_gen = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
         // Une tâche de réception par pair → décodage → tampon du pair (mixé à la lecture).
+        // Chacune ne nettoie l'état d'un pair en sortant QUE si `my_gen` est toujours
+        // l'appel courant (cf. l'incrément en tête de fonction).
         for (peer, conn) in conns {
             rt.spawn(receive_group_voice(
                 conn,
@@ -743,12 +764,60 @@ impl GroupCall {
                 act.clone(),
                 self.gen.clone(),
                 my_gen,
+                self.links.clone(),
             ));
         }
         // Émetteur d'activité : pousse ~10 Hz à l'UI qui est en appel et qui parle.
         rt.spawn(emit_voice_activity(app, stop.clone(), act, self.gen.clone(), my_gen));
+        *self.session.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(CallSession { stop: stop.clone(), out_rate, my_gen, rt });
         *self.flag.lock().unwrap_or_else(|e| e.into_inner()) = Some(stop);
         Ok(())
+    }
+
+    /// Rattache à l'appel EN COURS les pairs arrivés depuis son démarrage, et remplace la
+    /// connexion de ceux qui se sont reconnectés (nouvelle `stable_id`). Renvoie le nombre de
+    /// pairs (re)rattachés. Sans appel en cours : ne fait rien. Best-effort par nature : ça
+    /// AJOUTE des destinataires, ça ne conditionne jamais rien (leçon n° 1 de CLAUDE.md).
+    pub fn sync_peers(&self, conns: Vec<(String, Connection)>) -> usize {
+        let Some(s) = self.session.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return 0;
+        };
+        if s.stop.load(Ordering::SeqCst) {
+            return 0;
+        }
+        let mut n = 0;
+        for (peer, conn) in conns {
+            let a_brancher = {
+                let mut l = self.links.lock().unwrap_or_else(|e| e.into_inner());
+                match l.iter_mut().find(|(p, _)| *p == peer) {
+                    Some((_, c)) if c.stable_id() == conn.stable_id() => false,
+                    Some((_, c)) => {
+                        *c = conn.clone(); // reconnecté : l'ancienne connexion est morte
+                        true
+                    }
+                    None => {
+                        l.push((peer.clone(), conn.clone()));
+                        true
+                    }
+                }
+            };
+            if a_brancher {
+                s.rt.spawn(receive_group_voice(
+                    conn,
+                    s.stop.clone(),
+                    self.peers.clone(),
+                    peer,
+                    s.out_rate,
+                    self.act.clone(),
+                    self.gen.clone(),
+                    s.my_gen,
+                    self.links.clone(),
+                ));
+                n += 1;
+            }
+        }
+        n
     }
     /// Règle le volume (gain) de la VOIX d'un pair. 1.0 = normal, 0 = muet, 2.0 = ×2.
     /// Le son d'écran de ce pair a son propre contrôle (`set_screen_gain`) : le curseur
@@ -773,6 +842,7 @@ impl GroupCall {
         if let Some(f) = self.flag.lock().unwrap_or_else(|e| e.into_inner()).take() {
             f.store(true, Ordering::SeqCst);
         }
+        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -866,7 +936,7 @@ fn open_group_output(
 /// `app` sert à prévenir l'UI (ghost-audio-error) si un périphérique est perdu en appel.
 fn start_group_capture_mix(
     app: AppHandle,
-    conns: Vec<Connection>,
+    links: Links,
     stop: Arc<AtomicBool>,
     peers: Peers,
     cfg: AudioCfg,
@@ -912,7 +982,14 @@ fn start_group_capture_mix(
                     // Périphérique perdu (débranché en plein appel) : prévenir l'UI et
                     // arrêter la capture au lieu de laisser un appel zombie tourner à vide.
                     if dev_lost.load(Ordering::SeqCst) {
-                        let _ = app.emit("ghost-audio-error", "périphérique audio perdu");
+                        // Écouté par groups.ts (il ne l'était PAS avant v0.38 : l'UI restait
+                        // « En appel » sans micro). `stop` coupe aussi les tâches de réception
+                        // et l'émetteur d'activité, qui annonçait encore « me » en appel.
+                        let _ = app.emit(
+                            "ghost-audio-error",
+                            serde_json::json!({ "scope": "group", "reason": "périphérique audio perdu" }),
+                        );
+                        stop.store(true, Ordering::SeqCst);
                         break;
                     }
                     let got = if let Ok(mut q) = in_buf.lock() {
@@ -941,8 +1018,10 @@ fn start_group_capture_mix(
                             if let Ok(n) = encoder.encode_float(&frame48, &mut packet[1..]) {
                                 packet[0] = VOICE_TAG;
                                 let dg = bytes::Bytes::copy_from_slice(&packet[..1 + n]);
-                                for c in &conns {
-                                    let _ = c.send_datagram(dg.clone());
+                                if let Ok(l) = links.lock() {
+                                    for (_, c) in l.iter() {
+                                        let _ = c.send_datagram(dg.clone());
+                                    }
                                 }
                             }
                         }
@@ -955,8 +1034,10 @@ fn start_group_capture_mix(
                     if last_ping.elapsed() >= std::time::Duration::from_secs(1) {
                         last_ping = Instant::now();
                         let dg = bytes::Bytes::copy_from_slice(&[CALL_PING]);
-                        for c in &conns {
-                            let _ = c.send_datagram(dg.clone());
+                        if let Ok(l) = links.lock() {
+                            for (_, c) in l.iter() {
+                                let _ = c.send_datagram(dg.clone());
+                            }
                         }
                     }
                 }
@@ -988,7 +1069,9 @@ async fn receive_group_voice(
     act: VoiceAct,
     gen: Arc<AtomicU64>,
     my_gen: u64,
+    links: Links,
 ) {
+    let my_conn = conn.stable_id();
     let mut voice_dec = match new_decoder() {
         Ok(d) => d,
         Err(_) => return,
@@ -1064,7 +1147,21 @@ async fn receive_group_voice(
     // d'un appel précédent (qui peut survivre ~200 ms) ne doit pas supprimer l'entrée
     // d'un pair commun tout juste recréée par le nouvel appel (gain remis à 1.0, tampon
     // jeté). Même garde que emit_voice_activity.
-    if gen.load(Ordering::SeqCst) == my_gen {
+    // ET seulement si notre connexion est encore CELLE de ce pair : après une reconnexion
+    // (sync_peers), l'ancienne tâche sort quand l'ancienne connexion meurt — elle ne doit
+    // pas effacer le gain et le tampon que la nouvelle tâche est en train d'utiliser.
+    // Génération testée AVANT de toucher à `links` : un nouvel appel réutilise la même liste
+    // et, très souvent, la même connexion (même stable_id).
+    let encore_la_notre = gen.load(Ordering::SeqCst) == my_gen
+        && links
+            .lock()
+            .map(|mut l| {
+                let avant = l.len();
+                l.retain(|(p, c)| !(*p == peer && c.stable_id() == my_conn));
+                l.len() != avant
+            })
+            .unwrap_or(false);
+    if encore_la_notre {
         if let Ok(mut m) = peers.lock() {
             m.remove(&peer);
             m.remove(&skey);
@@ -1121,6 +1218,9 @@ async fn emit_voice_activity(
 #[derive(Clone, Default)]
 pub struct ScreenAudio {
     flag: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    /// Destinataires, mis à jour à chaud par `sync_targets` (même défaut que l'appel de
+    /// groupe : figés au démarrage, un membre arrivé ensuite n'entendait pas le partage).
+    targets: Arc<Mutex<Vec<Connection>>>,
 }
 
 impl ScreenAudio {
@@ -1129,9 +1229,17 @@ impl ScreenAudio {
     /// de ce process (partage d'UNE fenêtre : on ne diffuse que le son de cette appli).
     pub fn start(&self, conns: Vec<Connection>, pid: Option<u32>) -> anyhow::Result<()> {
         self.stop();
-        let f = start_screen_capture(conns, pid)?;
+        *self.targets.lock().unwrap_or_else(|e| e.into_inner()) = conns;
+        let f = start_screen_capture(self.targets.clone(), pid)?;
         *self.flag.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
         Ok(())
+    }
+    /// Remplace les destinataires d'une capture EN COURS (arrivants, reconnexions). Sans
+    /// capture en cours : ne fait rien (ne jamais démarrer un partage de son d'ici).
+    pub fn sync_targets(&self, conns: Vec<Connection>) {
+        if self.flag.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            *self.targets.lock().unwrap_or_else(|e| e.into_inner()) = conns;
+        }
     }
     /// Coupe la capture en cours (s'il y en a une).
     pub fn stop(&self) {
@@ -1153,7 +1261,7 @@ const SILENCE_HANG_FRAMES: u32 = 25; // 500 ms : couvre les silences courts dans
 /// découpe en trames de 20 ms, encode en Opus et diffuse en SCREEN_TAG. La capture
 /// WASAPI (COM) tourne sur SON propre thread dans `sysaudio`.
 #[cfg(windows)]
-fn start_screen_capture(conns: Vec<Connection>, pid: Option<u32>) -> anyhow::Result<Arc<AtomicBool>> {
+fn start_screen_capture(targets: Arc<Mutex<Vec<Connection>>>, pid: Option<u32>) -> anyhow::Result<Arc<AtomicBool>> {
     let stop = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
@@ -1221,8 +1329,10 @@ fn start_screen_capture(conns: Vec<Connection>, pid: Option<u32>) -> anyhow::Res
                 if let Ok(n) = encoder.encode_float(&framebuf, &mut packet[1..]) {
                     packet[0] = SCREEN_TAG;
                     let dg = bytes::Bytes::copy_from_slice(&packet[..1 + n]);
-                    for c in &conns {
-                        let _ = c.send_datagram(dg.clone());
+                    if let Ok(t) = targets.lock() {
+                        for c in t.iter() {
+                            let _ = c.send_datagram(dg.clone());
+                        }
                     }
                 }
             }
@@ -1251,8 +1361,89 @@ fn start_screen_capture(conns: Vec<Connection>, pid: Option<u32>) -> anyhow::Res
 /// Hors Windows, la capture « process loopback » n'existe pas : échec propre (l'UI le
 /// signale, l'app ne compile pas moins).
 #[cfg(not(windows))]
-fn start_screen_capture(_conns: Vec<Connection>, _pid: Option<u32>) -> anyhow::Result<Arc<AtomicBool>> {
+fn start_screen_capture(_targets: Arc<Mutex<Vec<Connection>>>, _pid: Option<u32>) -> anyhow::Result<Arc<AtomicBool>> {
     Err(anyhow::anyhow!(
         "capture du son système non disponible sur cette plateforme"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    const ALPN_TEST: &[u8] = b"ghost-link/test-audio/0";
+
+    async fn ep_local() -> iroh::Endpoint {
+        iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .alpns(vec![ALPN_TEST.to_vec()])
+            .bind()
+            .await
+            .unwrap()
+    }
+    async fn relier(de: &iroh::Endpoint, vers: &iroh::Endpoint) -> (Connection, Connection) {
+        let composer = async { de.connect(vers.addr(), ALPN_TEST).await.unwrap() };
+        let accepter = async { vers.accept().await.unwrap().await.unwrap() };
+        tokio::join!(composer, accepter)
+    }
+    /// Simule un appel EN COURS sans ouvrir de périphérique audio (ce que fait start()).
+    fn appel_en_cours(call: &GroupCall) -> Arc<AtomicBool> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let my_gen = call.gen.fetch_add(1, Ordering::SeqCst) + 1;
+        *call.session.lock().unwrap() = Some(CallSession {
+            stop: stop.clone(),
+            out_rate: 48_000,
+            my_gen,
+            rt: tokio::runtime::Handle::current(),
+        });
+        stop
+    }
+
+    #[tokio::test]
+    async fn appel_de_groupe_rattache_les_arrivants_et_les_reconnexions() {
+        // Régression v0.37.3 : les destinataires étaient figés au démarrage de l'appel —
+        // un membre arrivé ou reconnecté ensuite n'entendait personne, et inversement.
+        let (a, b) = (ep_local().await, ep_local().await);
+        let call = GroupCall::default();
+        let (c1, _c1_chez_b) = relier(&a, &b).await;
+        assert_eq!(call.sync_peers(vec![("B".into(), c1.clone())]), 0, "sans appel : ne rien faire");
+        let stop = appel_en_cours(&call);
+        assert_eq!(call.sync_peers(vec![("B".into(), c1.clone())]), 1, "arrivant rattaché");
+        assert_eq!(call.sync_peers(vec![("B".into(), c1.clone())]), 0, "même connexion : rien à faire");
+        let (c2, _c2_chez_b) = relier(&a, &b).await;
+        assert_eq!(call.sync_peers(vec![("B".into(), c2.clone())]), 1, "reconnexion : connexion remplacée");
+        call.set_gain("B", 1.5);
+
+        // L'ANCIENNE connexion meurt : sa tâche de réception ne doit effacer ni le lien vers
+        // la nouvelle, ni le gain que l'utilisateur a réglé pour ce pair.
+        c1.close(0u32.into(), b"reconnect");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        {
+            let l = call.links.lock().unwrap();
+            assert_eq!(l.len(), 1);
+            assert_eq!(l[0].1.stable_id(), c2.stable_id(), "le lien doit pointer la NOUVELLE connexion");
+        }
+        assert_eq!(call.peers.lock().unwrap().get("B").map(|e| e.0), Some(1.5), "gain conservé");
+
+        // La connexion COURANTE meurt (le pair est parti) : là, on nettoie.
+        c2.close(0u32.into(), b"bye");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(call.links.lock().unwrap().is_empty(), "plus de diffusion vers un pair parti");
+        assert!(call.peers.lock().unwrap().get("B").is_none(), "tampon du pair parti libéré");
+
+        stop.store(true, Ordering::SeqCst);
+        a.close().await;
+        b.close().await;
+    }
+
+    #[test]
+    fn son_d_ecran_sans_capture_ne_demarre_rien() {
+        // sync_targets ne doit JAMAIS faire partir du son système : sans capture en cours,
+        // les destinataires restent vides.
+        let sa = ScreenAudio::default();
+        sa.sync_targets(Vec::new());
+        assert!(sa.flag.lock().unwrap().is_none());
+        assert!(sa.targets.lock().unwrap().is_empty());
+    }
 }
