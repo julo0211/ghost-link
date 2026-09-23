@@ -470,7 +470,7 @@ export function renderGroups() {
         box.innerHTML = '<div class="empty">Aucun groupe.</div>';
         return;
     }
-    gs.forEach((g, i) => {
+    gs.forEach((g) => {
         // Item compact façon Discord : avatar (initiale) + nom, clic = ouvrir, ✕ au survol = supprimer/quitter.
         const d = document.createElement("div");
         d.className = "item" + (g.id === S.openGroupId ? " active" : "");
@@ -505,9 +505,9 @@ export function renderGroups() {
             // vers un groupe disparu et aucun bouton ne permettrait plus de raccrocher.
             if (S.inGroupCall && S.groupCallId === g.id)
                 stopGroupCall();
-            const a = loadGroups();
-            a.splice(i, 1);
-            saveGroups(a);
+            // Par ID, pas par l'index capté au rendu : s'il est périmé on supprimerait un AUTRE
+            // groupe (même défaut déjà corrigé pour les amis, cf. removeFriend).
+            saveGroups(loadGroups().filter((x) => x.id !== g.id));
             clearPInvGroup(g.id);
             myVotes(g.id).forEach((t) => saveMyVote(g.id, t, false)); // ne plus re-gossiper mes votes d'un groupe quitté
             delete S.groupMsgs[g.id]; // purge de l'historique de chat du groupe supprimé
@@ -2051,6 +2051,24 @@ async function startScreenNative(g, target) {
         screenBusy = false;
     }
 }
+/** Un code de pair = identifiant iroh : 64 caractères hexadécimaux minuscules. */
+const CODE_PAIR = /^[0-9a-f]{64}$/;
+/** Plafond d'un roster de groupe, très au-dessus de tout usage réel d'un maillage complet. */
+const MAX_MEMBRES_GROUPE = 64;
+/** Codes d'un roster REÇU (invitation, synchro), validés et bornés. Un membre malveillant ou
+ *  bogué pouvait injecter des milliers de chaînes arbitraires (512 Ko de CSV), re-diffusées de
+ *  proche en proche ; une chaîne contenant `"` cassait même le sélecteur de relabelPeer. */
+function codesDeRoster(csv) {
+    const vus = new Set();
+    for (const c of (csv || "").split(",")) {
+        const code = c.trim().toLowerCase();
+        if (CODE_PAIR.test(code))
+            vus.add(code);
+        if (vus.size >= MAX_MEMBRES_GROUPE + 1)
+            break; // +1 : le roster inclut son expéditeur
+    }
+    return [...vus];
+}
 /** Bannière d'offre de fichier de groupe : la PREMIÈRE offre en attente, sa destination,
  *  et combien d'autres attendent. Cachée quand la file est vide. */
 function paintGfileOffer() {
@@ -2444,10 +2462,7 @@ export function initGroups() {
             return;
         if (p.id && declinedGroups().includes(p.id))
             return;
-        const full = (p.members || "")
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean);
+        const full = codesDeRoster(p.members);
         S.pendingInvite = { id: p.id, name: p.name || "Groupe", full };
         $("#groupInviteText").textContent =
             '👪 Invitation au groupe « ' + (p.name || "?") + " » (" + full.length + " membres).";
@@ -2478,11 +2493,11 @@ export function initGroups() {
         if (!p.from || (!g.members.includes(p.from) && p.from !== S.myCode))
             return;
         const kset = kickedSet(g.id); // tombstones LOCAUX (jamais reçus du fil) : ne pas ré-admettre un exclu
-        const incoming = (p.members || "")
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean);
-        const merged = Array.from(new Set([...g.members, ...incoming])).filter((c) => c && c !== S.myCode && !kset.has(c));
+        const incoming = codesDeRoster(p.members);
+        // Membres DÉJÀ connus d'abord : si le plafond coupe, ce sont les arrivants qui restent dehors.
+        const merged = Array.from(new Set([...g.members, ...incoming]))
+            .filter((c) => c && c !== S.myCode && !kset.has(c))
+            .slice(0, MAX_MEMBRES_GROUPE);
         const changed = merged.length !== g.members.length || merged.some((c) => !g.members.includes(c));
         if (!changed)
             return; // anti-tempête : aucune re-diffusion sur un no-op
@@ -2568,6 +2583,11 @@ export function initGroups() {
             return;
         const g = loadGroups().find((x) => x.id === p.group);
         if (!g)
+            return;
+        // DURCISSEMENT (M8) : même contrôle que ghost-gchat / ghost-gchat-img, qui manquait ici.
+        // Un membre exclu par vote reste un AMI (applyKick ne touche pas Settings.friends), donc
+        // le maillage l'accepte : sans ce test il faisait encore sonner tout le groupe.
+        if (!p.from || !g.members.includes(p.from))
             return;
         S.pendingGCall = g.id;
         $("#gcallText").textContent = '📞 Appel dans le groupe « ' + g.name + " » — rejoindre ?";

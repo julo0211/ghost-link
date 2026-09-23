@@ -668,6 +668,13 @@ fn signed_file_name(signature_b64: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// Le nom de fichier signé porte-t-il EXACTEMENT cette version ? Tauri nomme l'installeur
+/// `<produit>_<version>_<arch>-setup.exe` : on exige `_<version>_`. Une simple sous-chaîne
+/// aurait accepté « 0.37.1 » dans « ghost-link_0.37.10_x64-setup.exe ».
+fn nom_signe_correspond(fichier: &str, version: &str) -> bool {
+    fichier.contains(&format!("_{version}_"))
+}
+
 /// Cherche une mise à jour. Renvoie la version disponible (ou null), et la garde en attente.
 ///
 /// SÉCURITÉ — liaison version ↔ binaire. La signature minisign prouve seulement que ces
@@ -696,7 +703,7 @@ async fn check_update(
         .map_err(|e| e.to_string())?;
     if let Some(u) = update.as_ref() {
         if let Some(fichier) = signed_file_name(&u.signature) {
-            if !fichier.contains(&u.version) {
+            if !nom_signe_correspond(&fichier, &u.version) {
                 return Err(format!(
                     "mise à jour refusée : le binaire signé est « {fichier} », qui ne correspond pas \
                      à la version annoncée {}. Signale-le — cela ressemble à un rejeu d'un ancien \
@@ -980,6 +987,16 @@ mod tests {
             signed_file_name(SIG_REELLE).as_deref(),
             Some("ghost-link_0.36.1_x64-setup.exe")
         );
+    }
+
+    #[test]
+    fn la_version_signee_doit_correspondre_exactement() {
+        use super::nom_signe_correspond;
+        assert!(nom_signe_correspond("ghost-link_0.36.1_x64-setup.exe", "0.36.1"));
+        // Sous-chaîne d'une AUTRE version : refusé (la v0.37 acceptait).
+        assert!(!nom_signe_correspond("ghost-link_0.37.10_x64-setup.exe", "0.37.1"));
+        assert!(!nom_signe_correspond("ghost-link_10.37.1_x64-setup.exe", "0.37.1"));
+        assert!(!nom_signe_correspond("ghost-link_0.36.1_x64-setup.exe", "99.0.0"));
     }
 
     #[test]

@@ -88,7 +88,9 @@ unsafe fn activate_loopback(target: LoopbackTarget) -> anyhow::Result<IAudioClie
             (pid, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE)
         }
     };
-    let params = AUDIOCLIENT_ACTIVATION_PARAMS {
+    // Sur le TAS : leur adresse est confiée à Windows (BLOB du PROPVARIANT) et doit rester
+    // valide tant que l'activation n'a pas complété — y compris si elle dépasse notre délai.
+    let params = Box::new(AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
@@ -96,26 +98,31 @@ unsafe fn activate_loopback(target: LoopbackTarget) -> anyhow::Result<IAudioClie
                 ProcessLoopbackMode: mode,
             },
         },
-    };
-    let prop = RawBlobPropVariant {
+    });
+    let prop = Box::new(RawBlobPropVariant {
         vt: 65, // VT_BLOB
         r1: 0,
         r2: 0,
         r3: 0,
         cb_size: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-        p_blob: &params as *const _ as *mut u8,
-    };
+        p_blob: &*params as *const _ as *mut u8,
+    });
     let (tx, rx) = std::sync::mpsc::channel();
     let handler: IActivateAudioInterfaceCompletionHandler = Completion(tx).into();
     let op = ActivateAudioInterfaceAsync(
         VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
         &IAudioClient::IID,
-        Some(&prop as *const _ as *const PROPVARIANT),
+        Some(&*prop as *const _ as *const PROPVARIANT),
         &handler,
     )?;
-    // `params` doit rester vivant tant que l'activation n'a pas complété.
-    rx.recv_timeout(Duration::from_secs(3))
-        .map_err(|_| anyhow::anyhow!("activation loopback : pas de réponse"))?;
+    if rx.recv_timeout(Duration::from_secs(3)).is_err() {
+        // Pilote bloqué : l'activation peut encore compléter PLUS TARD et lire ces octets.
+        // Les rendre maintenant serait une utilisation après libération ; on les laisse
+        // fuir (quelques dizaines d'octets, sur un chemin d'erreur rare) plutôt que risquer.
+        std::mem::forget(params);
+        std::mem::forget(prop);
+        return Err(anyhow::anyhow!("activation loopback : pas de réponse"));
+    }
     let mut hr = windows::core::HRESULT(0);
     let mut iface: Option<windows::core::IUnknown> = None;
     op.GetActivateResult(&mut hr, &mut iface)?;
@@ -134,8 +141,8 @@ unsafe fn activate_loopback(target: LoopbackTarget) -> anyhow::Result<IAudioClie
     if hr.0 < 0 {
         return Err(anyhow::anyhow!("activation loopback refusée (hr=0x{:08x})", hr.0));
     }
-    // `params` est resté vivant durant toute l'activation (bloquée sur rx ci-dessus) :
-    // son adresse était référencée par le BLOB du PROPVARIANT.
+    // L'activation a complété : `params`/`prop` peuvent être rendus (fin de portée).
+    drop((params, prop));
     iface
         .ok_or_else(|| anyhow::anyhow!("activation loopback : interface absente"))?
         .cast::<IAudioClient>()

@@ -203,7 +203,8 @@ export async function showFp(code: string): Promise<void> {
 // Demandes d'ami (mutuelles)
 function saveMutual(code: string, name?: string): void {
   if (!code) return;
-  const label = name && name.trim() ? name.trim() : "Ami " + String(code).slice(0, 8);
+  const auto = "Ami " + String(code).slice(0, 8);
+  const label = name && name.trim() ? name.trim() : auto;
   const a = loadFriends();
   let f = a.find((x) => x.code === code);
   if (!f) {
@@ -211,7 +212,12 @@ function saveMutual(code: string, name?: string): void {
     a.push(f);
   } else {
     f.mutual = true;
-    if (name && name.trim()) f.name = name.trim();
+    // NE JAMAIS écraser le nom local d'un ami EXISTANT par un nom venu du réseau. Le code
+    // d'une demande est auto-déclaré : un inconnu pouvait envoyer une demande portant le
+    // code de Bob et le nom « Alice ». La bannière affichait « Bob veut t'ajouter » avec la
+    // VRAIE empreinte de Bob (la vérification de vive voix réussissait donc), et accepter
+    // renommait Bob en « Alice » partout. Seule l'étiquette automatique est remplaçable.
+    if ((!f.name || f.name === auto) && name && name.trim()) f.name = name.trim();
   }
   saveFriends(a);
   renderFriends();

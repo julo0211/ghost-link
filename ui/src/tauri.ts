@@ -167,7 +167,8 @@ export interface Events {
   "ghost-ginvite": { id: string; name?: string; members?: string };
   "ghost-gmembers": { group: string; name?: string; members?: string; from?: string };
   "ghost-kick": { group: string; target: string; voter: string; from?: string };
-  "ghost-gcall": { group: string };
+  // `from` = remote_id authentifié (net.rs l'émet depuis toujours).
+  "ghost-gcall": { group: string; from?: string };
   "ghost-voice-presence": { group: string; code: string; inCall: boolean };
   "ghost-signal": { from?: string; data: string };
   "ghost-grecv-start": { name?: string; from?: string };
