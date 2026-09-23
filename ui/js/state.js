@@ -41,7 +41,10 @@ export const S = {
     rB: 0,
     rSpd: 0,
     rLast: 0,
-    fileOfferId: null,
+    // Offres de fichier en ATTENTE, dans l'ordre d'arrivée (la bannière montre la première).
+    // Avant : un seul id, écrasé par l'offre suivante — la précédente restait sans réponse
+    // (1-à-1 : l'expéditeur attendait 120 s) ou était refusée en silence (groupe).
+    fileOffers: [],
     // session / connexion entrante
     incomingId: null,
     // vocal 1-à-1
@@ -74,7 +77,7 @@ export const S = {
     // beacon ~1 Hz) — même hors appel. gid → (code → lastSeenMs). Pilote `.inbooth`
     // (pastille statique), SÉPARÉE de `.incall`/`.speaking` ci-dessus.
     voicePresence: {},
-    gfileOfferId: null,
+    gfileOffers: [],
     // vidéo (WebRTC)
     localCam: null,
     localScreen: null,

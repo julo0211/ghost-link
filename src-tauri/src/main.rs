@@ -22,8 +22,8 @@ struct PendingUpdate(std::sync::Mutex<Option<Update>>);
 ///
 /// Sert d'autorisation de lecture pour l'affichage inline d'une image glissée. La WebView
 /// n'a aucun accès disque (capabilities réduites à `core:default` + `updater:default`) et
-/// `read_image_bytes` est confiné au dossier de réception : sans ce registre, afficher une
-/// image glissée exigerait de rouvrir une primitive de lecture arbitraire.
+/// `read_image_bytes` ne lit sinon que les fichiers REÇUS pendant la session : sans ce
+/// registre, afficher une image glissée exigerait de rouvrir une lecture arbitraire.
 ///
 /// Il n'est alimenté QUE par l'événement de glisser-déposer du système. Aucune commande
 /// n'y écrit, donc un script de la page ne peut pas y ajouter un chemin de son choix — la
@@ -39,6 +39,9 @@ const MAX_DROPPED: usize = 32;
 
 impl DroppedPaths {
     fn remember(&self, paths: &[std::path::PathBuf]) {
+        // Un dépôt de plus de MAX_DROPPED fichiers d'un coup dépassait la borne annoncée :
+        // ne garder que les derniers (seul le premier est de toute façon utilisé par l'UI).
+        let paths = &paths[paths.len().saturating_sub(MAX_DROPPED)..];
         let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if s.len() + paths.len() > MAX_DROPPED {
             s.clear();
@@ -173,8 +176,20 @@ async fn clean_inline_img(app: &tauri::AppHandle, name: &str, data: Vec<u8>) -> 
     }
 }
 
+/// Refuse à l'ENVOI un type d'image que le destinataire jetterait (`net::mime_ok`). Sans ce
+/// contrôle, coller un .bmp/.svg/.avif copié depuis l'Explorateur affichait ma bulle, l'envoi
+/// réussissait, et l'image disparaissait sans un mot chez l'autre.
+fn mime_image_accepte(mime: &str) -> Result<(), String> {
+    if net::mime_ok(mime) {
+        Ok(())
+    } else {
+        Err(format!("format d'image non pris en charge ({mime}) — PNG, JPEG, GIF ou WebP uniquement"))
+    }
+}
+
 #[tauri::command]
 async fn send_img(app: tauri::AppHandle, state: State<'_, Net>, author: String, name: String, mime: String, data: Vec<u8>) -> Result<(), String> {
+    mime_image_accepte(&mime)?;
     let slot = state.slot.clone();
     let data = clean_inline_img(&app, &name, data).await;
     net::send_img(&slot, &author, &name, &mime, &data).await.map_err(|e| e.to_string())
@@ -185,73 +200,110 @@ async fn send_img(app: tauri::AppHandle, state: State<'_, Net>, author: String, 
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn send_gimg(app: tauri::AppHandle, state: State<'_, Net>, members: Vec<String>, gid: String, author: String, name: String, mime: String, data: Vec<u8>) -> Result<(), String> {
+    mime_image_accepte(&mime)?;
     let data = clean_inline_img(&app, &name, data).await;
     net::send_gimg(state.inner(), members, &gid, &author, &name, &mime, &data).await.map_err(|e| e.to_string())
 }
 
-/// Repli grosse image : lire les octets d'un fichier REÇU (borné) pour rendu inline via blob.
-///
-/// CONFINEMENT AU DOSSIER DE RÉCEPTION — indispensable. Les capabilities de l'app sont
-/// volontairement minimales (`core:default` + `updater:default` : ni plugin `fs`, ni
-/// `shell`, ni `dialog`), donc la WebView n'a AUCUN accès disque générique. Sans la
-/// vérification ci-dessous, cette commande réintroduisait à elle seule exactement la
-/// capacité que cette configuration interdit : une primitive de lecture arbitraire
-/// (identity.key, documents, profils d'autres applications), exploitable par tout script
-/// s'exécutant dans la vue. Le seul appel légitime (ui/src/transfer.ts) passe un chemin
-/// que NOUS venons de fabriquer et d'émettre dans `ghost-recv-done` : il est toujours
-/// dans le dossier de réception, le confinement ne coûte donc rien fonctionnellement.
 /// Résout `path` et vérifie qu'il est autorisé à la lecture. Deux voies, une seule règle :
-/// l'utilisateur doit avoir désigné ce fichier, d'une façon ou d'une autre.
+/// l'utilisateur doit avoir désigné CE fichier, d'une façon ou d'une autre.
 ///
 /// 1. Il l'a **déposé** sur la fenêtre (registre `DroppedPaths`, alimenté par l'OS) ;
-/// 2. ou c'est un fichier **reçu**, donc sous le dossier de réception (aperçu inline).
+/// 2. ou c'est un fichier **reçu pendant cette session** (`Settings::note_received`,
+///    alimenté par net.rs quand il écrit et vérifie un fichier).
 ///
-/// `canonicalize()` résout liens, jonctions, « .. » et casse des deux côtés : la comparaison
-/// porte sur le chemin RÉEL et jamais sur la chaîne fournie par le JS. Extrait de la commande
+/// Pourquoi pas « tout ce qui est sous le dossier de réception », comme en v0.37 : ce
+/// dossier est un RÉGLAGE que la vue peut changer (`set_download_dir`). Un script dans la vue
+/// pouvait donc le pointer sur `C:\` puis lire n'importe quel fichier — la primitive de
+/// lecture arbitraire fermée à l'audit du 25/07 (#22) se rouvrait en deux appels.
+///
+/// Les capabilities de l'app sont volontairement minimales (ni plugin `fs`, ni `shell`, ni
+/// `dialog`) : la WebView n'a AUCUN accès disque générique, cette commande ne doit pas en
+/// redonner un. `canonicalize()` résout liens, jonctions, « .. » et casse : la comparaison
+/// porte sur le chemin RÉEL, jamais sur la chaîne fournie par le JS. Extrait de la commande
 /// pour être TESTABLE — c'est un contrôle de sécurité dont l'échec est invisible côté UI.
 fn chemin_autorise(
-    dossier: &str,
     path: &str,
     deposes: &DroppedPaths,
+    recu: impl Fn(&std::path::Path) -> bool,
 ) -> Result<std::path::PathBuf, String> {
     let cible = std::path::Path::new(path)
         .canonicalize()
         .map_err(|e| e.to_string())?;
-    if deposes.contains(&cible) {
+    if deposes.contains(&cible) || recu(&cible) {
         return Ok(cible);
     }
-    let racine = std::path::PathBuf::from(dossier)
-        .canonicalize()
-        .map_err(|e| format!("dossier de réception illisible : {e}"))?;
-    if !cible.starts_with(&racine) {
-        return Err("chemin non autorisé : ni déposé sur la fenêtre, ni dans le dossier de réception".into());
-    }
-    Ok(cible)
+    Err("chemin non autorisé : ni déposé sur la fenêtre, ni reçu pendant cette session".into())
 }
 
+/// Plafond absolu d'une lecture d'image (aperçu d'une grosse image reçue).
+const MAX_IMAGE_LUE: u64 = 32 * 1024 * 1024;
+
+/// Octets d'une image déposée ou reçue, pour l'afficher (et, déposée, l'envoyer inline).
+///
+/// `max` : plafond demandé par l'appelant. Au-delà, erreur préfixée « TROP_GRANDE: » — un
+/// préfixe STABLE, que l'UI distingue de toute autre erreur (elle ne propose le repli en
+/// fichier QUE dans ce cas, et affiche la vraie cause sinon). La taille est vérifiée AVANT de
+/// lire : la v0.37.2 lisait jusqu'à 32 Mio pour découvrir ensuite qu'une photo dépassait 5 Mo.
+///
+/// Octets rendus BRUTS (`ArrayBuffer` côté JS) et non en `Vec<u8>` sérialisé en tableau JSON
+/// de nombres (~3,5 octets de JSON par octet d'image, décodés sur le thread de l'UI : une
+/// photo de 20 Mo figeait la fenêtre plusieurs secondes).
 #[tauri::command]
 async fn read_image_bytes(
     state: State<'_, Net>,
     deposes: State<'_, DroppedPaths>,
     path: String,
-) -> Result<Vec<u8>, String> {
-    let cible = chemin_autorise(&net::get_download_dir(&state.settings), &path, deposes.inner())?;
+    max: Option<u64>,
+) -> Result<tauri::ipc::Response, String> {
+    let settings = state.settings.clone();
+    let cible = chemin_autorise(&path, deposes.inner(), |p| settings.was_received(p))?;
     let meta = std::fs::metadata(&cible).map_err(|e| e.to_string())?;
     if !meta.is_file() {
         return Err("pas un fichier régulier".into());
     }
-    if meta.len() > 32 * 1024 * 1024 {
-        return Err("image trop grande".into()); // borne
+    let plafond = max.unwrap_or(MAX_IMAGE_LUE).min(MAX_IMAGE_LUE);
+    if meta.len() > plafond {
+        return Err(format!("TROP_GRANDE: {} octets, plafond {plafond}", meta.len()));
     }
-    std::fs::read(&cible).map_err(|e| e.to_string())
+    let octets = tokio::fs::read(&cible).await.map_err(|e| e.to_string())?;
+    Ok(tauri::ipc::Response::new(octets))
+}
+
+/// Dossiers où un fichier reçu s'exécuterait tout seul (Démarrage), ou qui hébergent
+/// l'identité de l'app. ATTÉNUATION, pas clôture : une liste ne couvre ni les dossiers
+/// d'auto-démarrage des autres applis, ni le dépôt d'une DLL à côté d'un exe inscriptible.
+/// La vraie protection reste le consentement, qui affiche désormais la destination.
+fn dossier_interdit(p: &std::path::Path) -> bool {
+    let Ok(cible) = p.canonicalize() else { return false };
+    let mut interdits: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(d) = dirs::data_dir() {
+        interdits.push(d.join(r"Microsoft\Windows\Start Menu\Programs\Startup"));
+        interdits.push(d.join("ghost-link"));
+    }
+    if let Some(d) = dirs::data_local_dir() {
+        interdits.push(d.join("ghost-link"));
+    }
+    if let Ok(pd) = std::env::var("ProgramData") {
+        interdits.push(std::path::PathBuf::from(pd).join(r"Microsoft\Windows\Start Menu\Programs\StartUp"));
+    }
+    if let Ok(sr) = std::env::var("SystemRoot") {
+        interdits.push(std::path::PathBuf::from(sr));
+    }
+    interdits
+        .iter()
+        .filter_map(|d| d.canonicalize().ok())
+        .any(|d| cible.starts_with(d))
 }
 
 /// Définit le dossier de réception. Chaîne vide = revenir au défaut (Téléchargements).
 ///
 /// Le chemin vient du JS et devient la RACINE d'écriture de tous les fichiers reçus.
-/// `sanitize()` protège le NOM du fichier, pas la racine : sans validation ici, un script
-/// dans la vue pouvait pointer le dossier Démarrage de l'utilisateur et transformer le
-/// prochain fichier reçu en exécution à l'ouverture de session.
+/// `sanitize()` protège le NOM du fichier, pas la racine : un script dans la vue pouvait
+/// pointer le dossier Démarrage et transformer le prochain fichier reçu en exécution à
+/// l'ouverture de session. « Absolu + existant » (v0.37.0) ne l'empêchait PAS — le dossier
+/// Démarrage est les deux. D'où `dossier_interdit`, et la destination affichée dans chaque
+/// offre de fichier (ghost-recv-offer / ghost-grecv-offer portent `dir`).
 #[tauri::command]
 fn set_download_dir(state: State<'_, Net>, path: String) -> Result<(), String> {
     let p = path.trim();
@@ -262,6 +314,9 @@ fn set_download_dir(state: State<'_, Net>, path: String) -> Result<(), String> {
         }
         if !chemin.is_dir() {
             return Err("ce dossier n'existe pas".into());
+        }
+        if dossier_interdit(chemin) {
+            return Err("dossier refusé : un fichier reçu pourrait s'y exécuter tout seul (Démarrage, Windows) ou toucher à l'identité de ghost link".into());
         }
     }
     net::set_download_dir(&state.settings, p);
@@ -551,7 +606,7 @@ fn video_receive_attach(
 }
 
 #[tauri::command]
-async fn send_gfile(state: State<'_, Net>, members: Vec<String>, path: String) -> Result<(), String> {
+async fn send_gfile(state: State<'_, Net>, members: Vec<String>, path: String) -> Result<usize, String> {
     net::send_gfile(state.inner(), members, &path).await.map_err(|e| e.to_string())
 }
 
@@ -790,7 +845,11 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{chemin_autorise, signed_file_name, DroppedPaths, MAX_DROPPED};
+    use super::{chemin_autorise, dossier_interdit, signed_file_name, DroppedPaths, MAX_DROPPED};
+    /// Registre des fichiers reçus : ici, aucun.
+    fn rien_recu(_: &std::path::Path) -> bool {
+        false
+    }
 
     // ---- Autorisation de lecture pour l'affichage d'images ----
     // Le cas NOMINAL compte autant que le refus : côté UI un échec de lecture ne produit
@@ -808,12 +867,26 @@ mod tests {
     }
 
     #[test]
-    fn autorise_un_fichier_du_dossier_de_reception() {
+    fn autorise_un_fichier_recu_pendant_la_session() {
+        // Le registre est alimenté par net.rs à la réception (intégrité vérifiée).
         let d = dossier("gl-auth-recv");
         let f = fichier(&d, "photo reçue.jpg");
+        let settings = crate::net::Settings::default();
+        settings.note_received(&f);
         let vide = DroppedPaths::default();
-        let r = chemin_autorise(&d.to_string_lossy(), &f.to_string_lossy(), &vide);
-        assert!(r.is_ok(), "un fichier DU dossier de réception doit passer, or : {r:?}");
+        let r = chemin_autorise(&f.to_string_lossy(), &vide, |p| settings.was_received(p));
+        assert!(r.is_ok(), "un fichier REÇU doit passer, or : {r:?}");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn refuse_un_fichier_du_dossier_de_reception_jamais_recu() {
+        // M9 (audit 2026-09-22) : « sous le dossier de réception » ne suffit plus. Ce dossier
+        // est un RÉGLAGE : un script dans la vue le pointait sur C:\ puis lisait n'importe quoi.
+        let d = dossier("gl-auth-recv-jamais");
+        let f = fichier(&d, "document.pdf");
+        let vide = DroppedPaths::default();
+        assert!(chemin_autorise(&f.to_string_lossy(), &vide, rien_recu).is_err());
         let _ = std::fs::remove_file(&f);
     }
 
@@ -821,12 +894,11 @@ mod tests {
     fn autorise_un_fichier_depose_hors_du_dossier() {
         // C'est TOUTE la raison d'être du registre : afficher inline une image glissée
         // depuis n'importe où, sans rouvrir une lecture arbitraire.
-        let recv = dossier("gl-auth-recv2");
         let ailleurs = dossier("gl-auth-ailleurs");
         let f = fichier(&ailleurs, "glissee.gif");
         let deposes = DroppedPaths::default();
         deposes.remember(std::slice::from_ref(&f));
-        let r = chemin_autorise(&recv.to_string_lossy(), &f.to_string_lossy(), &deposes);
+        let r = chemin_autorise(&f.to_string_lossy(), &deposes, rien_recu);
         assert!(r.is_ok(), "un fichier DÉPOSÉ doit passer, or : {r:?}");
         let _ = std::fs::remove_file(&f);
     }
@@ -838,13 +910,29 @@ mod tests {
         let secret = fichier(&ailleurs, "identity.key");
         let vide = DroppedPaths::default();
         assert!(
-            chemin_autorise(&recv.to_string_lossy(), &secret.to_string_lossy(), &vide).is_err(),
+            chemin_autorise(&secret.to_string_lossy(), &vide, rien_recu).is_err(),
             "un chemin ni déposé ni reçu ne doit JAMAIS être lisible"
         );
         // La traversée explicite reste refusée elle aussi.
         let traverse = format!("{}\\..\\gl-auth-ailleurs3\\identity.key", recv.to_string_lossy());
-        assert!(chemin_autorise(&recv.to_string_lossy(), &traverse, &vide).is_err());
+        assert!(chemin_autorise(&traverse, &vide, rien_recu).is_err());
         let _ = std::fs::remove_file(&secret);
+    }
+
+    #[test]
+    fn le_dossier_demarrage_est_refuse_comme_dossier_de_reception() {
+        // Le PoC du finding #29 (25/07) : « absolu + existant » ne l'arrêtait pas.
+        if let Some(d) = dirs::data_dir() {
+            let demarrage = d.join(r"Microsoft\Windows\Start Menu\Programs\Startup");
+            if demarrage.is_dir() {
+                assert!(dossier_interdit(&demarrage));
+            }
+            // L'identité de l'app non plus ne doit pas pouvoir recevoir de fichiers.
+            let _ = std::fs::create_dir_all(d.join("ghost-link"));
+            assert!(dossier_interdit(&d.join("ghost-link")));
+        }
+        // Un dossier ordinaire reste accepté.
+        assert!(!dossier_interdit(&dossier("gl-dossier-ordinaire")));
     }
 
     #[test]
@@ -862,6 +950,20 @@ mod tests {
         // Et le dernier déposé reste autorisé — purger ne doit pas casser le geste en cours.
         let dernier = tous.last().unwrap();
         assert!(deposes.contains(&dernier.canonicalize().unwrap()));
+        for f in tous {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    #[test]
+    fn un_depot_massif_d_un_coup_reste_borne() {
+        // Avant : le registre était vidé puis TOUS les chemins insérés — 40 fichiers déposés
+        // d'un seul geste en laissaient 40.
+        let d = dossier("gl-auth-massif");
+        let tous: Vec<_> = (0..(MAX_DROPPED + 8)).map(|i| fichier(&d, &format!("m{i}.png"))).collect();
+        let deposes = DroppedPaths::default();
+        deposes.remember(&tous);
+        assert!(deposes.0.lock().unwrap().len() <= MAX_DROPPED);
         for f in tous {
             let _ = std::fs::remove_file(f);
         }

@@ -1,6 +1,6 @@
 // Groupes : channel multi-pairs (chat), appel de groupe (audio), vidéo (WebRTC), fichiers.
 import { invoke, listen } from "./tauri.js";
-import { $, log, fmt, addImgBubble, clearImgBlobs, clampLabel, playPing, trimTextBubbles } from "./dom.js";
+import { $, log, fmt, addImgBubble, clearImgBlobs, clampLabel, playPing, trimTextBubbles, guessImageMime, mimeImageAccepte, versOctets, } from "./dom.js";
 import { S, PINV, GDECL, iceConfig, nativeVideoWanted, loadGroups, saveGroups, loadFriends, friendsOnly, memberName, isDeclaredLabel, saveGains, saveSGains, myName, } from "./state.js";
 import { showTab } from "./session.js";
 // Pas de cycle : friends.ts n'importe que tauri/dom/state/session, jamais groups.ts.
@@ -641,6 +641,12 @@ async function sendImageGroup(f) {
     const g = loadGroups().find((x) => x.id === S.openGroupId);
     if (!g)
         return;
+    // Même règle qu'en 1-à-1 : un type hors liste blanche serait jeté en silence par chaque
+    // membre, après qu'on a affiché NOTRE bulle comme envoyée.
+    if (!mimeImageAccepte(f.type)) {
+        log("Image « " + (f.type || "type inconnu") + " » non prise en charge — PNG, JPEG, GIF ou WebP uniquement.");
+        return;
+    }
     if (f.size > MAX_INLINE_GIMG) {
         log("Image > 5 Mo — glisse-la sur la fenêtre pour l'envoyer en fichier.");
         return;
@@ -2045,6 +2051,26 @@ async function startScreenNative(g, target) {
         screenBusy = false;
     }
 }
+/** Bannière d'offre de fichier de groupe : la PREMIÈRE offre en attente, sa destination,
+ *  et combien d'autres attendent. Cachée quand la file est vide. */
+function paintGfileOffer() {
+    const o = S.gfileOffers[0];
+    if (!o) {
+        $("#gfileOfferBanner").classList.add("hidden");
+        return;
+    }
+    const reste = S.gfileOffers.length - 1;
+    $("#gfileOfferText").textContent =
+        "📥 (groupe) « " + o.name + " » (" + fmt(o.size) + ") de " + memberName(o.from || "") +
+            (o.dir ? " → " + o.dir : "") + " — accepter ?" + (reste ? " (+" + reste + " en attente)" : "");
+    $("#gfileOfferBanner").classList.remove("hidden");
+}
+function answerGfileOffer(accept) {
+    const o = S.gfileOffers.shift();
+    if (o)
+        invoke("respond_gfile", { id: o.id, accept }).catch((e) => log("Réponse à l'offre de fichier : " + e));
+    paintGfileOffer();
+}
 export function initGroups() {
     initNativeVideoRx();
     // Micro/haut-parleur perdu en plein appel de groupe (casque débranché) : Rust a arrêté la
@@ -2271,8 +2297,11 @@ export function initGroups() {
             return;
         }
         invoke("send_gfile", { members: g.members, path })
-            .then(() => {
-            log("📎 Fichier envoyé au groupe.");
+            .then((n) => {
+            // « proposé » et non « envoyé » : chaque membre doit encore l'accepter. Le résultat
+            // par membre arrive par ghost-gsend-result (avant : jeté côté Rust, donc un envoi
+            // refusé par tous s'affichait quand même comme réussi).
+            log("📎 Fichier proposé à " + n + " membre(s) en ligne.");
             $("#groupFilePath").value = "";
         })
             .catch((e) => log("Fichier groupe : " + e));
@@ -2619,42 +2648,68 @@ export function initGroups() {
     });
     listen("ghost-grecv-done", (e) => {
         const p = e.payload || {};
-        log("✅ Reçu (groupe) : " + (p.name || ""));
-        // LIMITATION (Task 3.4) : contrairement au 1-à-1 (ghost-recv-done), l'événement
-        // groupe ne porte pas de `path` (voir tauri.ts, Events["ghost-grecv-done"] =
-        // { name?: string }) — impossible d'appeler read_image_bytes ici sans fabriquer
-        // un chemin. Une grosse image (> 5 Mo) envoyée en groupe reste donc une entrée
-        // fichier normale, sans rendu inline à la réception. L'inline groupe ≤ 5 Mo
-        // (ghost-gchat-img, envoyé via send_gimg) fonctionne normalement.
+        // Le CHEMIN est affiché (le 1-à-1 le montrait déjà) : sans lui, l'utilisateur ne savait
+        // pas où chercher le fichier qu'il venait d'accepter.
+        log("✅ Reçu (groupe) : " + (p.name || "") + (p.from ? " de " + memberName(p.from) : "") + (p.path ? " → " + p.path : ""));
+        // Grosse image (> 5 Mo, repli fichier d'une image glissée) : aperçu dans la conversation.
+        // net.rs émet bien `path` — un ancien commentaire affirmait le contraire, d'après un type
+        // qui l'omettait. LIMITE : le protocole GKIND_GFILE ne porte pas le groupe ; on n'affiche
+        // donc que si l'expéditeur est membre du groupe OUVERT (sinon : la ligne ci-dessus seule).
+        const mime = p.name ? guessImageMime(p.name) : null;
+        const g = loadGroups().find((x) => x.id === S.openGroupId);
+        const from = p.from || "";
+        if (!mime || !p.path || !g || !g.members.includes(from))
+            return;
+        invoke("read_image_bytes", { path: p.path })
+            .then((buf) => {
+            if (S.openGroupId !== g.id)
+                return; // groupe changé pendant la lecture
+            addImgBubble($("#groupChatLog"), URL.createObjectURL(new Blob([versOctets(buf)], { type: mime })), "them", memberName(from), from);
+        })
+            .catch((err) => log("Aperçu de l'image impossible (" + err + ") — le fichier est bien reçu : " + (p.path || "")));
     });
     listen("ghost-grecv-offer", (e) => {
-        const p = e.payload || {};
-        // Une offre précédente est encore en attente : la refuser explicitement avant que la
-        // bannière ne soit écrasée — sinon son id est perdu et l'expéditeur resterait bloqué
-        // en attente (aucun respond_gfile ne partirait jamais pour elle).
-        if (S.gfileOfferId != null && S.gfileOfferId !== (p.id ?? null))
-            invoke("respond_gfile", { id: S.gfileOfferId, accept: false }).catch(() => { });
-        S.gfileOfferId = p.id ?? null;
-        $("#gfileOfferText").textContent =
-            '📥 (groupe) « ' + (p.name || "fichier") + " » (" + fmt(p.size || 0) + ") de " + memberName(p.from || "") + " — accepter ?";
-        $("#gfileOfferBanner").classList.remove("hidden");
+        const p = e.payload;
+        if (!p)
+            return;
+        const from = p.from || "";
+        // DURCISSEMENT (M8) : le maillage accepte tout AMI, y compris un membre exclu par vote
+        // (applyKick ne touche pas Settings.friends). Un fichier « de groupe » n'est légitime
+        // que venant d'un membre d'au moins un de mes groupes — le protocole ne dit pas lequel.
+        if (!loadGroups().some((g) => g.members.includes(from))) {
+            invoke("respond_gfile", { id: p.id, accept: false }).catch(() => { });
+            log("⛔ Fichier « " + (p.name || "") + " » refusé : " + memberName(from) + " n'est membre d'aucun de tes groupes.");
+            return;
+        }
+        // File d'attente : avant, une deuxième offre REFUSAIT la première en silence — ni
+        // l'utilisateur ni l'expéditeur n'en savaient rien.
+        S.gfileOffers.push({ id: p.id, name: p.name || "fichier", size: p.size || 0, dir: p.dir, from });
+        paintGfileOffer();
     });
-    $("#btnGfileAccept").onclick = () => {
-        if (S.gfileOfferId != null)
-            invoke("respond_gfile", { id: S.gfileOfferId, accept: true }).catch(() => { });
-        $("#gfileOfferBanner").classList.add("hidden");
-        S.gfileOfferId = null;
-    };
+    $("#btnGfileAccept").onclick = () => answerGfileOffer(true);
     $("#btnGfileReject").onclick = () => {
-        if (S.gfileOfferId != null)
-            invoke("respond_gfile", { id: S.gfileOfferId, accept: false }).catch(() => { });
-        $("#gfileOfferBanner").classList.add("hidden");
-        S.gfileOfferId = null;
+        answerGfileOffer(false);
         log("Fichier de groupe refusé.");
     };
     listen("ghost-grecv-rejected", (e) => {
         const p = e.payload || {};
+        // Refus ou expiration (120 s) : retirer l'offre de la file.
+        if (p.id != null) {
+            S.gfileOffers = S.gfileOffers.filter((o) => o.id !== p.id);
+            paintGfileOffer();
+        }
         log("Fichier de groupe refusé : " + (p.name || ""));
+    });
+    // Résultat, membre par membre, d'un fichier de groupe que J'ENVOIE (le Rust jetait ce
+    // résultat : un fichier refusé par tous s'affichait quand même « envoyé »).
+    listen("ghost-gsend-result", (e) => {
+        const p = e.payload;
+        if (!p)
+            return;
+        if (p.ok)
+            log("📤 « " + p.name + " » envoyé à " + memberName(p.peer) + ".");
+        else
+            log("⛔ « " + p.name + " » non reçu par " + memberName(p.peer) + " : " + (p.error || "échec") + ".");
     });
     listen("ghost-grecv-corrupt", (e) => {
         const p = e.payload || {};

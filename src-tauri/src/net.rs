@@ -155,9 +155,33 @@ pub struct Settings {
     pub gfile_counter: Arc<AtomicU64>,
     // F5 : horodatage de la derniere demande de connexion par pair (anti-spam de la banniere).
     pub rate: Arc<StdMutex<HashMap<String, std::time::Instant>>>,
+    /// Fichiers EFFECTIVEMENT reçus pendant cette session (chemins canoniques, bornés) : seule
+    /// autorisation de lecture de `read_image_bytes` pour l'aperçu d'une image reçue. Même
+    /// motif que `DroppedPaths` (main.rs) : alimenté uniquement par le code réseau, jamais par
+    /// une commande. Remplace l'ancien confinement « tout ce qui est sous le dossier de
+    /// réception », contournable en deux appels : `set_download_dir("C:\\")` puis lecture.
+    pub received: Arc<StdMutex<std::collections::VecDeque<PathBuf>>>,
 }
 
+/// Borne du registre des fichiers reçus (les plus anciens sortent en premier).
+const MAX_RECEIVED: usize = 64;
+
 impl Settings {
+    /// Mémorise un fichier que NOUS venons d'écrire et de vérifier (intégrité OK).
+    pub fn note_received(&self, p: &Path) {
+        if let Ok(c) = p.canonicalize() {
+            let mut r = self.received.lock().unwrap_or_else(|e| e.into_inner());
+            r.retain(|x| x != &c);
+            r.push_back(c);
+            while r.len() > MAX_RECEIVED {
+                r.pop_front();
+            }
+        }
+    }
+    /// `p` (déjà canonique) est-il un fichier reçu pendant cette session ?
+    pub fn was_received(&self, p: &Path) -> bool {
+        self.received.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|x| x == p)
+    }
     /// Dossier de réception courant (configuré, sinon Téléchargements, sinon temp).
     fn recv_dir(&self) -> PathBuf {
         self.download_dir
@@ -838,7 +862,7 @@ async fn read_img_bytes<R: AsyncReadExt + Unpin>(recv: &mut R) -> anyhow::Result
         .map_err(|_| anyhow::anyhow!("image trop lente"))??;
     Ok((b, budget))
 }
-fn mime_ok(m: &str) -> bool {
+pub fn mime_ok(m: &str) -> bool {
     matches!(m, "image/png" | "image/jpeg" | "image/gif" | "image/webp")
 }
 
@@ -1473,7 +1497,12 @@ async fn recv_gfile<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     let offer_id = settings.gfile_counter.fetch_add(1, Ordering::SeqCst);
     let (otx, orx) = tokio::sync::oneshot::channel::<bool>();
     settings.gfile_pending.lock().unwrap_or_else(|e| e.into_inner()).insert(offer_id, otx);
-    let _ = app.emit("ghost-grecv-offer", serde_json::json!({ "id": offer_id, "name": name, "size": size, "from": from }));
+    // `dir` : le consentement doit dire OÙ le fichier va atterrir (la racine d'écriture est
+    // un réglage modifiable, pas une constante — recommandation #29 du 25/07).
+    let _ = app.emit(
+        "ghost-grecv-offer",
+        serde_json::json!({ "id": offer_id, "name": name, "size": size, "from": from, "dir": settings.recv_dir().to_string_lossy() }),
+    );
     let accepted = matches!(
         tokio::time::timeout(std::time::Duration::from_secs(120), orx).await,
         Ok(Ok(true))
@@ -1490,14 +1519,15 @@ async fn recv_gfile<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
 
     // Pré-allouer le fichier + enregistrer le transfert (les flux GKIND_GFDATA le rempliront).
     let dir = settings.recv_dir();
-    let dest = unique_path(&dir, &name);
-    let created = async {
-        let f = tokio::fs::File::create(&dest).await?;
-        f.set_len(size).await?;
-        anyhow::Ok(f)
-    }
-    .await;
-    let file = match created { Ok(f) => f, Err(_) => return Ok(()) };
+    let (dest, file) = match create_recv_file(&dir, &name, size).await {
+        Ok(v) => v,
+        Err(e) => {
+            // L'utilisateur vient de cliquer « Accepter » : un `return` muet ici (dossier de
+            // réception sur un disque débranché, droits, disque plein) le laissait sans rien.
+            let _ = app.emit("ghost-recv-failed", serde_json::json!({ "name": name, "from": from, "error": e.to_string() }));
+            return Ok(());
+        }
+    };
     let inb = Arc::new(Inbound {
         file: tokio::sync::Mutex::new(file),
         received: AtomicU64::new(0),
@@ -1526,6 +1556,7 @@ async fn recv_gfile<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
     }
     let ok_hash = done && sha256_file(&dest, None).await.map(|h| h == hash).unwrap_or(false);
     if ok_hash {
+        settings.note_received(&dest); // autorise son aperçu par read_image_bytes
         let _ = app.emit("ghost-grecv-done", serde_json::json!({ "name": name, "from": from, "path": dest.to_string_lossy() }));
     } else {
         let _ = tokio::fs::remove_file(&dest).await;
@@ -1535,7 +1566,9 @@ async fn recv_gfile<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
 }
 
 /// Envoie un fichier à tous les membres en ligne du groupe (un flux par membre, sans accusé).
-pub async fn send_gfile(net: &Net, members: Vec<String>, path: &str) -> anyhow::Result<()> {
+/// Renvoie le nombre de membres à qui le fichier est PROPOSÉ ; le résultat de chacun
+/// (accepté et envoyé, refusé, échec) arrive ensuite par `ghost-gsend-result`.
+pub async fn send_gfile(net: &Net, members: Vec<String>, path: &str) -> anyhow::Result<usize> {
     let conns = group_conns(net, &members);
     if conns.is_empty() {
         anyhow::bail!("aucun membre du groupe en ligne");
@@ -1558,14 +1591,22 @@ pub async fn send_gfile(net: &Net, members: Vec<String>, path: &str) -> anyhow::
     let hash = sha256_file(Path::new(&read_path), None)
         .await
         .map_err(|e| anyhow::anyhow!("hash: {e}"))?;
-    for (_peer, conn) in conns {
+    let n = conns.len();
+    for (peer, conn) in conns {
         let name = name.clone();
         let path = read_path.clone();
+        let app = net.app.clone();
         tokio::spawn(async move {
-            let _ = send_one_gfile(&conn, &path, &name, size, hash).await;
+            // Le résultat était jeté (`let _ =`) : si tout le monde refusait, l'expéditeur
+            // lisait quand même « 📎 Fichier envoyé au groupe ».
+            let r = send_one_gfile(&conn, &path, &name, size, hash).await;
+            let _ = app.emit(
+                "ghost-gsend-result",
+                serde_json::json!({ "name": name, "peer": peer, "ok": r.is_ok(), "error": r.err().map(|e| e.to_string()) }),
+            );
         });
     }
-    Ok(())
+    Ok(n)
 }
 
 /// Nettoie les métadonnées du fichier avant envoi (meta.rs) et prévient l'UI du
@@ -2204,7 +2245,11 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                     let offer_id = settings.file_counter.fetch_add(1, Ordering::SeqCst);
                     let (otx, orx) = tokio::sync::oneshot::channel::<bool>();
                     settings.file_pending.lock().unwrap_or_else(|e| e.into_inner()).insert(offer_id, otx);
-                    let _ = a.emit("ghost-recv-offer", serde_json::json!({ "id": offer_id, "name": name, "size": size }));
+                    // `dir` : le consentement dit OÙ le fichier va atterrir (cf. groupe).
+                    let _ = a.emit(
+                        "ghost-recv-offer",
+                        serde_json::json!({ "id": offer_id, "name": name, "size": size, "dir": settings.recv_dir().to_string_lossy() }),
+                    );
                     let accepted = matches!(
                         tokio::time::timeout(std::time::Duration::from_secs(120), orx).await,
                         Ok(Ok(true))
@@ -2219,16 +2264,17 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                     let _ = AsyncWriteExt::write_all(&mut send, &[1u8]).await;
 
                     let dir = settings.recv_dir();
-                    let dest = unique_path(&dir, &name);
-                    let created = async {
-                        let f = tokio::fs::File::create(&dest).await?;
-                        f.set_len(size).await?; // pré-allouer : les flux écrivent à leur offset
-                        anyhow::Ok(f)
-                    }
-                    .await;
-                    let file = match created {
-                        Ok(f) => f,
-                        Err(_) => return,
+                    // Pré-allouer : les flux écrivent à leur offset. Jamais d'écrasement.
+                    let (dest, file) = match create_recv_file(&dir, &name, size).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // Acceptation déjà envoyée : un `return` muet laissait l'utilisateur
+                            // (qui vient de cliquer « Accepter ») et l'émetteur sans rien. Le
+                            // reset fait échouer l'émetteur tout de suite au lieu d'attendre.
+                            let _ = send.reset(0u32.into());
+                            let _ = a.emit("ghost-recv-failed", serde_json::json!({ "name": name, "error": e.to_string() }));
+                            return;
+                        }
                     };
                     let inb = Arc::new(Inbound {
                         file: tokio::sync::Mutex::new(file),
@@ -2279,6 +2325,7 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                     if ok_hash {
                         let _ = AsyncWriteExt::write_all(&mut send, b"ok").await;
                         let _ = send.finish();
+                        settings.note_received(&dest); // autorise son aperçu par read_image_bytes
                         let _ = a.emit("ghost-recv-done", serde_json::json!({ "name": name, "size": size, "path": dest.to_string_lossy() }));
                     } else {
                         let _ = tokio::fs::remove_file(&dest).await;
@@ -2703,11 +2750,15 @@ fn sanitize(name: &str) -> String {
     cleaned
 }
 
-fn unique_path(dir: &Path, name: &str) -> PathBuf {
-    let p = dir.join(name);
-    if !p.exists() {
-        return p;
-    }
+/// Crée le fichier de réception SANS JAMAIS écraser : `create_new` échoue si le nom est
+/// pris, on essaie alors le suivant (« nom (1).ext »…). Renvoie le chemin retenu.
+///
+/// Remplace `unique_path` + `File::create` : entre le test `exists()` et la création (qui
+/// TRONQUE), il y avait des `await` — deux réceptions simultanées du même nom visaient le
+/// même chemin, la seconde tronquait la première, et la suppression après un échec
+/// d'intégrité pouvait effacer le fichier de l'autre. Après 9 999 homonymes, l'ancien code
+/// retombait même sur le nom d'origine, c'est-à-dire sur l'écrasement d'un fichier existant.
+async fn create_unique(dir: &Path, name: &str) -> std::io::Result<(PathBuf, tokio::fs::File)> {
     let stem = Path::new(name)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -2718,13 +2769,27 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
         .and_then(|s| s.to_str())
         .map(|e| format!(".{e}"))
         .unwrap_or_default();
-    for i in 1..10000 {
-        let cand = dir.join(format!("{stem} ({i}){ext}"));
-        if !cand.exists() {
-            return cand;
+    for i in 0..10000u32 {
+        let cand = if i == 0 { dir.join(name) } else { dir.join(format!("{stem} ({i}){ext}")) };
+        match tokio::fs::OpenOptions::new().write(true).create_new(true).open(&cand).await {
+            Ok(f) => return Ok((cand, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
     }
-    dir.join(name)
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "trop de fichiers homonymes"))
+}
+
+/// Crée puis pré-alloue le fichier de réception ; en cas d'échec de la pré-allocation (disque
+/// plein), ne laisse pas de fichier vide derrière soi.
+async fn create_recv_file(dir: &Path, name: &str, size: u64) -> anyhow::Result<(PathBuf, tokio::fs::File)> {
+    let (dest, f) = create_unique(dir, name).await?;
+    if let Err(e) = f.set_len(size).await {
+        drop(f);
+        let _ = tokio::fs::remove_file(&dest).await;
+        return Err(e.into());
+    }
+    Ok((dest, f))
 }
 
 #[cfg(test)]
@@ -2832,6 +2897,24 @@ mod tests {
         assert!(super::mesh_admit(&mesh, &idb, &nouvelle, nouvelle_sortante, &ida).is_some());
         a.close().await;
         b.close().await;
+    }
+
+    // ---- Réception : jamais d'écrasement d'un fichier existant ----
+
+    #[tokio::test]
+    async fn la_reception_n_ecrase_jamais_un_fichier_existant() {
+        let d = std::env::temp_dir().join("gl-create-unique");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("photo.jpg"), b"ORIGINAL").unwrap();
+        let (p1, f1) = super::create_unique(&d, "photo.jpg").await.unwrap();
+        let (p2, f2) = super::create_unique(&d, "photo.jpg").await.unwrap();
+        drop((f1, f2));
+        assert_eq!(p1.file_name().unwrap(), "photo (1).jpg");
+        assert_eq!(p2.file_name().unwrap(), "photo (2).jpg");
+        // L'ancien File::create TRONQUAIT : le fichier de l'utilisateur doit être intact.
+        assert_eq!(std::fs::read(d.join("photo.jpg")).unwrap(), b"ORIGINAL");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     // ---- sanitize : le nom vient du PAIR, c'est une entrée hostile ----

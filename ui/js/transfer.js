@@ -1,66 +1,69 @@
 // Transfert de fichiers 1-à-1 (envoi/réception + accord) + chat texte + glisser-déposer.
 import { invoke, listen } from "./tauri.js";
-import { $, log, fmt, etaStr, baseName, addImgBubble, clampLabel, playPing, trimTextBubbles } from "./dom.js";
+import { $, log, fmt, etaStr, baseName, addImgBubble, clampLabel, playPing, trimTextBubbles, guessImageMime, mimeImageAccepte, versOctets, } from "./dom.js";
 import { S, myName, memberName, isDeclaredLabel, loadGroups } from "./state.js";
 import { paintConvoUnread } from "./session.js";
 // Images/GIF inline (Task 3.4) : au-delà, pas de chemin fichier disponible pour
 // un `File` issu du picker/presse-papiers — repli documenté (log), pas d'échec silencieux.
 const MAX_INLINE_IMG = 5 * 1024 * 1024;
-/** Devine le mime à partir de l'extension (repli fichier → image reçue). */
-function guessImageMime(name) {
-    const n = name.toLowerCase();
-    if (n.endsWith(".png"))
-        return "image/png";
-    if (n.endsWith(".gif"))
-        return "image/gif";
-    if (n.endsWith(".webp"))
-        return "image/webp";
-    if (n.endsWith(".jpg") || n.endsWith(".jpeg"))
-        return "image/jpeg";
-    return null;
-}
-/** Octets d'une image DÉPOSÉE sur la fenêtre.
+/** Octets d'une image DÉPOSÉE sur la fenêtre, bornés à `MAX_INLINE_IMG`.
  *
  *  Rust n'autorise cette lecture que parce que le système lui a signalé le dépôt (registre
- *  `DroppedPaths`) : un chemin que l'utilisateur n'a pas glissé reste illisible. `null` =
- *  illisible ou trop volumineuse pour la lecture bornée — l'appelant se replie sur le fichier. */
+ *  `DroppedPaths`) : un chemin que l'utilisateur n'a pas glissé reste illisible. Rust vérifie
+ *  la taille AVANT de lire. On distingue « trop grande » (le seul cas où le repli en fichier
+ *  a un sens) de toute autre cause, qui est rapportée telle quelle : la v0.37.2 ramenait
+ *  TOUT échec à « dépasse 5 Mo », même pour une image de 200 Ko verrouillée ou refusée. */
 async function lireImageDeposee(p) {
     try {
-        return await invoke("read_image_bytes", { path: p });
+        return { ok: true, bytes: versOctets(await invoke("read_image_bytes", { path: p, max: MAX_INLINE_IMG })) };
     }
-    catch {
-        return null; // l'appelant explique et propose le repli — pas d'échec muet
+    catch (e) {
+        const raison = String(e);
+        return { ok: false, tropGrande: raison.startsWith("TROP_GRANDE"), raison };
     }
 }
-/** Demande confirmation avant qu'une image trop lourde ne devienne un FICHIER chez le pair.
- *  C'est le seul cas où un dépôt d'image atterrit dans les Téléchargements de quelqu'un :
- *  il ne doit pas se produire dans le dos de l'utilisateur. */
-function accepteRepliFichier(nom) {
+/** Demande confirmation avant qu'une image trop lourde ne devienne un FICHIER chez le(s)
+ *  destinataire(s). C'est le seul cas où un dépôt d'image atterrit sur le disque de
+ *  quelqu'un : il ne doit pas se produire dans le dos de l'utilisateur. */
+function accepteRepliFichier(nom, groupe) {
     const ok = confirm("« " +
         nom +
         " » dépasse 5 Mo : trop lourde pour s'afficher dans la conversation.\n\n" +
-        "L'envoyer en fichier ? Elle atterrira dans les Téléchargements de ton correspondant.");
+        (groupe
+            ? "L'envoyer en fichier ? Chaque membre devra l'accepter, et elle atterrira dans son dossier de réception."
+            : "L'envoyer en fichier ? Elle atterrira dans les Téléchargements de ton correspondant."));
     if (!ok)
         log("Envoi annulé — « " + nom + " » n'a pas été envoyée.");
     return ok;
 }
+/** Image déposée mais illisible pour une AUTRE raison que sa taille : le dire, et préparer
+ *  l'envoi en fichier SANS le lancer (déposer n'est pas un ordre d'envoi). */
+function imageIllisible(nom, raison, groupe) {
+    log("🖼️ « " + nom + " » ne peut pas s'afficher dans la conversation (" + raison + ") — " +
+        (groupe ? "prête pour le groupe, clique « 📎 Envoyer »." : "prête à partir en fichier, clique « Envoyer »."));
+}
 /** Dépôt dans une conversation 1-à-1 : image/GIF → inline, tout le reste → fichier. */
 async function deposer1a1(p, mime) {
     if (mime) {
-        const bytes = await lireImageDeposee(p);
-        if (bytes && bytes.length <= MAX_INLINE_IMG) {
+        const r = await lireImageDeposee(p);
+        if (r.ok) {
             try {
-                await invoke("send_img", { author: myName(), name: baseName(p), mime, data: bytes });
-                addImgBubble($("#chatLog"), URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: mime })), "me");
+                await invoke("send_img", { author: myName(), name: baseName(p), mime, data: Array.from(r.bytes) });
+                addImgBubble($("#chatLog"), URL.createObjectURL(new Blob([r.bytes], { type: mime })), "me");
             }
             catch (e) {
                 log("Image : " + e);
             }
             return;
         }
+        if (!r.tropGrande) {
+            imageIllisible(baseName(p), r.raison, false);
+            setFile(p);
+            return;
+        }
         // Image trop lourde : l'envoi en fichier vient d'être explicitement confirmé, donc on
         // le lance. On passe par le bouton pour réutiliser toute son UI (débit, annulation).
-        if (!accepteRepliFichier(baseName(p)))
+        if (!accepteRepliFichier(baseName(p), false))
             return;
         setFile(p);
         $("#btnSend").click();
@@ -81,8 +84,8 @@ async function deposerGroupe(p, mime) {
         return;
     }
     if (mime) {
-        const bytes = await lireImageDeposee(p);
-        if (bytes && bytes.length <= MAX_INLINE_IMG) {
+        const r = await lireImageDeposee(p);
+        if (r.ok) {
             try {
                 await invoke("send_gimg", {
                     members: g.members,
@@ -90,26 +93,33 @@ async function deposerGroupe(p, mime) {
                     author: myName(),
                     name: baseName(p),
                     mime,
-                    data: bytes,
+                    data: Array.from(r.bytes),
                 });
                 // L'utilisateur a pu changer de groupe pendant les await : ne pas écrire ma bulle
                 // dans le journal d'un AUTRE groupe (même garde que sendImageGroup).
                 if (S.openGroupId !== g.id)
                     return;
-                addImgBubble($("#groupChatLog"), URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: mime })), "me");
+                addImgBubble($("#groupChatLog"), URL.createObjectURL(new Blob([r.bytes], { type: mime })), "me");
             }
             catch (e) {
                 log("Image de groupe : " + e);
             }
             return;
         }
+        if (!r.tropGrande) {
+            imageIllisible(baseName(p), r.raison, true);
+            $("#groupFilePath").value = p;
+            return;
+        }
         // Image trop lourde et envoi confirmé : la confirmation EST l'ordre d'envoi.
-        if (!accepteRepliFichier(baseName(p)))
+        if (!accepteRepliFichier(baseName(p), true))
             return;
         $("#groupFilePath").value = p;
         invoke("send_gfile", { members: g.members, path: p })
-            .then(() => {
-            log("📎 Fichier envoyé au groupe : " + baseName(p));
+            .then((n) => {
+            // « proposé », pas « envoyé » : chaque membre doit encore l'accepter (résultat par
+            // membre via ghost-gsend-result).
+            log("📎 « " + baseName(p) + " » proposé à " + n + " membre(s) en ligne.");
             $("#groupFilePath").value = "";
         })
             .catch((e) => log("Fichier groupe : " + e));
@@ -118,6 +128,26 @@ async function deposerGroupe(p, mime) {
     // Fichier ordinaire : on PRÉPARE l'envoi, on ne le déclenche pas (cf. deposer1a1).
     $("#groupFilePath").value = p;
     log("📎 « " + baseName(p) + " » prêt pour le groupe — clique « 📎 Envoyer ».");
+}
+/** Bannière d'offre de fichier : montre la PREMIÈRE offre en attente, sa destination, et
+ *  combien d'autres attendent derrière. Cachée quand la file est vide. */
+function paintFileOffer() {
+    const o = S.fileOffers[0];
+    if (!o) {
+        $("#fileOfferBanner").classList.add("hidden");
+        return;
+    }
+    const reste = S.fileOffers.length - 1;
+    $("#fileOfferText").textContent =
+        "📥 « " + o.name + " » (" + fmt(o.size) + ")" + (o.dir ? " → " + o.dir : "") + " — accepter ce fichier ?" +
+            (reste ? " (+" + reste + " en attente)" : "");
+    $("#fileOfferBanner").classList.remove("hidden");
+}
+function answerFileOffer(accept) {
+    const o = S.fileOffers.shift();
+    if (o)
+        invoke("respond_file", { id: o.id, accept }).catch((e) => log("Réponse à l'offre de fichier : " + e));
+    paintFileOffer();
 }
 /** Vrai si la section `[data-view="<nom>"]` est actuellement AFFICHÉE.
  *  Même idiome que noteIncoming1to1 et watchingGroup : `view-hidden` = masquée. */
@@ -207,6 +237,13 @@ async function sendChat() {
 // presse-papiers (pas de chemin fichier disponible) — le glisser-déposer garde
 // le flux fichier existant (send_file) et se rend inline côté récepteur (repli plus bas).
 async function sendImage1to1(f) {
+    // BMP, SVG, AVIF, HEIC… (sélecteur « Tous les fichiers », ou copie depuis l'Explorateur) :
+    // le destinataire les jette. Le dire ici plutôt qu'afficher une bulle que l'autre ne verra
+    // jamais. Rust refuse de toute façon (send_img) — ceci évite juste le détour.
+    if (!mimeImageAccepte(f.type)) {
+        log("Image « " + (f.type || "type inconnu") + " » non prise en charge — PNG, JPEG, GIF ou WebP uniquement.");
+        return;
+    }
     if (f.size > MAX_INLINE_IMG) {
         log("Image > 5 Mo — glisse-la sur la fenêtre pour l'envoyer en fichier.");
         return;
@@ -365,8 +402,8 @@ export function initTransfer() {
         const mime = guessImageMime(name);
         if (mime) {
             invoke("read_image_bytes", { path })
-                .then((bytes) => {
-                const url = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: mime }));
+                .then((buf) => {
+                const url = URL.createObjectURL(new Blob([versOctets(buf)], { type: mime }));
                 addImgBubble($("#chatLog"), url, "them");
             })
                 // Un `.catch(() => {})` nu rendait l'échec TOTALEMENT invisible : le fichier
@@ -391,29 +428,37 @@ export function initTransfer() {
         log("⚠️ Espace disque insuffisant — fichier refusé : " + ((e.payload && e.payload.name) || ""));
     });
     // Acceptation d'un fichier entrant (avant réception)
+    // File d'attente des offres : une deuxième offre ne remplace plus la première (dont l'id
+    // était perdu — l'expéditeur attendait alors 120 s une réponse qui ne venait jamais).
     listen("ghost-recv-offer", (e) => {
-        const p = e.payload || {};
-        S.fileOfferId = p.id ?? null;
-        $("#fileOfferText").textContent =
-            '📥 « ' + (p.name || "fichier") + " » (" + fmt(p.size || 0) + ") — accepter ce fichier ?";
-        $("#fileOfferBanner").classList.remove("hidden");
+        const p = e.payload;
+        if (!p)
+            return;
+        S.fileOffers.push({ id: p.id, name: p.name || "fichier", size: p.size || 0, dir: p.dir });
+        paintFileOffer();
     });
-    $("#btnFileAccept").onclick = () => {
-        if (S.fileOfferId != null)
-            invoke("respond_file", { id: S.fileOfferId, accept: true }).catch(() => { });
-        $("#fileOfferBanner").classList.add("hidden");
-        S.fileOfferId = null;
-    };
+    $("#btnFileAccept").onclick = () => answerFileOffer(true);
     $("#btnFileReject").onclick = () => {
-        if (S.fileOfferId != null)
-            invoke("respond_file", { id: S.fileOfferId, accept: false }).catch(() => { });
-        $("#fileOfferBanner").classList.add("hidden");
-        S.fileOfferId = null;
+        answerFileOffer(false);
         log("Fichier refusé.");
     };
     listen("ghost-recv-rejected", (e) => {
         $("#recvBox").classList.add("hidden");
+        // Refus explicite OU expiration côté Rust (120 s) : retirer l'offre de la file.
+        const id = e.payload && e.payload.id;
+        if (id != null) {
+            S.fileOffers = S.fileOffers.filter((o) => o.id !== id);
+            paintFileOffer();
+        }
         log("Fichier refusé : " + ((e.payload && e.payload.name) || ""));
+    });
+    // Fichier ACCEPTÉ mais impossible à créer (1-à-1 et groupe) : un `return` muet côté Rust
+    // laissait l'utilisateur — qui venait de cliquer « Accepter » — sans aucune nouvelle.
+    listen("ghost-recv-failed", (e) => {
+        const p = e.payload || {};
+        $("#recvBox").classList.add("hidden");
+        log("⚠️ « " + (p.name || "fichier") + " » accepté mais impossible à enregistrer (" + (p.error || "?") +
+            ") — vérifie le dossier de réception dans Réglages.");
     });
     // Chat
     $("#btnChat").onclick = sendChat;

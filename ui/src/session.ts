@@ -102,7 +102,10 @@ function setDisconnected(): void {
   $("#recvBox").classList.add("hidden");
   $("#freqBanner").classList.add("hidden");
   $("#fileOfferBanner").classList.add("hidden");
-  S.fileOfferId = null;
+  // Les offres en attente appartenaient à la session qui se termine : les refuser
+  // explicitement plutôt que de les laisser expirer (120 s) sans réponse.
+  for (const o of S.fileOffers) invoke("respond_file", { id: o.id, accept: false }).catch(() => {});
+  S.fileOffers = [];
   hideCallOffer();
   if (S.inCall) {
     invoke("call_stop", { signal: false }).catch(() => {});

@@ -30,6 +30,15 @@ export interface GroupMsg {
   text: string;
   who: string;
 }
+/** Une offre de fichier entrante en attente de réponse (1-à-1 ou groupe). */
+export interface FileOffer {
+  id: number;
+  name: string;
+  size: number;
+  /** Dossier où le fichier atterrira (affiché dans le consentement). */
+  dir?: string;
+  from?: string;
+}
 export interface PcState {
   pc: RTCPeerConnection;
   makingOffer: boolean;
@@ -76,7 +85,10 @@ export const S = {
   rB: 0,
   rSpd: 0,
   rLast: 0,
-  fileOfferId: null as number | null,
+  // Offres de fichier en ATTENTE, dans l'ordre d'arrivée (la bannière montre la première).
+  // Avant : un seul id, écrasé par l'offre suivante — la précédente restait sans réponse
+  // (1-à-1 : l'expéditeur attendait 120 s) ou était refusée en silence (groupe).
+  fileOffers: [] as FileOffer[],
   // session / connexion entrante
   incomingId: null as number | null,
   // vocal 1-à-1
@@ -109,7 +121,7 @@ export const S = {
   // beacon ~1 Hz) — même hors appel. gid → (code → lastSeenMs). Pilote `.inbooth`
   // (pastille statique), SÉPARÉE de `.incall`/`.speaking` ci-dessus.
   voicePresence: {} as Record<string, Record<string, number>>,
-  gfileOfferId: null as number | null,
+  gfileOffers: [] as FileOffer[],
   // vidéo (WebRTC)
   localCam: null as MediaStream | null,
   localScreen: null as MediaStream | null,

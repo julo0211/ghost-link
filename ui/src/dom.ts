@@ -49,6 +49,32 @@ export function etaStr(sec: number): string {
   return h + " h " + (m % 60 < 10 ? "0" : "") + (m % 60) + " min";
 }
 
+/** Types d'image que le destinataire accepte (liste blanche de net.rs, `mime_ok`). */
+const MIMES_IMAGE = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+export function mimeImageAccepte(t: string): boolean {
+  return MIMES_IMAGE.includes(t);
+}
+
+/** Normalise une réponse binaire de Tauri en octets. `tauri::ipc::Response` arrive en
+ *  ArrayBuffer par le protocole IPC, mais en tableau de nombres par le repli postMessage
+ *  (constaté sur le canal vidéo, bench exp3 — cf. handleNativeFrame) : ne dépendre d'aucun. */
+export function versOctets(x: unknown): Uint8Array<ArrayBuffer> {
+  if (x instanceof ArrayBuffer) return new Uint8Array(x);
+  if (Array.isArray(x)) return Uint8Array.from(x as number[]);
+  if (ArrayBuffer.isView(x)) return Uint8Array.from(new Uint8Array(x.buffer, x.byteOffset, x.byteLength));
+  throw new Error("réponse binaire inattendue");
+}
+
+/** Devine le mime d'une image à partir de l'extension (dépôt, fichier reçu). */
+export function guessImageMime(name: string): string | null {
+  const n = name.toLowerCase();
+  if (n.endsWith(".png")) return "image/png";
+  if (n.endsWith(".gif")) return "image/gif";
+  if (n.endsWith(".webp")) return "image/webp";
+  if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
+  return null;
+}
+
 /** Nom de fichier depuis un chemin (Windows ou Unix). */
 export function baseName(p: string): string {
   return String(p).split(/[\\/]/).pop() || "";

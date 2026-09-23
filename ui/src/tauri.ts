@@ -73,7 +73,10 @@ export interface Commands {
   send_gchat: { args: { members: string[]; gid: string; name: string; text: string }; ret: void };
   send_img: { args: { author: string; name: string; mime: string; data: number[] }; ret: void };
   send_gimg: { args: { members: string[]; gid: string; author: string; name: string; mime: string; data: number[] }; ret: void };
-  read_image_bytes: { args: { path: string }; ret: number[] };
+  // Octets BRUTS (ArrayBuffer) et non un tableau JSON de nombres. `max` = plafond demandé :
+  // au-delà, l'erreur commence par « TROP_GRANDE: » (seul cas où le repli fichier est proposé).
+  // Type volontairement LARGE : toujours passer par versOctets (dom.ts).
+  read_image_bytes: { args: { path: string; max?: number }; ret: ArrayBuffer | number[] };
   group_call_start: { args: { members: string[]; gid: string; announce: boolean }; ret: void };
   group_call_stop: { args: void; ret: void };
   group_call_mute: { args: { on: boolean }; ret: void };
@@ -85,7 +88,9 @@ export interface Commands {
   screen_audio_stop: { args: void; ret: void };
   screen_audio_gain: { args: { peer: string; vol: number }; ret: void };
   send_signal: { args: { peer: string; data: string }; ret: void };
-  send_gfile: { args: { members: string[]; path: string }; ret: void };
+  // Nombre de membres à qui le fichier est PROPOSÉ ; le résultat de chacun arrive ensuite
+  // par ghost-gsend-result.
+  send_gfile: { args: { members: string[]; path: string }; ret: number };
   respond_gfile: { args: { id: number; accept: boolean }; ret: void };
   set_streams: { args: { n: number }; ret: void };
 
@@ -127,8 +132,12 @@ export interface Events {
   "ghost-recv-progress": { received: number; size: number };
   "ghost-recv-done": { name: string; size: number; path: string };
   "ghost-recv-cancel": { name: string };
-  "ghost-recv-offer": { id: number; name: string; size: number };
-  "ghost-recv-rejected": { name: string };
+  // `dir` = dossier où le fichier atterrira : le consentement doit dire OÙ.
+  "ghost-recv-offer": { id: number; name: string; size: number; dir?: string };
+  // `id` = l'offre refusée ou expirée (retirée de la file d'attente des offres).
+  "ghost-recv-rejected": { id?: number; name: string };
+  // Fichier ACCEPTÉ mais impossible à créer (dossier absent, droits, disque plein).
+  "ghost-recv-failed": { name?: string; error?: string; from?: string };
   "ghost-recv-corrupt": { name: string };
   "ghost-recv-nospace": { name?: string; size?: number; free?: number; from?: string };
 
@@ -162,9 +171,13 @@ export interface Events {
   "ghost-voice-presence": { group: string; code: string; inCall: boolean };
   "ghost-signal": { from?: string; data: string };
   "ghost-grecv-start": { name?: string; from?: string };
-  "ghost-grecv-done": { name?: string };
-  "ghost-grecv-offer": { id: number; name?: string; size?: number; from?: string };
-  "ghost-grecv-rejected": { name?: string };
+  // net.rs émet `path` et `from` depuis toujours : seul ce type les omettait, et un
+  // commentaire de groups.ts en avait conclu à tort que l'aperçu était impossible.
+  "ghost-grecv-done": { name?: string; from?: string; path?: string };
+  "ghost-grecv-offer": { id: number; name?: string; size?: number; from?: string; dir?: string };
+  "ghost-grecv-rejected": { id?: number; name?: string };
+  // Résultat, pour UN membre, d'un fichier de groupe que j'envoie.
+  "ghost-gsend-result": { name: string; peer: string; ok: boolean; error?: string | null };
   "ghost-grecv-corrupt": { name?: string; from?: string };
   "ghost-video-ended": { reason?: string };
   "ghost-video-rx-end": string;
