@@ -146,6 +146,9 @@ section[data-view]{flex:1 1 auto;min-height:0}
 .conn{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:600;padding:8px 12px;border-radius:8px;margin:0 0 14px;background:var(--rail);color:var(--text)}
 .conn .dot{background:var(--faint);margin:0}
 .s-ok .dot{background:var(--good)}
+.s-wait .dot{background:var(--warn);animation:ppulse 1s ease-in-out infinite}
+.s-err{align-items:flex-start;line-height:1.45;font-weight:500;border:1px solid var(--bad)}
+.s-err .dot{background:var(--bad);flex:0 0 auto;margin-top:5px}
 
 /* ---------- Régions « conversation » ---------- */
 .center-panel{display:flex;flex-direction:column;min-height:0;overflow:hidden;background:var(--chat)}

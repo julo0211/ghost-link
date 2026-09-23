@@ -23,6 +23,12 @@
 - [ ] Même test en appel **1-à-1** → message « 🎧 Appel coupé… », le pair voit l'appel se terminer.
 
 ## 2. Session 1-à-1 et code éphémère (2 personnes)
+- [ ] **(v0.38.1)** B coche « N'accepter que les connexions de mes amis » ; A (pas encore ami)
+      se connecte au code de B → A lit TOUT DE SUITE, dans l'écran de connexion, « ce pair n'accepte
+      que les connexions de ses amis… » (avant : rien ne se passait, l'erreur n'allait que dans le
+      Journal caché des Réglages). Puis A et B s'ajoutent mutuellement → la connexion passe.
+- [ ] **(v0.38.1)** B relance son appli (son code du moment change), A compose l'ANCIEN code →
+      message « pair injoignable… ce code n'est plus valable », pas de silence.
 - [ ] B donne son **code éphémère** à A ; A s'y connecte ; B clique « 🔄 Nouveau code » →
       confirmation « Ta session en cours passe par ton code éphémère… ». Si B confirme : **les deux**
       voient « Déconnecté » tout de suite (avant : session morte en silence, messages perdus).

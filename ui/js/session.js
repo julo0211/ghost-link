@@ -41,26 +41,34 @@ export function showTab(name) {
     if (layout)
         layout.classList.toggle("no-members", !grp);
 }
+/** État affiché DANS l'écran de connexion. Le Journal vit dans les Réglages, fermés par
+ *  défaut : un échec de connexion qui n'allait que là passait pour « rien ne se passe »
+ *  (vécu sur la v0.38.0 — un pair réglé sur « amis uniquement » refusait en silence). */
+function setConnStatus(etat, texte) {
+    $("#connStatus").className = "conn s-" + etat;
+    $("#connStatus").querySelector(".conn-text").textContent = texte;
+}
 export async function connectTo(addr) {
     addr = (addr || "").trim();
     if (!addr) {
-        log("Entre un code ami ou une adresse.");
+        setConnStatus("err", "Colle d'abord le code du pair.");
         return;
     }
     $("#btnConnect").disabled = true;
+    setConnStatus("wait", "Connexion… en attente de l'acceptation du pair (45 s max).");
     log("Connexion… (en attente de l'acceptation du pair)");
     try {
         await invoke("connect", { addr });
     }
     catch (e) {
+        setConnStatus("err", "Connexion impossible : " + e);
         log("Erreur connexion : " + e);
         $("#btnConnect").disabled = false;
     }
 }
 function setConnected(peer) {
     S.currentPeer = peer;
-    $("#connStatus").className = "conn s-ok";
-    $("#connStatus").querySelector(".conn-text").textContent = "Connecté à " + memberName(peer);
+    setConnStatus("ok", "Connecté à " + memberName(peer));
     $("#peerLabel").textContent = "Connecté à " + memberName(peer);
     $("#connectForm").classList.add("hidden");
     $("#sessionBox").classList.remove("hidden");
@@ -93,8 +101,7 @@ function setDisconnected() {
     const convo = document.getElementById("railConvo");
     if (convo)
         convo.innerHTML = '<div class="empty">Aucune session.</div>';
-    $("#connStatus").className = "conn s-idle";
-    $("#connStatus").querySelector(".conn-text").textContent = "Déconnecté";
+    setConnStatus("idle", "Déconnecté");
     $("#sessionBox").classList.add("hidden");
     $("#connectForm").classList.remove("hidden");
     $("#btnConnect").disabled = false;
@@ -189,5 +196,9 @@ export function initSession() {
         log("Déconnecté.");
         setDisconnected();
     });
-    listen("ghost-refused", (e) => log("⛔ Connexion refusée (pair pas dans tes amis) : " + memberName(e.payload)));
+    // Journal seulement (pas de bannière) : un inconnu pourrait sinon inonder l'écran. Le
+    // COMPOSEUR, lui, lit désormais la raison dans son écran de connexion.
+    listen("ghost-refused", (e) => log("⛔ Connexion refusée (« N'accepter que les connexions de mes amis ») : " +
+        memberName(e.payload) +
+        " — un inconnu, ou un ami qui ne t'a pas encore ajouté de son côté (il compose alors avec son code du moment)."));
 }

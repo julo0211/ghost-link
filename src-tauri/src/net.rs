@@ -1894,6 +1894,60 @@ fn est_refus_de_presence(e: &iroh::endpoint::ConnectionError) -> bool {
     matches!(e, iroh::endpoint::ConnectionError::ApplicationClosed(c) if c.reason.as_ref() == b"not-a-friend")
 }
 
+/// Poignée de main applicative du composeur : on n'est « connecté » qu'une fois que le pair
+/// a ACCEPTÉ (côté récepteur, l'ack n'est envoyé qu'après le clic « Accepter »). Évite le
+/// faux « Connecté » suivi d'un « Déconnecté » quand le pair refuse.
+///
+/// En cas d'échec, l'erreur dit POURQUOI. `Ghost::accept` ferme avec un motif précis, mais
+/// on renvoyait « connexion refusée ou pair injoignable » quel qu'il soit : un non-ami qui
+/// composait un pair réglé sur « amis uniquement » ne pouvait pas deviner qu'il lui suffisait
+/// d'être ajouté (vécu sur la v0.38.0 : « rien ne se passe »).
+async fn poignee_de_main(conn: &Connection) -> anyhow::Result<()> {
+    let essai = async {
+        let (mut s, mut r) = conn.open_bi().await?;
+        AsyncWriteExt::write_all(&mut s, &[KIND_HELLO]).await?;
+        let _ = s.finish();
+        let mut ack = [0u8; 1];
+        AsyncReadExt::read_exact(&mut r, &mut ack).await?;
+        anyhow::ensure!(ack[0] == 1, "réponse inattendue du pair");
+        anyhow::Ok(())
+    };
+    // 50 s : au-delà des 45 s d'attente de la bannière chez le pair, dont le « refused »
+    // arrive donc toujours avant.
+    let echec = match tokio::time::timeout(std::time::Duration::from_secs(50), essai).await {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(e)) => Some(e),
+        Err(_) => None,
+    };
+    // Lire le motif AVANT de fermer nous-mêmes (sinon on ne lirait que notre propre fermeture).
+    let motif = conn.close_reason().as_ref().and_then(motif_de_refus);
+    conn.close(0u32.into(), b"no-hello");
+    Err(match (motif, echec) {
+        (Some(m), _) => anyhow::anyhow!("{m}"),
+        (None, None) => anyhow::anyhow!("pas de réponse du pair en 50 s."),
+        (None, Some(e)) => anyhow::anyhow!("connexion interrompue avant l'acceptation ({e})."),
+    })
+}
+
+/// Motifs de fermeture posés par `Ghost::accept` : c'est un CONTRAT avec `poignee_de_main`,
+/// qui les traduit ici pour l'utilisateur. En ajouter un là-bas = l'ajouter ici.
+fn motif_de_refus(e: &iroh::endpoint::ConnectionError) -> Option<&'static str> {
+    let iroh::endpoint::ConnectionError::ApplicationClosed(c) = e else {
+        return None;
+    };
+    Some(match c.reason.as_ref() {
+        b"not-a-friend" => {
+            "ce pair n'accepte que les connexions de ses amis. Ajoutez-vous MUTUELLEMENT en amis \
+             (codes permanents) puis reconnecte-toi — ou demande-lui de décocher « N'accepter que \
+             les connexions de mes amis » dans ses Réglages."
+        }
+        b"refused" => "le pair a refusé la connexion (ou n'a pas répondu dans les 45 s).",
+        b"busy" => "le pair a déjà trop de demandes de connexion en attente : réessaie dans un moment.",
+        b"rate-limited" => "tentative trop rapprochée de la précédente : réessaie dans 2 s.",
+        _ => return None,
+    })
+}
+
 pub async fn connect(net: &Net, input: &str) -> anyhow::Result<String> {
     let input = input.trim();
     // Accepte soit une adresse complète (JSON), soit un simple « code » (EndpointId).
@@ -1916,34 +1970,14 @@ pub async fn connect(net: &Net, input: &str) -> anyhow::Result<String> {
         let ep = net.eph.lock().await.endpoint.clone();
         ep.connect(addr, ALPN).await
     }
-    .map_err(|e| anyhow::anyhow!("connexion: {e}"))?;
-
-    // Poignée de main applicative : on n'est « connecté » qu'une fois que le pair a
-    // ACCEPTÉ (côté récepteur, l'ack n'est envoyé qu'après le clic « Accepter »).
-    // Évite le faux « Connecté » suivi d'un « Déconnecté » quand le pair refuse.
-    {
-        let (mut s, mut r) = conn
-            .open_bi()
-            .await
-            .map_err(|e| anyhow::anyhow!("ouverture du flux: {e}"))?;
-        AsyncWriteExt::write_all(&mut s, &[KIND_HELLO])
-            .await
-            .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
-        let _ = s.finish();
-        let mut ack = [0u8; 1];
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(50),
-            AsyncReadExt::read_exact(&mut r, &mut ack),
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "pair injoignable : il est hors ligne, ou ce code n'est plus valable (un code du \
+             moment change à chaque lancement de son appli et quand il clique « Changer »). ({e})"
         )
-        .await
-        {
-            Ok(Ok(_)) if ack[0] == 1 => {}
-            _ => {
-                conn.close(0u32.into(), b"no-hello");
-                return Err(anyhow::anyhow!("connexion refusée ou pair injoignable"));
-            }
-        }
-    }
+    })?;
+
+    poignee_de_main(&conn).await?;
 
     let peer = conn.remote_id().to_string();
     let app2 = net.app.clone();
@@ -2852,12 +2886,79 @@ mod tests {
     // de deux connexions croisées qui tuait le maillage (reproduit 27/30, cf. mesh_admit).
 
     async fn ep_local() -> iroh::Endpoint {
+        ep_local_alpn(super::GROUP_ALPN).await
+    }
+
+    async fn ep_local_alpn(alpn: &[u8]) -> iroh::Endpoint {
         iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
             .relay_mode(iroh::RelayMode::Disabled)
-            .alpns(vec![super::GROUP_ALPN.to_vec()])
+            .alpns(vec![alpn.to_vec()])
             .bind()
             .await
             .unwrap()
+    }
+
+    // ---- Connexion 1-à-1 : le composeur apprend POURQUOI il est refusé ----
+    // Vécu sur la v0.38.0 : un non-ami composait un pair réglé sur « amis uniquement » →
+    // `Ghost::accept` fermait avec « not-a-friend », mais le composeur n'affichait qu'un
+    // « connexion refusée ou pair injoignable » dans le Journal (caché dans les Réglages).
+    // Côté utilisateur : « rien ne se passe ».
+
+    #[tokio::test]
+    async fn le_composeur_apprend_pourquoi_il_est_refuse() {
+        let cas: [(&[u8], &str); 4] = [
+            (b"not-a-friend", "amis"),
+            (b"refused", "refusé"),
+            (b"busy", "trop de demandes"),
+            (b"rate-limited", "2 s"),
+        ];
+        for (motif, attendu) in cas {
+            let (a, b) = (ep_local_alpn(super::ALPN).await, ep_local_alpn(super::ALPN).await);
+            let composer = async {
+                let c = a.connect(b.addr(), super::ALPN).await.unwrap();
+                let t = std::time::Instant::now();
+                let r = super::poignee_de_main(&c).await;
+                // Le motif doit arriver en un aller-retour, pas au bout du délai de 50 s.
+                assert!(t.elapsed() < std::time::Duration::from_secs(5), "refus lu en {:?}", t.elapsed());
+                r
+            };
+            // Exactement ce que fait `Ghost::accept` : fermeture motivée juste après la
+            // poignée de main QUIC, avant tout échange applicatif.
+            let accepter = async {
+                let c = b.accept().await.unwrap().await.unwrap();
+                c.close(0u32.into(), motif);
+                c
+            };
+            let (res, _c) = tokio::join!(composer, accepter);
+            let err = res.expect_err("un refus ne doit pas passer pour une connexion").to_string();
+            assert!(err.contains(attendu), "motif {:?} → « {err} »", String::from_utf8_lossy(motif));
+            a.close().await;
+            b.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn la_poignee_de_main_aboutit_quand_le_pair_accepte() {
+        let (a, b) = (ep_local_alpn(super::ALPN).await, ep_local_alpn(super::ALPN).await);
+        let composer = async {
+            let c = a.connect(b.addr(), super::ALPN).await.unwrap();
+            super::poignee_de_main(&c).await
+        };
+        // Même réponse que `run_conn` à un KIND_HELLO.
+        let accepter = async {
+            let c = b.accept().await.unwrap().await.unwrap();
+            let (mut s, mut r) = c.accept_bi().await.unwrap();
+            let mut k = [0u8; 1];
+            tokio::io::AsyncReadExt::read_exact(&mut r, &mut k).await.unwrap();
+            assert_eq!(k[0], super::KIND_HELLO);
+            tokio::io::AsyncWriteExt::write_all(&mut s, &[1u8]).await.unwrap();
+            let _ = s.finish();
+            c
+        };
+        let (res, _c) = tokio::join!(composer, accepter);
+        assert!(res.is_ok(), "poignée de main acceptée : {res:?}");
+        a.close().await;
+        b.close().await;
     }
 
     /// Ouvre une connexion `de` → `vers` ; renvoie (vue du composeur, vue de l'accepteur).
