@@ -17,7 +17,10 @@ param(
   [string]$KeyPath = "$HOME\.tauri\ghostlink.key",
   # Identité publique des commits (n'expose pas ton vrai email).
   [string]$Name    = "julo0211",
-  [string]$Email   = "julo0211@users.noreply.github.com"
+  [string]$Email   = "julo0211@users.noreply.github.com",
+  # Republier une version DEJA publiee (remplacer ses fichiers). Presque toujours une erreur :
+  # voir le garde-fou plus bas (lecon n. 6 de CLAUDE.md).
+  [switch]$Republier
 )
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $PSScriptRoot)
@@ -45,6 +48,15 @@ $uiBuildMatch = Select-String -Path "ui\src\main.ts" -Pattern 'UI_BUILD\s*=\s*"(
 if (-not $uiBuildMatch) { throw "Impossible de trouver UI_BUILD dans ui\src\main.ts" }
 $uiBuildVer = $uiBuildMatch.Matches[0].Groups[1].Value
 if ($uiBuildVer -ne $Version) { throw "Versions incohérentes : ui\src\main.ts UI_BUILD=$uiBuildVer, tauri.conf.json=$Version. Aligne-les avant de publier." }
+
+# --- Garde-fou : ne JAMAIS republier un numéro déjà distribué (leçon n. 6 de CLAUDE.md) ---
+# L'updater compare des VERSIONS, pas des binaires : un binaire republié sous un numéro que
+# les clients ont déjà ne leur parviendra jamais. Vérifié AVANT le build signé, le commit et
+# le push (avant ce garde-fou, le script remplaçait les fichiers en silence, tout à la fin).
+gh release view "v$Version" --repo $Repo *> $null
+if ($LASTEXITCODE -eq 0 -and -not $Republier) {
+  throw "La release v$Version existe déjà sur GitHub : les clients déjà en $Version ne verraient JAMAIS un binaire republié sous ce numéro. Monte la version (package.json, Cargo.toml, tauri.conf.json, UI_BUILD de ui\src\main.ts), ou relance avec -Republier si tu sais exactement ce que tu fais."
+}
 
 # --- 0) Compiler le frontend TypeScript -> ui/js ---
 Write-Host "`n[0/5] Compilation du frontend TypeScript (tsc)..." -ForegroundColor Yellow
@@ -106,7 +118,8 @@ if ($LASTEXITCODE -ne 0) { throw "git push a échoué (clé SSH / accès dépôt
 Write-Host "`n[5/5] Release GitHub v$Version..." -ForegroundColor Yellow
 gh release view "v$Version" --repo $Repo *> $null
 if ($LASTEXITCODE -eq 0) {
-  Write-Host "    La release v$Version existe déjà -> mise à jour des assets." -ForegroundColor DarkYellow
+  # N'arrive ici qu'avec -Republier (cf. garde-fou en tête de script).
+  Write-Host "    -Republier : la release v$Version existe déjà -> remplacement de ses fichiers." -ForegroundColor DarkYellow
   gh release upload "v$Version" "$($exe.FullName)" "latest.json" --repo $Repo --clobber
 } else {
   gh release create "v$Version" "$($exe.FullName)" "latest.json" `
@@ -119,4 +132,4 @@ if ($LASTEXITCODE -ne 0) { throw "La publication de la release a échoué." }
 gh release edit "v$Version" --repo $Repo --prerelease=false --latest | Out-Null
 
 Write-Host "`n✅ Publié : https://github.com/$Repo/releases/tag/v$Version" -ForegroundColor Green
-Write-Host "Les apps en 0.19.0 verront la mise à jour (rappel : le multi-flux exige 0.20.0 des DEUX côtés)." -ForegroundColor Cyan
+Write-Host "Les apps installées proposeront la v$Version à leur prochaine vérification de mise à jour." -ForegroundColor Cyan
