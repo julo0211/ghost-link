@@ -1136,13 +1136,23 @@ async fn run_mesh_conn(app: AppHandle, mesh: Mesh, settings: Settings, video_rx:
         }
     }
     uni_task.abort();
-    {
+    let etait_la_courante = {
         let mut m = mesh.lock().unwrap_or_else(|e| e.into_inner());
         if m.get(&peer).map(|e| e.token == token).unwrap_or(false) {
             m.remove(&peer);
+            true
+        } else {
+            false
         }
+    };
+    // Ne dire « pair parti » que si c'était SA connexion courante. Une connexion REMPLACÉE
+    // (reconnexion, ou perdante d'une numérotation croisée) se termine APRÈS le mesh-up de sa
+    // remplaçante : émettre ici faisait passer hors ligne, dans l'UI, un pair bel et bien
+    // connecté (et fermait sa vignette vidéo native). Préexistant, mais E4 (départage) rend
+    // ce cas courant : avant lui, les deux connexions mouraient.
+    if etait_la_courante {
+        let _ = app.emit("ghost-mesh-down", &peer);
     }
-    let _ = app.emit("ghost-mesh-down", &peer);
 }
 
 /// Renvoie la connexion de maillage vers `code`, en l'ouvrant si besoin (ALPN groupe).
