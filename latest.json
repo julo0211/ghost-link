@@ -1,11 +1,11 @@
 {
-  "version": "0.38.1",
+  "version": "0.38.2",
   "notes": "Ameliorations et corrections.",
-  "pub_date": "2026-09-23T19:13:45.317Z",
+  "pub_date": "2026-11-01T22:43:41.003Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVhXNlhvNVNzbFRaNWdkS2txYUpodUxHQVpNYzNxRXJuN2RqanBjWnRRSElrSldtdzhRM1NJZlBHVmFidXNnWnJGZTlSTW1lNzBocHQxN2UyenJGMGdnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMTkwODI1CWZpbGU6Z2hvc3QtbGlua18wLjM4LjFfeDY0LXNldHVwLmV4ZQpnb2VQTEsza085RDBWZHptM1kydkhIbWRscng4NVd6T29YajhteTBEY2tTYVQyMGRNKzhmQXRCVVdjOEdkeE90WVJCSWZxaE9seCtpRE9QQnRwTU5CUT09Cg==",
-      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.38.1_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTdjd2dnU1RlBNRVRJd1Roc3VLY0dadzd0VTRqa092WjUvQ0lXRkFOUFRoNk0zeFpkNlJGa0JGMzNxeFJCUXdLY01Ga2t4cVlFR3hLT0ZyVHZWcFNGb1huL0RvQ2FkdEE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNTczMDIwCWZpbGU6Z2hvc3QtbGlua18wLjM4LjJfeDY0LXNldHVwLmV4ZQpPNUZxK3RkQUJBYlNDelQ4WWdRNDVFZHFISFdyaU5QMnVLNlYwU3Zwckk1TmZUWnpMOVc0UkxiSHhhRUVkZ1BYWXRLZTJBMWNieWtYMmltWjljdTRCQT09Cg==",
+      "url": "https://github.com/julo0211/ghost-link/releases/latest/download/ghost-link_0.38.2_x64-setup.exe"
     }
   }
 }
