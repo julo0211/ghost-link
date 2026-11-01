@@ -125,7 +125,14 @@ export interface Events {
   // Micro/haut-parleur perdu en plein appel (débranché) : `scope` dit QUEL appel est mort.
   "ghost-audio-error": { scope: "call" | "group"; reason: string };
 
-  "ghost-send-await": null;
+  // Empreinte SHA-256 en cours chez l'ENVOYEUR : le pair n'est pas encore prévenu (l'empreinte
+  // est dans l'entête de l'offre). `done`/`size` en octets.
+  "ghost-send-hashing": { name: string; done: number; size: number };
+  // L'offre vient d'être envoyée : le pair la voit maintenant et doit répondre.
+  "ghost-send-await": { name?: string; size?: number } | null;
+  // Tous les octets sont partis ; le pair relit le fichier pour vérifier l'empreinte.
+  "ghost-send-verifying": { name: string };
+  "ghost-recv-verifying": { name: string; done: number; size: number };
   "ghost-meta": { name: string; status: "cleaned" | "skipped" | "failed"; info?: string };
   "ghost-send-progress": { sent: number; size: number };
   "ghost-recv-start": { name: string; size: number };
@@ -139,7 +146,8 @@ export interface Events {
   // Fichier ACCEPTÉ mais impossible à créer (dossier absent, droits, disque plein).
   "ghost-recv-failed": { name?: string; error?: string; from?: string };
   "ghost-recv-corrupt": { name: string };
-  "ghost-recv-nospace": { name?: string; size?: number; free?: number; from?: string };
+  // `dir` = dossier de réception dont l'espace libre est insuffisant.
+  "ghost-recv-nospace": { name?: string; size?: number; free?: number; from?: string; dir?: string };
 
   "ghost-chat": { text: string; name: string };
   "ghost-chat-img": { author?: string; name?: string; mime: string; dataB64: string };

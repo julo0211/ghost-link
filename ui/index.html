@@ -329,6 +329,8 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 
   <!-- ===== Bannières (demandes entrantes) ===== -->
   <div class="banners">
+    <!-- Notice persistante (échec d'envoi, disque plein…) : le Journal est dans les Réglages, fermés par défaut. -->
+    <div id="noticeBanner" class="banner hidden"><span id="noticeText"></span><span class="sp"></span><button class="pill" id="btnNoticeOk">OK</button></div>
     <div id="freqBanner" class="banner hidden"><span id="freqText">Un pair veut t'ajouter en ami.</span><span class="sp"></span><button class="pill go" id="btnFreqAccept">Accepter</button><button class="pill" id="btnFreqRefuse">Refuser</button></div>
     <div id="incomingBanner" class="banner hidden"><span id="incomingText">Un pair veut se connecter.</span><span class="sp"></span><button class="pill go" id="btnAccept">Accepter</button><button class="pill" id="btnRefuse">Refuser</button></div>
     <div id="fileOfferBanner" class="banner hidden"><span id="fileOfferText">Réception d'un fichier.</span><span class="sp"></span><button class="pill go" id="btnFileAccept">Accepter</button><button class="pill" id="btnFileReject">Refuser</button></div>

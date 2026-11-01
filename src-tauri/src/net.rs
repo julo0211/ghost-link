@@ -1498,7 +1498,10 @@ async fn recv_gfile<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
         if size > free.saturating_sub(64 * 1024 * 1024) {
             let _ = send.write_all(&[0u8]).await;
             let _ = send.flush().await;
-            let _ = app.emit("ghost-recv-nospace", serde_json::json!({ "name": name, "size": size, "from": from }));
+            let _ = app.emit(
+                "ghost-recv-nospace",
+                serde_json::json!({ "name": name, "size": size, "free": free, "from": from, "dir": settings.recv_dir().to_string_lossy() }),
+            );
             return Ok(());
         }
     }
@@ -2022,24 +2025,85 @@ type Inbounds = Arc<StdMutex<HashMap<u64, Arc<Inbound>>>>;
 
 /// SHA-256 d'un fichier (vérification d'intégrité après réassemblage multi-flux).
 async fn sha256_file(path: &Path, cancel: Option<&Arc<AtomicBool>>) -> anyhow::Result<[u8; 32]> {
+    sha256_file_prog(path, cancel, |_| {}).await
+}
+
+/// Comme `sha256_file`, et rapporte les octets déjà hachés (~4 fois par seconde).
+///
+/// Sur un fichier de 200 Go ce calcul dure des minutes (mesuré : 1,2 Go/s sur un i7-14700K
+/// avec le fichier en cache, donc ≥ 2,8 min ; un disque ordinaire est bien plus lent) et le
+/// pair n'est PAS prévenu avant sa fin (l'empreinte est dans l'entête de l'offre). L'envoyeur
+/// affichait « en attente d'acceptation » pendant tout ce temps : le receveur ne voyait rien,
+/// l'envoyeur croyait à une attente de réponse. Sans progression, impossible de savoir.
+async fn sha256_file_prog(
+    path: &Path,
+    cancel: Option<&Arc<AtomicBool>>,
+    on_progress: impl FnMut(u64) + Send + 'static,
+) -> anyhow::Result<[u8; 32]> {
+    let path = path.to_path_buf();
+    let cancel = cancel.cloned();
+    tokio::task::spawn_blocking(move || sha256_blocking(&path, cancel.as_ref(), on_progress))
+        .await
+        .map_err(|e| anyhow::anyhow!("calcul d'empreinte interrompu: {e}"))?
+}
+
+/// Cœur BLOQUANT du hachage. Un fil lit par blocs de 4 Mio pendant que celui-ci hache : le
+/// disque n'attend plus la fin du calcul de chaque bloc (avant : lecture 1 Mio, calcul,
+/// lecture suivante — le disque restait inactif pendant tout le calcul).
+fn sha256_blocking(
+    path: &Path,
+    cancel: Option<&Arc<AtomicBool>>,
+    mut on_progress: impl FnMut(u64),
+) -> anyhow::Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
-    let mut f = tokio::fs::File::open(path).await?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        // Annulation réactive : sortir tôt si l'utilisateur annule pendant le hash
-        // (vérifié toutes les ~1 MiB, avant chaque lecture).
-        if let Some(c) = cancel {
-            if c.load(Ordering::SeqCst) {
-                anyhow::bail!("annulé");
+    use std::io::Read;
+    const BLOC: usize = 4 << 20;
+    let mut f = std::fs::File::open(path)?;
+    // Canal borné : le lecteur ne prend jamais plus de ~12 Mio d'avance.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(3);
+    let lecteur = std::thread::spawn(move || loop {
+        let mut buf = vec![0u8; BLOC];
+        match f.read(&mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                let fin = n == 0;
+                if tx.send(Ok(buf)).is_err() || fin {
+                    return; // récepteur parti (annulation/erreur) ou fin de fichier
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                return;
             }
         }
-        let n = AsyncReadExt::read(&mut f, &mut buf).await?;
-        if n == 0 {
-            break;
+    });
+    let mut h = Sha256::new();
+    let mut fait = 0u64;
+    let mut dernier = std::time::Instant::now();
+    let res: anyhow::Result<()> = loop {
+        // Annulation réactive : vérifiée avant chaque bloc de 4 Mio.
+        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            break Err(anyhow::anyhow!("annulé"));
         }
-        h.update(&buf[..n]);
-    }
+        match rx.recv() {
+            Ok(Ok(b)) if b.is_empty() => break Ok(()),
+            Ok(Ok(b)) => {
+                h.update(&b);
+                fait += b.len() as u64;
+                if dernier.elapsed() >= std::time::Duration::from_millis(250) {
+                    on_progress(fait);
+                    dernier = std::time::Instant::now();
+                }
+            }
+            Ok(Err(e)) => break Err(e.into()),
+            Err(_) => break Err(anyhow::anyhow!("lecture interrompue")),
+        }
+    };
+    drop(rx); // débloque le lecteur s'il attend de la place dans le canal
+    let _ = lecteur.join();
+    res?;
+    on_progress(fait);
     let out = h.finalize();
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&out);
@@ -2280,7 +2344,10 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                         if size > free.saturating_sub(64 * 1024 * 1024) {
                             let _ = AsyncWriteExt::write_all(&mut send, &[2u8]).await;
                             let _ = send.finish();
-                            let _ = a.emit("ghost-recv-nospace", serde_json::json!({ "name": name, "size": size, "free": free }));
+                            let _ = a.emit(
+                                "ghost-recv-nospace",
+                                serde_json::json!({ "name": name, "size": size, "free": free, "dir": settings.recv_dir().to_string_lossy() }),
+                            );
                             return;
                         }
                     }
@@ -2365,7 +2432,18 @@ async fn run_conn(app: AppHandle, slot: Slot, recv_cancel: Arc<AtomicBool>, sett
                         let mut f = inb.file.lock().await;
                         let _ = AsyncWriteExt::flush(&mut *f).await;
                     }
-                    let ok_hash = done && sha256_file(&dest, None).await.map(|h| h == hash).unwrap_or(false);
+                    // Relecture complète du fichier reçu : des minutes sur 200 Go, avec la barre
+                    // restée à 100 %. On rapporte la progression pour que l'UI le dise.
+                    let ok_hash = done
+                        && {
+                            let (a_v, n_v) = (a.clone(), name.clone());
+                            sha256_file_prog(&dest, None, move |fait| {
+                                let _ = a_v.emit("ghost-recv-verifying", serde_json::json!({ "name": n_v, "done": fait, "size": size }));
+                            })
+                            .await
+                            .map(|h| h == hash)
+                            .unwrap_or(false)
+                        };
                     if ok_hash {
                         let _ = AsyncWriteExt::write_all(&mut send, b"ok").await;
                         let _ = send.finish();
@@ -2416,14 +2494,19 @@ pub async fn send_file(
         .map_err(|e| anyhow::anyhow!("fichier introuvable: {e}"))?
         .len();
 
-    // Prévenir l'UI AVANT le hash : sur un gros fichier, sha256_file peut durer et
-    // l'UI ne doit pas afficher un 0 % figé pendant ce temps. L'annulation reste
-    // réactive : send_cancel est vérifié périodiquement au fil de la lecture.
-    let _ = app.emit("ghost-send-await", serde_json::json!({ "name": name }));
     // Empreinte SHA-256 du fichier : le pair vérifiera l'intégrité après réassemblage.
-    let hash = sha256_file(p, Some(send_cancel))
+    // Elle voyage dans l'entête de l'offre : le pair n'est donc prévenu QU'APRÈS ce calcul.
+    // On rapporte sa progression (`ghost-send-hashing`) au lieu d'annoncer « en attente
+    // d'acceptation » — ce que l'UI affichait pendant tout le calcul, soit des minutes sur un
+    // gros fichier, alors que personne n'avait encore rien reçu. L'annulation reste réactive.
+    let hash = {
+        let (app_h, name_h) = (app.clone(), name.clone());
+        sha256_file_prog(p, Some(send_cancel), move |fait| {
+            let _ = app_h.emit("ghost-send-hashing", serde_json::json!({ "name": name_h, "done": fait, "size": size }));
+        })
         .await
-        .map_err(|e| anyhow::anyhow!("lecture (hash): {e}"))?;
+        .map_err(|e| anyhow::anyhow!("lecture (hash): {e}"))?
+    };
     let id = FILE_SEQ.fetch_add(1, Ordering::SeqCst);
     let nstreams = STREAMS.load(Ordering::SeqCst).clamp(1, 8);
 
@@ -2445,6 +2528,8 @@ pub async fn send_file(
     AsyncWriteExt::write_all(&mut send, &head)
         .await
         .map_err(|e| anyhow::anyhow!("envoi: {e}"))?;
+    // C'est seulement maintenant que le pair VOIT la proposition.
+    let _ = app.emit("ghost-send-await", serde_json::json!({ "name": name, "size": size }));
 
     // Attendre que le pair accepte (ou refuse) le fichier avant d'envoyer les octets.
     let mut decision = [0u8; 1];
@@ -2509,6 +2594,10 @@ pub async fn send_file(
     }
     let _ = send.finish();
 
+    // Tous les octets sont partis, mais le pair doit relire le fichier entier pour vérifier
+    // son empreinte avant de répondre : sur 200 Go c'est de nouveau des minutes, pendant
+    // lesquelles la barre affichait 100 % sans rien dire.
+    let _ = app.emit("ghost-send-verifying", serde_json::json!({ "name": name }));
     // Accusé final du pair : "ok" si l'intégrité est vérifiée.
     let mut ack = [0u8; 2];
     match AsyncReadExt::read_exact(&mut recv, &mut ack).await {
@@ -2826,8 +2915,47 @@ async fn create_unique(dir: &Path, name: &str) -> std::io::Result<(PathBuf, toki
 
 /// Crée puis pré-alloue le fichier de réception ; en cas d'échec de la pré-allocation (disque
 /// plein), ne laisse pas de fichier vide derrière soi.
+/// Marque le fichier « creux » (NTFS/ReFS), à faire AVANT de l'agrandir.
+///
+/// Les flux écrivent chacun à leur offset : avec 4 flux sur 200 Go, le 4e écrit à 150 Go. Sur un
+/// fichier agrandi par `set_len`, NTFS doit d'abord remplir de zéros tout ce qui précède le
+/// premier octet écrit (sa « valid data length » est restée à 0). Mesuré ici : 1re écriture à
+/// 6 Go d'un fichier de 8 Go = 0,79 s, contre 0,001 s à l'offset 0 — sur un SSD très rapide ;
+/// sur un SATA ou un disque dur ce sont des minutes, pendant lesquelles les flux, qui se
+/// partagent un verrou, n'avancent plus, et le chien de garde « 5 min sans octet » avorte la
+/// réception. Un fichier creux n'a pas ce remplissage. Meilleur effort : échec silencieux sur
+/// FAT/exFAT (clé USB), où le comportement reste celui d'avant.
+#[cfg(windows)]
+fn marquer_creux(f: &tokio::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    let mut octets = 0u32;
+    // SAFETY: le handle est valide et tenu par `f` pendant tout l'appel ; FSCTL_SET_SPARSE
+    // sans tampon d'entrée marque le fichier creux (SetSparse = TRUE par défaut) et n'a pas
+    // de tampon de sortie.
+    let ok = unsafe {
+        DeviceIoControl(
+            f.as_raw_handle() as _,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut octets,
+            std::ptr::null_mut(),
+        )
+    };
+    ok != 0
+}
+#[cfg(not(windows))]
+fn marquer_creux(_f: &tokio::fs::File) -> bool {
+    false
+}
+
 async fn create_recv_file(dir: &Path, name: &str, size: u64) -> anyhow::Result<(PathBuf, tokio::fs::File)> {
     let (dest, f) = create_unique(dir, name).await?;
+    marquer_creux(&f);
     if let Err(e) = f.set_len(size).await {
         drop(f);
         let _ = tokio::fs::remove_file(&dest).await;
@@ -3008,6 +3136,79 @@ mod tests {
         assert!(super::mesh_admit(&mesh, &idb, &nouvelle, nouvelle_sortante, &ida).is_some());
         a.close().await;
         b.close().await;
+    }
+
+    // ---- Gros fichiers : hachage fidèle, annulable, avec progression ----
+
+    #[test]
+    fn le_hachage_pipeline_donne_le_meme_resultat_que_sha2() {
+        use sha2::{Digest, Sha256};
+        let d = std::env::temp_dir().join("gl-hash-pipeline");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // 9 Mio + 7 octets : plusieurs blocs de 4 Mio ET un dernier bloc partiel.
+        let data: Vec<u8> = (0..(9 * 1024 * 1024 + 7)).map(|i: usize| (i.wrapping_mul(31) ^ (i >> 7)) as u8).collect();
+        let p = d.join("f.bin");
+        std::fs::write(&p, &data).unwrap();
+        let mut dernier = 0u64;
+        let h = super::sha256_blocking(&p, None, |fait| {
+            assert!(fait >= dernier, "la progression ne recule jamais");
+            dernier = fait;
+        })
+        .unwrap();
+        assert_eq!(h.as_slice(), Sha256::digest(&data).as_slice(), "même empreinte que sha2 d'un bloc");
+        assert_eq!(dernier, data.len() as u64, "le dernier rapport couvre tout le fichier");
+        // Fichier vide : empreinte de la chaîne vide, pas d'erreur.
+        let vide = d.join("vide.bin");
+        std::fs::write(&vide, b"").unwrap();
+        assert_eq!(super::sha256_blocking(&vide, None, |_| {}).unwrap().as_slice(), Sha256::digest(b"").as_slice());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn le_hachage_annule_rend_annule_sans_bloquer() {
+        let d = std::env::temp_dir().join("gl-hash-cancel");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("f.bin");
+        std::fs::write(&p, vec![7u8; 20 * 1024 * 1024]).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let t = std::time::Instant::now();
+        let e = super::sha256_blocking(&p, Some(&stop), |_| {}).unwrap_err().to_string();
+        assert_eq!(e, "annulé");
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "l'annulation ne doit pas attendre la fin du fichier");
+        // Fichier introuvable : une erreur, pas un blocage ni une panique du lecteur.
+        assert!(super::sha256_blocking(&d.join("absent"), None, |_| {}).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Le fichier préalloué d'une réception ne doit pas réserver (donc remplir de zéros) toute sa
+    /// taille : c'est ce remplissage qui figeait les flux d'un transfert de 200 Go sur disque lent.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn la_reception_preallouee_est_creuse() {
+        use fs2::FileExt;
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+        let d = std::env::temp_dir().join("gl-sparse-recv");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let taille: u64 = 512 * 1024 * 1024;
+        let (_dest, mut f) = super::create_recv_file(&d, "gros.bin", taille).await.unwrap();
+        // Comme un flux de données qui démarre loin dans le fichier.
+        f.seek(std::io::SeekFrom::Start(taille - 4096)).await.unwrap();
+        f.write_all(&[1u8; 4096]).await.unwrap();
+        f.flush().await.unwrap();
+        let std_f = f.into_std().await;
+        assert_eq!(std_f.metadata().unwrap().len(), taille, "la taille logique est bien celle de l'offre");
+        let alloue = std_f.allocated_size().unwrap();
+        // Hors NTFS/ReFS (clé FAT/exFAT), le marquage échoue : on ne peut rien affirmer.
+        if alloue >= taille {
+            eprintln!("volume sans fichiers creux : test non concluant ({alloue} octets alloués)");
+        } else {
+            assert!(alloue < taille / 2, "fichier creux attendu, {alloue} octets alloués sur {taille}");
+        }
+        drop(std_f);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     // ---- Réception : jamais d'écrasement d'un fichier existant ----

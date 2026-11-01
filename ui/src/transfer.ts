@@ -18,6 +18,14 @@ import {
 import { S, myName, memberName, isDeclaredLabel, loadGroups } from "./state.js";
 import { paintConvoUnread } from "./session.js";
 
+/** Notice PERSISTANTE dans la zone des bannières (fermée par OK). Pour tout échec qui doit être
+ *  vu : le Journal est dans les Réglages, fermés par défaut, donc un message qui n'y va que
+ *  passe pour « rien ne se passe » (leçon n° 7 de CLAUDE.md, retrouvée sur l'envoi de 200 Go). */
+function notifier(texte: string): void {
+  $("#noticeText").textContent = texte;
+  $("#noticeBanner").classList.remove("hidden");
+}
+
 // Images/GIF inline (Task 3.4) : au-delà, pas de chemin fichier disponible pour
 // un `File` issu du picker/presse-papiers — repli documenté (log), pas d'échec silencieux.
 const MAX_INLINE_IMG = 5 * 1024 * 1024;
@@ -306,7 +314,7 @@ export function initTransfer(): void {
     $("#btnCancelSend").classList.remove("hidden");
     $("#sendName").textContent = baseName(path);
     $("#sendBar").style.width = "0%";
-    $("#sendPct").textContent = "0%";
+    $("#sendPct").textContent = "🔎 préparation…";
     $<HTMLButtonElement>("#btnSend").disabled = true;
     try {
       const name = await invoke("send_file", { path });
@@ -314,8 +322,12 @@ export function initTransfer(): void {
       $("#sendPct").textContent = "✅ envoyé";
       log("Fichier envoyé : " + name + " ✅");
     } catch (e) {
-      $("#sendPct").textContent = "✗ " + (String(e) === "annulé" ? "annulé" : "erreur");
+      const annule = String(e) === "annulé";
+      $("#sendPct").textContent = "✗ " + (annule ? "annulé" : "erreur");
       log("Envoi : " + e);
+      // Le Journal est dans les Réglages : une erreur d'envoi qui n'allait que là passait pour
+      // « rien ne se passe » (vécu sur un envoi de 200 Go refusé pour manque de place chez le pair).
+      if (!annule) notifier("Envoi de « " + baseName(path) + " » impossible : " + e);
     } finally {
       $<HTMLButtonElement>("#btnSend").disabled = false;
       $("#btnCancelSend").classList.add("hidden");
@@ -325,9 +337,28 @@ export function initTransfer(): void {
     invoke("cancel_send").catch((e) => log("Annulation : " + e));
     log("Annulation de l'envoi…");
   };
-  // BUG-9 : tant que le pair n'a pas accepté le fichier, la barre reste à 0 % — on l'indique.
+  // Phase 1 (envoyeur) : calcul de l'empreinte. Le destinataire ne voit RIEN pendant ce temps :
+  // l'UI affichait « en attente d'acceptation » alors qu'aucune offre n'était partie, d'où
+  // « l'autre ne reçoit jamais la proposition » sur un fichier de 200 Go.
+  listen("ghost-send-hashing", (e) => {
+    const { done, size } = e.payload;
+    const p = size ? Math.min(99, Math.floor((done / size) * 100)) : 0;
+    $("#sendPct").textContent = "🔎 empreinte " + p + " % — le destinataire sera prévenu ensuite";
+  });
+  // Phase 2 : l'offre est partie ; la barre reste à 0 % tant que le pair n'a pas accepté (BUG-9).
   listen("ghost-send-await", () => {
-    $("#sendPct").textContent = "⏳ en attente d'acceptation…";
+    $("#sendPct").textContent = "⏳ en attente de l'acceptation du destinataire…";
+  });
+  // Phase 3 : tout est parti, le pair relit le fichier pour vérifier l'empreinte (des minutes sur 200 Go).
+  listen("ghost-send-verifying", () => {
+    $("#sendBar").style.width = "100%";
+    $("#sendPct").textContent = "🔎 vérification d'intégrité chez le destinataire…";
+  });
+  listen("ghost-recv-verifying", (e) => {
+    const { done, size } = e.payload;
+    const p = size ? Math.min(99, Math.floor((done / size) * 100)) : 0;
+    $("#recvBar").style.width = "100%";
+    $("#recvPct").textContent = "🔎 vérification " + p + " %";
   });
   // Nettoyage des métadonnées avant envoi (meta.rs) : rendre le résultat VISIBLE —
   // succès rassurant, et surtout jamais d'échec silencieux (confidentialité).
@@ -439,9 +470,20 @@ export function initTransfer(): void {
     log("⚠️ Fichier corrompu (intégrité invalide) — rejeté : " + ((e.payload && e.payload.name) || ""));
   });
   // SEC-2 : espace disque insuffisant → fichier refusé automatiquement.
+  // Refus AUTOMATIQUE, avant même d'afficher l'offre : sans notice visible, l'utilisateur ne
+  // voyait jamais la proposition ni la raison (le Journal est caché dans les Réglages).
   listen("ghost-recv-nospace", (e) => {
     $("#recvBox").classList.add("hidden");
-    log("⚠️ Espace disque insuffisant — fichier refusé : " + ((e.payload && e.payload.name) || ""));
+    const p = e.payload || {};
+    const nom = p.name || "fichier";
+    log("⚠️ Espace disque insuffisant — fichier refusé : " + nom);
+    const besoin = p.size ? " (" + fmt(p.size) + ")" : "";
+    const libre = p.free != null ? " : il ne reste que " + fmt(p.free) + " libres" : "";
+    const ou = p.dir ? " dans « " + p.dir + " »" : "";
+    notifier(
+      "Fichier « " + nom + " »" + besoin + " refusé automatiquement" + libre + ou +
+        ". Libère de la place ou choisis un autre dossier de réception (Réglages), puis demande-lui de renvoyer.",
+    );
   });
 
   // Acceptation d'un fichier entrant (avant réception)
@@ -453,6 +495,7 @@ export function initTransfer(): void {
     S.fileOffers.push({ id: p.id, name: p.name || "fichier", size: p.size || 0, dir: p.dir });
     paintFileOffer();
   });
+  $("#btnNoticeOk").onclick = () => $("#noticeBanner").classList.add("hidden");
   $("#btnFileAccept").onclick = () => answerFileOffer(true);
   $("#btnFileReject").onclick = () => {
     answerFileOffer(false);
